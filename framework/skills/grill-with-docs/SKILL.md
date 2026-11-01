@@ -63,4 +63,8 @@ Only offer to create an ADR when all three are true:
 
 If any of the three is missing, skip the ADR. Use the format in `${CLAUDE_SKILL_DIR}/ADR-FORMAT.md`.
 
+## When the tree is walked
+
+Stop. Say in a few lines what was decided and which glossary entries and ADRs were written, then name the next step: `/to-prd` for a feature, or a standalone issue for a small, well-scoped task. Do not slice the work into issues or write them by hand — packaging is `/to-prd` and `/to-issues`' job, and asking "one issue or three?" here skips the module design those steps exist for. The glossary and ADR edits stay uncommitted in the working tree; `/to-prd` carries them onto the feature branch.
+
 </supporting-info>

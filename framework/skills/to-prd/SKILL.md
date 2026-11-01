@@ -13,6 +13,8 @@ This skill takes the current conversation context and codebase understanding and
 
 A deep module (as opposed to a shallow module) is one which encapsulates a lot of functionality in a simple, testable interface which rarely changes.
 
+A class earns a row as a **module** only when it hides a decision its callers would otherwise each repeat, behind an interface small enough to state in one line — a status rule three pages read, a row shape three lists draw, an audience predicate the header should not know. A class that only assembles other parts in order, or that the feature merely touches, is not a module: list it as **modified** with its interface change and no structural claim, so the reader sees what changes without mistaking page assembly for design. If no row passes the test, say so rather than inventing one.
+
 Present the design to the user as its own message, before the PRD, in two parts:
 
 - **Module table** — one row per module: name; new or modified; responsibility in one sentence; interface in one line (what callers give it, what they get back); and the structural claim it must hold, if any ("pure: no I/O", "the only place points are summed", "never depends on X"). Leave the claim empty when there is none — don't invent one.
@@ -22,7 +24,7 @@ Ask the user to edit it: a module they would merge, split, rename or drop; an ar
 
 3. Pick a feature slug from the grilling context and confirm it with the maintainer.
 
-4. Set up the feature workspace per `docs/formann/issue-tracker/BINDING.md`.
+4. Set up the feature workspace per `docs/formann/issue-tracker/BINDING.md`. The grill's uncommitted edits to `GLOSSARY.md` and `docs/adr/` are part of this feature: they ride along when the feature branch is created from HEAD and become its first commit, referencing the parent issue. Never stash or discard them, and don't count them as the "dirty tree" the binding asks about.
 
 5. Write and publish the PRD using the template below; publish per `docs/formann/issue-tracker/BINDING.md`.
 

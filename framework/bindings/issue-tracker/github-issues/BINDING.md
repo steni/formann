@@ -422,7 +422,7 @@ The title goes in GitHub's native title field. The PRD content goes in the issue
 **Step 4 — Feature branch creation.** Create and switch to the feature branch (slug → branch name):
 
 - If HEAD is not the project's main branch, warn the maintainer and confirm before branching.
-- If the working tree is dirty, ask the maintainer how to proceed before branching.
+- If the working tree is dirty with anything other than the grill's own `GLOSSARY.md` / `docs/adr/` edits, ask the maintainer how to proceed before branching. The grill's edits are expected here: they come along onto the new branch and become its first commit.
 - Create a git branch named with the feature slug from the current HEAD and switch to it.
 
 This step is binding-agnostic and follows the same convention as the local-markdown binding.
