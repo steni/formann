@@ -318,3 +318,61 @@ gh_repo=lowercase_bad"
   assert_failure
   assert_output --partial "not inside a git repository"
 }
+
+# --- Linux hosts -------------------------------------------------------------
+# The runner's own OAuth token is read with secret-tool or keyctl on Linux
+# (runner/retrieve-secret.sh); the GH token follows the same two tools and the
+# same key naming, so a headless host is set up once for both.
+
+_fake_keyctl() {
+  # Shim: `search @s user <name>` prints a key id; `pipe <id>` prints the token.
+  # KEYCTL_FAKE_MISSING: when non-empty, every search fails (no such key).
+  cat >"$FAKE_BIN/keyctl" <<'EOS'
+#!/usr/bin/env bash
+if [[ "$1" == "search" ]]; then
+  [[ -n "${KEYCTL_FAKE_MISSING:-}" ]] && { echo "keyctl_search: Required key not available" >&2; exit 1; }
+  [[ "$4" == "formann_gh_token_github" ]] && { echo "123456789"; exit 0; }
+  exit 1
+fi
+if [[ "$1" == "pipe" && "$2" == "123456789" ]]; then printf 'ghp_fake_test_token'; exit 0; fi
+exit 1
+EOS
+  chmod +x "$FAKE_BIN/keyctl"
+}
+
+@test "Linux, kernel keyring holds the token — emits GH_TOKEN and GH_REPO" {
+  export OSTYPE="linux-gnu"
+  rm "$FAKE_BIN/security"
+  _fake_keyctl
+  export PATH="$FAKE_BIN:/bin"
+
+  run "$SANDBOX_ENV"
+  [ "$status" -eq 0 ]
+  assert_line --index 0 "GH_TOKEN=ghp_fake_test_token"
+  assert_line --index 1 "GH_REPO=owner/repo"
+}
+
+@test "Linux, keyring entry absent — exits 1 naming the key, token never on stderr" {
+  export OSTYPE="linux-gnu"
+  rm "$FAKE_BIN/security"
+  _fake_keyctl
+  export PATH="$FAKE_BIN:/bin"
+  export KEYCTL_FAKE_MISSING=1
+
+  run "$SANDBOX_ENV"
+  [ "$status" -eq 1 ]
+  assert_output --partial "formann_gh_token_github"
+  assert_output --partial "keyctl padd"
+  refute_output --partial "ghp_fake_test_token"
+}
+
+@test "Linux, neither secret-tool nor keyctl on PATH — exits 2 naming both tools" {
+  export OSTYPE="linux-gnu"
+  rm "$FAKE_BIN/security"
+  export PATH="$FAKE_BIN:/bin"
+
+  run "$SANDBOX_ENV"
+  [ "$status" -eq 2 ]
+  assert_output --partial "secret-tool"
+  assert_output --partial "keyctl"
+}
