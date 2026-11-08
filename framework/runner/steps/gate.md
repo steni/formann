@@ -48,6 +48,16 @@ The issue ref is appended to this prompt below the `---` separator at the end. I
 - **No push.** The runner fast-forwards to host afterward.
 - **No other tracker writes.** On a clean verdict, only the "Set state to done" write happens. No comment is appended.
 
+## When a dependency is unreachable
+
+If something this step needs from outside the run is unreachable — a consumer's service, a preview environment, a remote API — the step ends **Blocked**. An outage outside the run is not a defect in the code, so do not report it as a finding and do not fail.
+
+1. **Comment with Blocked** on the issue, naming the dependency and the error you got (the command and its output, trimmed to what shows the failure). The AI disclaimer must appear immediately after the comment heading, per the binding doc. This comment is the step's only tracker write — it replaces the step's usual comment and state change.
+2. **Change no state.** Leave the issue where it is.
+3. **End your final message with the line** `BLOCKED: <dependency>`, alone on the last line, where `<dependency>` is a short name for what was unreachable (for example `BLOCKED: preview-daemon`). Omit any `verdict:` line.
+
+The runner reads that line, leaves the issue's state alone, moves on to other work, and re-runs this step on a later pass. After three Blocked passes it leaves the issue for a human with the Blocked comments as the reason.
+
 ## On failure
 
 If no findings comment is found, or if the comment's severity cannot be classified, exit non-zero with a diagnostic. The runner records `gate-failed` and the maintainer reads the log on return.

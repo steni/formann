@@ -177,15 +177,32 @@ next_eligible_ref() {
     <<<"$snapshot_json"
 }
 
+# Blocked passes at which a Blocked step stops being retried and the issue is
+# left for a human (issue #3; PRD user story 33).
+RUNNER_BLOCKED_PASS_LIMIT=3
+
 # Classify the per-item control-flow action after a post-implement step runs.
 # Inputs:
 #   $1 — post-item status string (already extracted from the snapshot by the
 #         caller; NOT a snapshot JSON blob)
 #   $2 — Dispatch exit code
+#   $3 — blocked: `true` when the step's result ended `BLOCKED: <dependency>`
+#         (optional; default `false`)
+#   $4 — blocked-passes: the issue's Blocked pass count read from the tracker,
+#         including this pass (optional; a missing or non-integer value counts
+#         as 0)
 #
 # Output (stdout): exactly one of `stop-success`, `continue`, `terminate-run`,
-# or `fail`.
+# `blocked`, `left-for-human`, or `fail`. Guards, in order:
 #
+#   fail           — nonzero exit (a BLOCKED: line does not soften a failed
+#                    dispatch).
+#   blocked        — exit 0, blocked, passes < 3: stop the walk for this
+#                    issue, change no state, write no abort flag; a later
+#                    pass re-runs it.
+#   left-for-human — exit 0, blocked, passes >= 3: the same outcome as a walk
+#                    exhausted at in-review (no abort flag).
+#   Status-based actions apply only when not blocked:
 #   stop-success   — exit 0 AND status is done, wontfix, or empty (github-issues
 #                    binding closes the work-item parent on done, so absence is
 #                    the binding-native signal for done).
@@ -201,10 +218,20 @@ next_eligible_ref() {
 #
 # Pure logic — no I/O beyond stdin/stdout. Sourceable from bats.
 classify_item_action() {
-  local status="$1" exit_code="$2"
+  local status="$1" exit_code="$2" blocked="${3:-false}" passes="${4:-0}"
 
   if [ "$exit_code" != "0" ]; then
     echo "fail"
+    return 0
+  fi
+
+  if [ "$blocked" = "true" ]; then
+    case "$passes" in ''|*[!0-9]*) passes=0 ;; esac
+    if [ "$passes" -ge "$RUNNER_BLOCKED_PASS_LIMIT" ]; then
+      echo "left-for-human"
+    else
+      echo "blocked"
+    fi
     return 0
   fi
 
@@ -411,6 +438,56 @@ extract_result_summary() {
   fi
   printf '(no result event in the dispatch stream — no closing message; see the .stderr.log sibling for diagnostics)\n'
   return 0
+}
+
+# The dependency a step named in its closing `BLOCKED: <dependency>` line, or
+# empty. The line must be the last non-blank line of the terminal `result`
+# event's text (the step contract: "end your final message with the line").
+# Surrounding whitespace is trimmed; an empty dependency is not Blocked.
+# Fail-safe: any parse surprise yields empty.
+#
+# Pure — reads only the named file. Sourceable from bats.
+blocked_dependency() {
+  local stream_file="$1"
+  local result_line
+  result_line="$(_terminal_result_line "$stream_file")"
+  [ -n "$result_line" ] || return 0
+  printf '%s' "$result_line" | jq -r '
+    (.result // "") | if type == "string" then . else "" end
+    | split("\n") | map(sub("[[:space:]]+$"; "")) | map(select(length > 0))
+    | (last // "")
+    | (capture("^BLOCKED:[[:space:]]*(?<dep>.*)$").dep // "")
+  ' 2>/dev/null || true
+}
+
+# The issue's Blocked pass count, read from the tracker through the active
+# binding's `blocked-passes` script on the role surface (Blocked comments
+# since the issue's latest Implementation comment — see each binding's
+# BINDING.md). Reads committed state in the runner-checkout, the same view
+# take_snapshot classifies from. Prints the integer; returns 1 (with a
+# stderr diagnostic) when the script is absent, fails, or prints no integer.
+#
+# Args: $1 = binding-native ref.
+read_blocked_passes() {
+  local ref="$1"
+  local script="$HOST_REPO/docs/formann/issue-tracker/blocked-passes"
+  if [ ! -x "$script" ]; then
+    echo "runner: blocked-passes: $script not found or not executable" >&2
+    return 1
+  fi
+  local rc=0 out
+  out="$(SNAPSHOT_CHECKOUT_DIR="$HOST_CHECKOUT" "$script" "$ref")" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "runner: blocked-passes exited non-zero ($rc) for $ref" >&2
+    return 1
+  fi
+  case "$out" in
+    ''|*[!0-9]*)
+      echo "runner: blocked-passes printed no count for $ref" >&2
+      return 1
+      ;;
+  esac
+  printf '%s\n' "$out"
 }
 
 # Pre-dispatch sync-base selector. Pure function — takes a pre-computed
@@ -2981,9 +3058,11 @@ capture_dispatch_core_files() {
 # For each item: dispatch in the sandbox, propagate committed work by commit
 # delta, snapshot, classify with classify_item_action, and react.
 #
-# The walk stops as soon as the issue reaches a terminal state (stop-success)
-# or a failure occurs. If the list is exhausted with the issue still at
-# in-review, the outcome is a neutral "left-for-human" with no abort flag.
+# The walk stops as soon as the issue reaches a terminal state (stop-success),
+# a failure occurs, or a step ends `BLOCKED: <dependency>` (blocked — state
+# untouched, no abort flag, return 0; left-for-human at the third Blocked
+# pass). If the list is exhausted with the issue still at in-review, the
+# outcome is a neutral "left-for-human" with no abort flag.
 #
 # Args:
 #   $1  = feature
@@ -3120,10 +3199,59 @@ walk_post_implement_steps() {
     post_item_status="$(jq -r --arg r "$ref" \
       '(.issues[] | select(.ref == $r) | .status) // empty' <<<"$post_item_json")"
 
+    # Blocked: a clean step whose closing line is `BLOCKED: <dependency>`.
+    # The pass count (this pass's Blocked comment included) comes from the
+    # tracker, so a runner on another machine continues the same count. `|`
+    # is the dispatch-record delimiter, so it is replaced in the name.
+    local item_blocked=false item_blocked_dep="" item_blocked_passes=0
+    if [ "$item_rc" = "0" ]; then
+      item_blocked_dep="$(blocked_dependency "$item_log_base.stdout.jsonl")"
+      if [ -n "$item_blocked_dep" ]; then
+        item_blocked=true
+        item_blocked_dep="${item_blocked_dep//|//}"
+        if ! item_blocked_passes="$(read_blocked_passes "$ref")"; then
+          echo "runner: walk_post_implement_steps: could not read the Blocked pass count for '$ref'; counting this pass as below the limit" >&2
+          item_blocked_passes=0
+        fi
+      fi
+    fi
+
     local item_action
-    item_action="$(classify_item_action "$post_item_status" "$item_rc")"
+    item_action="$(classify_item_action "$post_item_status" "$item_rc" \
+      "$item_blocked" "$item_blocked_passes")"
 
     case "$item_action" in
+      blocked|left-for-human)
+        # A dependency outside the run was unreachable. The issue keeps its
+        # state and gets no abort flag; the walk stops here for this issue
+        # and the run moves on. Below the pass limit a later pass re-runs the
+        # walk; at the limit the issue is left for a human, the Blocked
+        # comments on its timeline being the reason. The step's commit (its
+        # Blocked comment, under local-markdown) is propagated either way.
+        local blocked_progress_label blocked_combined_label
+        if [ "$item_action" = "blocked" ]; then
+          blocked_progress_label="blocked ($item_blocked_dep)"
+          blocked_combined_label="blocked ($item_blocked_dep)"
+        else
+          blocked_progress_label="left-for-human (blocked: $item_blocked_dep, $item_blocked_passes passes)"
+          blocked_combined_label="left-for-human (blocked: $item_blocked_dep)"
+        fi
+        format_progress_outcome "$(now_clock)" "$ref" "$item_label" "$blocked_progress_label" "$item_duration"
+        if [ "$item_has_runner_commits" -eq 1 ]; then
+          if ! propagate_feature "$feature"; then
+            local halt_duration
+            halt_duration=$(( $(date +%s) - item_started_at + impl_duration + total_item_seconds - item_duration ))
+            format_progress_outcome "$(now_clock)" "$ref" "$item_label" "halt → gate-failed" "$item_duration"
+            record_dispatch "$feature" "$nn" "$ref" "gate-failed" "$halt_duration" "$step_logs" "$total_attempts"
+            RUN_STOP_REASON="propagation-error"
+            return 1
+          fi
+        fi
+        record_dispatch "$feature" "$nn" "$ref" "$blocked_combined_label" \
+          "$iter_duration" "$step_logs" "$total_attempts"
+        return 0
+        ;;
+
       stop-success)
         format_progress_outcome "$(now_clock)" "$ref" "$item_label" "clean → done" "$item_duration"
         if [ "$item_has_runner_commits" -eq 1 ]; then

@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - AFK runner passes the output of an optional, consumer-owned `runner/sandbox-env` into every
   dispatch container, beside the binding's env. It can add variables but never replace one the
   runner or the binding sets, nor set any `ANTHROPIC_*` or `CLAUDE_CODE_*` variable.
+- A post-implement step that can't reach a dependency outside the run (a consumer's service, a
+  preview environment) can end Blocked: it posts a `Blocked` comment and ends with
+  `BLOCKED: <dependency>`. The runner leaves the issue's state alone, writes no abort flag, shows
+  `blocked (<dependency>)` and moves on; the third Blocked pass leaves the issue for a human. The
+  pass count is read from the tracker through each binding's new `blocked-passes` script.
 
 ### Fixed
 - AFK dispatches can no longer end their turn waiting on a background build: background Bash is disabled in the sandbox and foreground Bash may run for up to an hour.

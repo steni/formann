@@ -67,7 +67,7 @@ Write (or replace) the triage notes for this issue. Body-shaped: recording overw
 
 ### Comment with `<kind>`
 
-Append a comment to the issue's timeline. Timeline-shaped: append-only, history is preserved. The kind names the producing context — examples: `Implementation`, `Verification`, `Rework notes`, `Wontfix explanation`, `Post-mortem`, `Review (AFK gate)`, `Note`.
+Append a comment to the issue's timeline. Timeline-shaped: append-only, history is preserved. The kind names the producing context — examples: `Implementation`, `Verification`, `Rework notes`, `Wontfix explanation`, `Post-mortem`, `Review (AFK gate)`, `Blocked`, `Note`.
 
 **Local-markdown realization:**
 
@@ -77,6 +77,8 @@ Append a comment to the issue's timeline. Timeline-shaped: append-only, history 
 - Sub-blocks (Evidence, Findings, Decisions, Resolved scope, Verification summary) live as **bolded labels** — `**Evidence**`, `**Findings**`, etc. — inside the producing comment subsection. They are never `####` nested headings and never sibling sections of `## Comments`.
 - The body above `## Comments` is read-only after triage. Corrections and follow-ups go in a new comment. The only above-the-fold mutations permitted after triage are frontmatter field writes (Set the state, Set issue metadata) and the Triage Notes section (written and cleared by the Record triage notes verb only).
 - Commit the appended comment via a `tracker:` commit (see [Committing tracker changes](#committing-tracker-changes)). A comment posted alongside a status change is the same logical operation — both file edits land in one commit, not two.
+
+**Blocked pass count:** `blocked-passes <feature>/<NN>` prints the number of `### Blocked — <date>` (or `### Blocked (n) — <date>`) subsections of the issue file's `## Comments` section since its latest `### Implementation …` subsection — all of them when there is none. Headings inside fenced code blocks don't count. With `SNAPSHOT_CHECKOUT_DIR` set (as the AFK runner does) it reads the committed file at that checkout's HEAD, the same view `tracker-snapshot` uses. Exit codes: `0` success, `1` issue file not found, `2` usage error.
 
 #### Canonical example
 

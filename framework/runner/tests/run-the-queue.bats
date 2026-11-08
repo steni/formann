@@ -137,8 +137,10 @@ emit_result_event() {
 # === classify_item_action =====================================================
 #
 # Pure classifier for the per-item control-flow decision after a post-implement
-# step runs. Inputs: (post-item status string, dispatch exit code). Returns
-# exactly one of `stop-success`, `continue`, `terminate-run`, `fail`.
+# step runs. Inputs: (post-item status string, dispatch exit code, and the
+# optional blocked / blocked-passes pair). Returns exactly one of
+# `stop-success`, `continue`, `terminate-run`, `fail`, or — for a Blocked
+# step — `blocked` / `left-for-human` (see "Blocked steps" below).
 
 @test "classify_item_action — exit 0 + done is stop-success" {
   [ "$(classify_item_action done 0)" = "stop-success" ]
@@ -185,8 +187,8 @@ emit_result_event() {
 }
 
 @test "classify_item_action — no transport_crash input, no transport-flavoured output" {
-  # The function takes exactly two args; any third arg is ignored and the
-  # output must never include a transport-flavoured token.
+  # The optional inputs are blocked / blocked-passes, never a transport
+  # flag; the output must never include a transport-flavoured token.
   result="$(classify_item_action in-review 1)"
   [ "$result" != "review-aborted" ]
   [ "$result" != "dispatch-aborted" ]
@@ -8253,4 +8255,303 @@ f|02|f/02|in-review|10|y|1|local-only (propagated → host)'
   body="$(declare -f propagate_feature)"
   ! grep -qE 'push[^|]*(--force|-f |\+\$|"\+)' <<<"$body"
   grep -q 'push --quiet' <<<"$body"
+}
+
+# === Blocked steps (#3) =======================================================
+#
+# A post-implement step that cannot reach a dependency posts a Blocked comment
+# and ends its result with `BLOCKED: <dependency>`. The runner leaves the
+# issue's state alone, writes no abort flag, and moves on; at the third Blocked
+# pass (count read from the tracker via the binding's blocked-passes script)
+# the issue is left for a human.
+
+# Write a clean terminal `result` event whose closing message is $2.
+emit_result_text() {
+  local base="$1" text="$2"
+  jq -cn --arg t "$text" \
+    '{type:"result",subtype:"success",is_error:false,api_error_status:null,result:$t,uuid:"u"}' \
+    >"$base.stdout.jsonl"
+}
+
+# Independent oracle for the classifier's documented guard order.
+_expected_item_action() {
+  local status="$1" rc="$2" blocked="$3" passes="$4"
+  if [ "$rc" != "0" ]; then echo fail; return; fi
+  if [ "$blocked" = "true" ]; then
+    if [ "$passes" -ge 3 ]; then echo left-for-human; else echo blocked; fi
+    return
+  fi
+  case "$status" in
+    done|wontfix|"") echo stop-success ;;
+    in-review) echo continue ;;
+    ready-for-agent) echo terminate-run ;;
+    *) echo fail ;;
+  esac
+}
+
+@test "classify_item_action — exhaustive over status × exit code × blocked × passes 0–3" {
+  local status rc blocked passes got want n=0
+  for status in done wontfix "" in-review ready-for-agent ready-for-human needs-triage needs-info some-unknown; do
+    for rc in 0 1 137; do
+      for blocked in false true; do
+        for passes in 0 1 2 3; do
+          n=$((n + 1))
+          got="$(classify_item_action "$status" "$rc" "$blocked" "$passes")"
+          want="$(_expected_item_action "$status" "$rc" "$blocked" "$passes")"
+          [ "$got" = "$want" ] || fail "status='$status' rc=$rc blocked=$blocked passes=$passes: got '$got', want '$want'"
+        done
+      done
+      # Two-argument form behaves as blocked=false.
+      got="$(classify_item_action "$status" "$rc")"
+      want="$(_expected_item_action "$status" "$rc" false 0)"
+      [ "$got" = "$want" ] || fail "two-arg status='$status' rc=$rc: got '$got', want '$want'"
+    done
+  done
+  [ "$n" -eq 216 ]
+}
+
+@test "classify_item_action — blocked below three passes is blocked, at three or more is left-for-human" {
+  [ "$(classify_item_action in-review 0 true 0)" = "blocked" ]
+  [ "$(classify_item_action in-review 0 true 2)" = "blocked" ]
+  [ "$(classify_item_action in-review 0 true 3)" = "left-for-human" ]
+  [ "$(classify_item_action in-review 0 true 4)" = "left-for-human" ]
+  # blocked precedes the status-based actions; a nonzero exit is still fail.
+  [ "$(classify_item_action done 0 true 1)" = "blocked" ]
+  [ "$(classify_item_action ready-for-agent 0 true 1)" = "blocked" ]
+  [ "$(classify_item_action in-review 1 true 1)" = "fail" ]
+  # An unreadable pass count is treated as 0, never as exhausted.
+  [ "$(classify_item_action in-review 0 true "")" = "blocked" ]
+  [ "$(classify_item_action in-review 0 true x)" = "blocked" ]
+}
+
+@test "blocked_dependency — reads the dependency from a final BLOCKED: line" {
+  local base="$BATS_TEST_TMPDIR/d"
+  emit_result_text "$base" $'Posted a Blocked comment.\n\nBLOCKED: preview-daemon\n'
+  [ "$(blocked_dependency "$base.stdout.jsonl")" = "preview-daemon" ]
+
+  emit_result_text "$base" 'BLOCKED:   consumer api  '
+  [ "$(blocked_dependency "$base.stdout.jsonl")" = "consumer api" ]
+}
+
+@test "blocked_dependency — empty unless BLOCKED: is the final line" {
+  local base="$BATS_TEST_TMPDIR/d"
+  emit_result_text "$base" $'BLOCKED: preview-daemon\nverdict: clean'
+  [ -z "$(blocked_dependency "$base.stdout.jsonl")" ]
+  emit_result_text "$base" 'verdict: blocked'
+  [ -z "$(blocked_dependency "$base.stdout.jsonl")" ]
+  emit_result_text "$base" 'BLOCKED:'
+  [ -z "$(blocked_dependency "$base.stdout.jsonl")" ]
+  emit_result_text "$base" 'not BLOCKED: x'
+  [ -z "$(blocked_dependency "$base.stdout.jsonl")" ]
+  [ -z "$(blocked_dependency "$BATS_TEST_TMPDIR/missing.stdout.jsonl")" ]
+}
+
+@test "read_blocked_passes — runs the role surface's blocked-passes against the runner-checkout" {
+  HOST_REPO="$BATS_TEST_TMPDIR/host"
+  HOST_CHECKOUT="$BATS_TEST_TMPDIR/checkout"
+  mkdir -p "$HOST_REPO/docs/formann/issue-tracker"
+  cat >"$HOST_REPO/docs/formann/issue-tracker/blocked-passes" <<'S'
+#!/usr/bin/env bash
+echo "$1|$SNAPSHOT_CHECKOUT_DIR" >"$BLOCKED_PASSES_ARGS"
+echo 2
+S
+  chmod +x "$HOST_REPO/docs/formann/issue-tracker/blocked-passes"
+  export BLOCKED_PASSES_ARGS="$BATS_TEST_TMPDIR/args"
+
+  [ "$(read_blocked_passes '#7')" = "2" ]
+  [ "$(cat "$BLOCKED_PASSES_ARGS")" = "#7|$HOST_CHECKOUT" ]
+}
+
+@test "read_blocked_passes — a failing or absent script yields an error, not a count" {
+  HOST_REPO="$BATS_TEST_TMPDIR/host"
+  HOST_CHECKOUT="$BATS_TEST_TMPDIR/checkout"
+  mkdir -p "$HOST_REPO/docs/formann/issue-tracker"
+  run read_blocked_passes '#7'
+  assert_failure
+
+  printf '#!/usr/bin/env bash\nexit 3\n' >"$HOST_REPO/docs/formann/issue-tracker/blocked-passes"
+  chmod +x "$HOST_REPO/docs/formann/issue-tracker/blocked-passes"
+  run read_blocked_passes '#7'
+  assert_failure
+
+  printf '#!/usr/bin/env bash\necho lots\n' >"$HOST_REPO/docs/formann/issue-tracker/blocked-passes"
+  run read_blocked_passes '#7'
+  assert_failure
+}
+
+# Walk fixture: a two-item manifest whose first step ends Blocked. The issue
+# stays at in-review; read_blocked_passes returns $TEST_BLOCKED_PASSES.
+setup_blocked_walk() {
+  setup_dispatch_one_test
+  BLOCKED_MANIFEST="$(printf 'review\t%s\ngate\t%s\n' "$HERE/review-and-gate.md" "$HERE/gate.md")"
+  BLOCKED_POST_IMPL='{"feature":"f","issues":[{"ref":"f/01","nn":"01","status":"in-review","category":"enhancement","type":"AFK","blocked_by":[],"eligible":false}]}'
+  take_snapshot() { printf '%s' "$BLOCKED_POST_IMPL"; }
+  TEST_ITEM_CALLS="$BATS_TEST_TMPDIR/item-calls"
+  : >"$TEST_ITEM_CALLS"
+  run_item_container() {
+    printf '%s\n' "$3" >>"$TEST_ITEM_CALLS"
+    emit_result_text "$2" $'Posted a Blocked comment.\nBLOCKED: preview-daemon'
+    return 0
+  }
+  TEST_BLOCKED_PASSES=1
+  TEST_PASSES_REFS="$BATS_TEST_TMPDIR/passes-refs"
+  : >"$TEST_PASSES_REFS"
+  read_blocked_passes() { echo "$1" >>"$TEST_PASSES_REFS"; echo "$TEST_BLOCKED_PASSES"; }
+  TEST_PROPAGATE_CALLS="$BATS_TEST_TMPDIR/prop-calls"
+  : >"$TEST_PROPAGATE_CALLS"
+  propagate_feature() { echo called >>"$TEST_PROPAGATE_CALLS"; return 0; }
+  RUN_DISPATCHES=()
+  RUN_STOP_REASON=""
+}
+
+@test "walk_post_implement_steps — BLOCKED: <dep> stops the walk, records blocked (<dep>), no abort flag" {
+  setup_blocked_walk
+  local progress="$BATS_TEST_TMPDIR/progress"
+  walk_post_implement_steps "f" "01" "f/01" \
+    "$TEST_RUN_DIR" "$TEST_RUN_DIR" "01" "$BLOCKED_POST_IMPL" \
+    "in-review" 10 1 "$BLOCKED_MANIFEST" >"$progress"
+  local rc=$?
+
+  [ "$rc" -eq 0 ]
+  # Only the blocked step ran; the gate step was not dispatched.
+  [ "$(wc -l <"$TEST_ITEM_CALLS" | tr -d ' ')" = "1" ]
+  # The pass count was read for this issue's ref.
+  [ "$(cat "$TEST_PASSES_REFS")" = "f/01" ]
+  [ "${#RUN_DISPATCHES[@]}" -eq 1 ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|blocked (preview-daemon)|"*"|01-review|"* ]]
+  grep -qF ' f/01 review → blocked (preview-daemon) (' "$progress"
+  [ ! -e "$HOST_ABORT_DIR/f/01" ]
+  [ -z "$RUN_STOP_REASON" ]
+}
+
+@test "walk_post_implement_steps — a Blocked step's commit (its Blocked comment) is propagated" {
+  setup_blocked_walk
+  run_item_container() {
+    git -C "$HOST_CHECKOUT" -c user.email=t@t -c user.name=t \
+      commit --allow-empty --quiet -m "tracker: f/01 Blocked"
+    emit_result_text "$2" 'BLOCKED: preview-daemon'
+    return 0
+  }
+  walk_post_implement_steps "f" "01" "f/01" \
+    "$TEST_RUN_DIR" "$TEST_RUN_DIR" "01" "$BLOCKED_POST_IMPL" \
+    "in-review" 10 1 "$BLOCKED_MANIFEST" >/dev/null
+  [ "$(wc -l <"$TEST_PROPAGATE_CALLS" | tr -d ' ')" = "1" ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|blocked (preview-daemon)|"* ]]
+}
+
+@test "walk_post_implement_steps — two prior Blocked comments + this pass (3) leaves the issue for a human" {
+  setup_blocked_walk
+  TEST_BLOCKED_PASSES=3
+  local progress="$BATS_TEST_TMPDIR/progress"
+  walk_post_implement_steps "f" "01" "f/01" \
+    "$TEST_RUN_DIR" "$TEST_RUN_DIR" "01" "$BLOCKED_POST_IMPL" \
+    "in-review" 10 1 "$BLOCKED_MANIFEST" >"$progress"
+  local rc=$?
+
+  [ "$rc" -eq 0 ]
+  [ "$(wc -l <"$TEST_ITEM_CALLS" | tr -d ' ')" = "1" ]
+  [ "${#RUN_DISPATCHES[@]}" -eq 1 ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|left-for-human (blocked: preview-daemon)|"*"|01-review|"* ]]
+  grep -qF ' f/01 review → left-for-human (blocked: preview-daemon, 3 passes) (' "$progress"
+  [ ! -e "$HOST_ABORT_DIR/f/01" ]
+}
+
+@test "walk_post_implement_steps — an unreadable pass count still ends blocked (count treated as 0)" {
+  setup_blocked_walk
+  read_blocked_passes() { return 1; }
+  walk_post_implement_steps "f" "01" "f/01" \
+    "$TEST_RUN_DIR" "$TEST_RUN_DIR" "01" "$BLOCKED_POST_IMPL" \
+    "in-review" 10 1 "$BLOCKED_MANIFEST" >/dev/null 2>"$BATS_TEST_TMPDIR/err"
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|blocked (preview-daemon)|"* ]]
+  grep -q 'could not read the Blocked pass count' "$BATS_TEST_TMPDIR/err"
+}
+
+@test "walk_post_implement_steps — a step without a BLOCKED: line does not read the pass count" {
+  setup_blocked_walk
+  run_item_container() { emit_result_text "$2" 'verdict: blocked'; return 0; }
+  walk_post_implement_steps "f" "01" "f/01" \
+    "$TEST_RUN_DIR" "$TEST_RUN_DIR" "01" "$BLOCKED_POST_IMPL" \
+    "in-review" 10 1 "$BLOCKED_MANIFEST" >/dev/null
+  [ ! -s "$TEST_PASSES_REFS" ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|left-for-human|"*"|01-review:02-gate|"* ]]
+}
+
+@test "walk_post_implement_steps — BLOCKED: with a nonzero exit is a failure, not blocked" {
+  setup_blocked_walk
+  run_item_container() { emit_result_text "$2" 'BLOCKED: preview-daemon'; return 1; }
+  set +e
+  walk_post_implement_steps "f" "01" "f/01" \
+    "$TEST_RUN_DIR" "$TEST_RUN_DIR" "01" "$BLOCKED_POST_IMPL" \
+    "in-review" 10 1 "$BLOCKED_MANIFEST" >/dev/null
+  local rc=$?
+  set -e
+  [ "$rc" -eq 1 ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|gate-failed|"* ]]
+  [ -f "$HOST_ABORT_DIR/f/01" ]
+}
+
+@test "walk_post_implement_steps — a dependency name containing | is recorded without breaking the record" {
+  setup_blocked_walk
+  run_item_container() { emit_result_text "$2" 'BLOCKED: a|b'; return 0; }
+  walk_post_implement_steps "f" "01" "f/01" \
+    "$TEST_RUN_DIR" "$TEST_RUN_DIR" "01" "$BLOCKED_POST_IMPL" \
+    "in-review" 10 1 "$BLOCKED_MANIFEST" >/dev/null
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|blocked (a/b)|"* ]]
+}
+
+@test "run_loop — a Blocked issue keeps its status, gets no abort flag, and the run dispatches the next eligible issue" {
+  setup_dispatch_one_test
+  ensure_runner_checkout() { :; }
+  propagate_feature() { return 0; }
+  read_blocked_passes() { echo 1; }
+  RUN_DIR="$TEST_RUN_DIR"
+  RESOLVED_MANIFEST="$(printf 'review\t%s\n' "$HERE/review-and-gate.md")"
+
+  # Tracker state: one status per issue, rewritten by the mocked dispatches.
+  TEST_STATE="$BATS_TEST_TMPDIR/state"
+  printf '01 ready-for-agent\n02 ready-for-agent\n' >"$TEST_STATE"
+  take_snapshot() {
+    jq -Rn '{feature:"f",issues:[inputs | split(" ") |
+      {ref:("f/"+.[0]), nn:.[0], status:.[1], category:"enhancement", type:"AFK",
+       blocked_by:[], eligible:(.[1]=="ready-for-agent")}]}' <"$TEST_STATE"
+  }
+  TEST_IMPL_CALLS="$BATS_TEST_TMPDIR/impl-calls"
+  : >"$TEST_IMPL_CALLS"
+  run_dispatch_container() {
+    local nn="${1##*/}"
+    echo "$1" >>"$TEST_IMPL_CALLS"
+    sed -i.bak "s/^$nn .*/$nn in-review/" "$TEST_STATE"
+    return 0
+  }
+  run_item_container() {
+    local nn="${1##*/}"
+    if [ "$nn" = "01" ]; then
+      emit_result_text "$2" 'BLOCKED: preview-daemon'
+    else
+      sed -i.bak "s/^$nn .*/$nn done/" "$TEST_STATE"
+      emit_result_text "$2" 'verdict: clean'
+    fi
+    return 0
+  }
+
+  RUN_DISPATCHES=()
+  RUN_STOP_REASON=""
+  run_loop >"$BATS_TEST_TMPDIR/progress"
+
+  [ "$RUN_STOP_REASON" = "queue-empty" ]
+  [ "$(cat "$TEST_IMPL_CALLS")" = "$(printf 'f/01\nf/02')" ]
+  # f/01 untouched by the runner after its Blocked step: still in-review.
+  grep -qx '01 in-review' "$TEST_STATE"
+  grep -qx '02 done' "$TEST_STATE"
+  [ ! -e "$HOST_ABORT_DIR/f/01" ]
+  [ "${#RUN_DISPATCHES[@]}" -eq 2 ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|blocked (preview-daemon)|"* ]]
+  [[ "${RUN_DISPATCHES[1]}" == "f|02|f/02|done|"* ]]
+}
+
+@test "format_summary_md — a Blocked row shows blocked (<dependency>)" {
+  run format_summary_md f 20261108-120000 12:00:00 12:05:00 ended queue-empty \
+    <<<"f|01|f/01|blocked (preview-daemon)|42|01-review|1|"
+  assert_success
+  assert_output --partial '| f/01 | blocked (preview-daemon) | 42s | - | [01.summary.md](01.summary.md) [01-01-review.summary.md](01-01-review.summary.md) |'
 }

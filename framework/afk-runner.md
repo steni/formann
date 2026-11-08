@@ -224,9 +224,9 @@ One iteration, end to end:
 6. **Propagate (any committed runner-checkout change)** — if the runner-checkout's HEAD advanced during the dispatch (the runner produced commits), publish them to the per-feature parking ref on host (`refs/remotes/runner/<branch>`, force-updated), then attempt a best-effort fast-forward of host's branch ref (no `--update-head-ok`). The propagation gate is the commit delta, not the classifier verdict. Under local-markdown, a `/implement` bail commits an explanatory `tracker:` comment without flipping status; that commit must reach the parking ref before the next iteration's sync moves on. Under GitHub Issues, a bail makes an API call that produces no commit — propagation is a no-op, which is correct. A genuine technical failure (container died before any tracker write) leaves HEAD unchanged and the runner skips propagation. Git's refusal of the host fast-forward (HEAD-on-target or non-ff) is an expected `parked-only` outcome and the iteration is recorded as success; only the parking-ref publish failing — a rare runner bug — records FAIL. If the classifier verdict is `failure` (independent of whether propagation ran), iteration also ends here with `FAIL`.
 7. **Post-implement walk** — every successful AFK implement proceeds to the manifest walk (`walk_post_implement_steps`). Both run modes refuse non-AFK refs before reaching this point (loop via the snapshot's `eligible` filter, single-dispatch via the same flag in `run_single`), so `dispatch_one` never sees a non-AFK ref. The walk iterates the resolved manifest items in order; for each item:
    - **Dispatch the step** — `claude -p "<step-prompt>\n<ref>" --output-format stream-json --verbose --dangerously-skip-permissions` (with `--model <id>` appended when `--model` was passed to the runner) in a fresh sandbox container (no PTY). Captured to the same per-dispatch artifact set as the implement stage: `<NN>-<step>-<label>.stdout.jsonl` (event stream), `.stderr.log` (diagnostics), `.summary.md` (extracted closing message).
-   - **Snapshot + classify** — the post-item status and the dispatch exit code feed `classify_item_action`, which returns one of `stop-success`, `continue`, `fail`, or `terminate-run`.
+   - **Snapshot + classify** — the post-item status, the dispatch exit code and, when the step's closing line is `BLOCKED: <dependency>`, its Blocked pass count feed `classify_item_action`, which returns one of `stop-success`, `continue`, `fail`, `terminate-run`, `blocked`, or `left-for-human`.
    - **Propagate** — same publish-then-fast-forward sequence as step 6, gated on the runner-checkout HEAD delta across the step dispatch. Under local-markdown a step's `tracker:` commit advances HEAD and this fires; under github-issues the step's API-only mutations leave HEAD unchanged and this is a no-op.
-   - **React** — `stop-success` (a terminal status like `done`) records `done` and ends the walk; `continue` (still `in-review`) advances to the next item, and its progress line reads `in-review` — or `left-for-human` when it was the last item, matching the combined outcome; `fail` records `gate-failed` (or `review-aborted` on a transport crash), writes an abort flag, and ends the walk; `terminate-run` (issue pushed back to `ready-for-agent`) records `halt → runaway` and halts the whole run. When the items are exhausted with the issue still at `in-review`, the walk records `left-for-human` (no abort flag).
+   - **React** — `stop-success` (a terminal status like `done`) records `done` and ends the walk; `continue` (still `in-review`) advances to the next item, and its progress line reads `in-review` — or `left-for-human` when it was the last item, matching the combined outcome; `fail` records `gate-failed` (or `review-aborted` on a transport crash), writes an abort flag, and ends the walk; `terminate-run` (issue pushed back to `ready-for-agent`) records `halt → runaway` and halts the whole run; `blocked` records `blocked (<dependency>)`, ends the walk without touching the issue's state or writing an abort flag, and the run moves on to the next eligible issue; `left-for-human` (the third Blocked pass) records `left-for-human (blocked: <dependency>)`, also without an abort flag. When the items are exhausted with the issue still at `in-review`, the walk records `left-for-human` (no abort flag).
 
 The default manifest is a single `review` step running the review-and-gate prompt, so the common case is observationally identical to a one-shot gate: implement, then one review-and-gate dispatch ending in `done` or `left-for-human`.
 
@@ -256,7 +256,7 @@ The review-and-gate prompt at `framework/runner/steps/review-and-gate.md` instru
 6. Record the outcome via BINDING.md verbs: "set the state to `done`" (clean only) and "comment with `Review (AFK gate)`". Under local-markdown this lands as a `tracker:` commit (the binding fixes only the `tracker:` prefix; the rest of the subject is the agent's phrasing); under GitHub Issues it is one or two API calls with no resulting commit.
 7. Emit the review-issue agent's output verbatim on stdout, followed by a `verdict: clean|blocked` line.
 
-The runner classifies each step's outcome from the post-step snapshot and the dispatch exit code (`classify_item_action`) — it does not parse the verdict line. The verdict line exists for the human reading the step's artifacts (`<NN>-<step>-<label>.summary.md` for the skim, `.stdout.jsonl` for the full trace) after the fact.
+The runner classifies each step's outcome from the post-step snapshot and the dispatch exit code (`classify_item_action`) — it does not parse the verdict line. The one line of a step's result the runner does read is a closing `BLOCKED: <dependency>` (see "Blocked steps" below). The verdict line exists for the human reading the step's artifacts (`<NN>-<step>-<label>.summary.md` for the skim, `.stdout.jsonl` for the full trace) after the fact.
 
 Why a separate dispatch (not a slash command, not part of `/implement`)? Independence. The same `claude` session that just shipped the work would have a strong continuity bias toward declaring it good. A fresh session, with no implementation context, reading only the committed state, exercises closer-to-cold-eyes judgment. The Docker isolation makes "fresh session" cheap.
 
@@ -299,19 +299,31 @@ A missing entry in either snapshot counts as "anything else". The pre-status gua
 
 ### `classify_item_action` — post-implement step
 
-Inputs: the post-item status and the step's dispatch exit code. Unlike the implement classifier it needs no pre-status — the walk only runs after a successful implement, so the issue is already at `in-review`. It returns the *action* the walk takes for that item:
+Inputs: the post-item status, the step's dispatch exit code, and an optional pair — `blocked` (`true` when the step's result ended `BLOCKED: <dependency>`) and `blocked-passes` (the issue's Blocked pass count, this pass included). Two-argument calls behave as `blocked = false`. Unlike the implement classifier it needs no pre-status — the walk only runs after a successful implement, so the issue is already at `in-review`. It returns the *action* the walk takes for that item:
 
-| #  | Guard (evaluated in order)                | Action          |
-| -- | ----------------------------------------- | --------------- |
-| 1  | exit code is nonzero                      | `fail`          |
-| 2  | post status ∈ {`done`, `wontfix`, absent} | `stop-success`  |
-| 3  | post status == `in-review`                | `continue`      |
-| 4  | post status == `ready-for-agent`          | `terminate-run` |
-| 5  | post status is anything else              | `fail`          |
+| #  | Guard (evaluated in order)                | Action           |
+| -- | ----------------------------------------- | ---------------- |
+| 1  | exit code is nonzero                      | `fail`           |
+| 2  | blocked and passes < 3                    | `blocked`        |
+| 3  | blocked and passes ≥ 3                    | `left-for-human` |
+| 4  | post status ∈ {`done`, `wontfix`, absent} | `stop-success`   |
+| 5  | post status == `in-review`                | `continue`       |
+| 6  | post status == `ready-for-agent`          | `terminate-run`  |
+| 7  | post status is anything else              | `fail`           |
+
+Blocked takes precedence over every status-based guard, but not over a nonzero exit: a failed dispatch is a failure whatever its last line says. A missing or non-integer pass count counts as 0.
 
 An **absent** ref (guard 2) is `stop-success`, not a failure: the github-issues binding closes the issue on `done`, so the issue dropping out of the snapshot is that binding's native "done" signal. `wontfix` is also terminal — a valid final resolution.
 
-`classify_item_action` itself knows nothing about transport crashes or abort flags — those are `walk_post_implement_steps`' job. The walk maps each action to a combined outcome: `stop-success` → `done` (return 0); `continue` → advance to the next item, or `left-for-human` if it was the last (return 0, no abort flag); `fail` → `gate-failed`, or `review-aborted` when the step subprocess transport-crashed (return 1, abort flag `type: technical` / `type: transport` respectively); `terminate-run` → `halt → runaway`, halting the whole run (return 1, no abort flag — the issue is eligible, not stuck).
+`classify_item_action` itself knows nothing about transport crashes or abort flags — those are `walk_post_implement_steps`' job. The walk maps each action to a combined outcome: `stop-success` → `done` (return 0); `continue` → advance to the next item, or `left-for-human` if it was the last (return 0, no abort flag); `fail` → `gate-failed`, or `review-aborted` when the step subprocess transport-crashed (return 1, abort flag `type: technical` / `type: transport` respectively); `terminate-run` → `halt → runaway`, halting the whole run (return 1, no abort flag — the issue is eligible, not stuck); `blocked` → `blocked (<dependency>)` (return 0, no abort flag, no state change); `left-for-human` → `left-for-human (blocked: <dependency>)` (return 0, no abort flag).
+
+### Blocked steps
+
+A step that cannot reach something it needs from outside the run — a consumer's service, a preview environment — ends **Blocked** instead of reporting a finding or failing. Every framework step prompt carries the contract: post a comment of kind `Blocked` (through "Comment with `<kind>`") naming the dependency and the error, change no state, and end the final message with the line `BLOCKED: <dependency>`.
+
+The runner reads that line from the step's terminal `result` event (`blocked_dependency`; it must be the last non-blank line). It then reads the issue's **Blocked pass count** from the tracker through the binding's `blocked-passes` script on the role surface (`read_blocked_passes`): the number of `Blocked` comments since the issue's latest `Implementation` comment. A rework posts a new Implementation comment, so it resets the count. Because the count lives on the tracker, a runner on another machine continues it. If the count can't be read the runner logs it and treats the pass as below the limit.
+
+Below three passes the issue keeps its state (`in-review`), no abort flag is written, the walk stops for that issue, and the run moves on to the next eligible issue; the progress line and `SUMMARY.md` show `blocked (<dependency>)`. The next run re-runs the walk. At the third pass the issue is left for a human — `left-for-human (blocked: <dependency>)`, no abort flag — with the Blocked comments on its timeline as the reason.
 
 ### Combined per-iteration outcome
 
@@ -326,6 +338,8 @@ An **absent** ref (guard 2) is `stop-success`, not a failure: the github-issues 
 | `in-review`        | AFK iteration interrupted between implement-finish and the start of the post-implement walk — implement landed `in-review`, the interrupt pre-empted the first step, and the iteration is recorded at its implement outcome. |
 | `FAIL`             | Implement-stage failure (classifier verdict, container error, or parking-ref publish failure). Runner writes an abort flag where applicable and continues. |
 | `halt → runaway`   | A post-implement step drove the issue back to `ready-for-agent` (a misconfigured manifest). The runner halts the entire run immediately. No abort flag — the issue is eligible, not stuck. |
+| `blocked (<dependency>)` | AFK iteration; a post-implement step ended `BLOCKED: <dependency>` below three Blocked passes. The issue keeps its state, no abort flag, and the run moves on; a later run re-runs the walk. |
+| `left-for-human (blocked: <dependency>)` | AFK iteration; the third Blocked pass. Left for the maintainer with the Blocked comments as the reason. No abort flag. |
 
 ## Pre-flight invariants
 

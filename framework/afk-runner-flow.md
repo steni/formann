@@ -360,8 +360,10 @@ the classifier runs.
    │        │                            snapshot-failed-mid-dispatch:post-<label>; │
    │        │                            record FAIL; ret 1                    │
    │        ▼ yes                                                              │
-   │   action = classify_item_action(post status, item_rc)                     │
-   │        (status + exit code only; nonzero exit ─► fail)                    │
+   │   blocked = result ends `BLOCKED: <dep>` (item_rc 0 only);               │
+   │   passes  = read_blocked_passes(ref) when blocked (unreadable ─► 0)      │
+   │   action = classify_item_action(post status, item_rc, blocked, passes)   │
+   │        (nonzero exit ─► fail; blocked precedes status)                    │
    │             │                                                             │
    │        [action?]                                                          │
    │        │                                                                  │
@@ -373,6 +375,14 @@ the classifier runs.
    │        │          aborted, else technical); propagate (when commits;      │
    │        │          park error ─► propagation-error); record gate-failed    │
    │        │          / review-aborted; ret 1                                 │
+   │        │                                                                  │
+   │        ├─ blocked (passes < 3) ─► propagate (when commits; park error ─► │
+   │        │                   gate-failed, propagation-error, ret 1);        │
+   │        │                   record blocked (<dep>); ret 0                  │
+   │        │                   (no abort flag, no state change; run moves on) │
+   │        │                                                                  │
+   │        ├─ left-for-human (blocked, passes ≥ 3) ─► same, but record        │
+   │        │                   left-for-human (blocked: <dep>); ret 0         │
    │        │                                                                  │
    │        ├─ terminate-run ─► propagate (when commits); RUN_STOP_REASON =    │
    │        │                   runaway-halt(<ref>); record halt → runaway;    │
@@ -406,6 +416,9 @@ the classifier runs.
 | Step `stop-success`, propagate ok | `done` | 0 | no | no |
 | Walk exhausted (issue still `in-review`) | `left-for-human` | 0 | no | no |
 | Step `terminate-run` (issue back to `ready-for-agent`) | `halt → runaway` | 1 | `runaway-halt (<ref>)` | no |
+| Step `blocked` (`BLOCKED: <dep>`, fewer than three Blocked passes), propagate ok | `blocked (<dep>)` | 0 | no | no |
+| Step `left-for-human` (third Blocked pass), propagate ok | `left-for-human (blocked: <dep>)` | 0 | no | no |
+| Step `blocked`/`left-for-human`, propagate error | `gate-failed` | 1 | `propagation-error` | no |
 
 The two snapshot-failure rows bail before the classifier runs — an unreadable snapshot leaves the issue's state unknown — parking any committed work first so the next iteration's reset can't lose it. `snapshot-failed-mid-dispatch:<stage>` is transient: `run_single` overwrites it with `single-dispatch (…)`, and in loop / drain mode the next iteration re-snapshots and re-classifies, so it shows up in the per-iteration record but not in the terminal Stop reasons list below.
 

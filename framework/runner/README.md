@@ -112,6 +112,8 @@ combined-outcome column. The combined-outcome vocabulary is:
 | `window-exhausted` | The dispatch (implement or walk item — the abort flag's `dispatch:` field names the stage) still died usage-window-rejected after `RUNNER_WINDOW_RETRY_MAX_WAITS` window-waits. The quota is structurally insufficient for this dispatch, not a blip to `rm` and re-run. Runner writes a `type: window` abort flag and continues. |
 | `in-review` | AFK iteration interrupted between implement-finish and the start of the post-implement walk: implement landed `in-review`, the interrupt pre-empted the first walk step, and the iteration is recorded at its implement outcome. |
 | `FAIL` | Implement-stage failure (classifier verdict, container error, or parking-ref publish failure). Any `tracker:` work the dispatch did commit (notably the comment `/implement` posts on a bail) is still propagated to the host so it shows up on your branch when you return. |
+| `blocked (<dependency>)` | A post-implement step couldn't reach a dependency outside the run and ended `BLOCKED: <dependency>` after posting a Blocked comment. The issue keeps its state, no abort flag is written, and the run moves on to the next eligible issue; the next run re-runs the walk. |
+| `left-for-human (blocked: <dependency>)` | The third Blocked pass (counted from the issue's Blocked comments since its latest Implementation comment). The issue is left for you with those comments as the reason. No abort flag. |
 | `halt → runaway` | A post-implement step drove the issue back to `ready-for-agent` (eligible) — a misconfigured manifest that would otherwise re-dispatch the same ref forever. The runner halts the entire run immediately. No abort flag (the issue is eligible, not stuck); the maintainer fixes the manifest. |
 
 The trailing `stop reason:` line varies by mode.
@@ -322,7 +324,12 @@ contract*) for the term definitions.
 The runner classifies the step's outcome from the snapshot delta and the
 dispatch exit code (`classify_item_action` in `run-the-queue.sh`, called
 per walk step by `walk_post_implement_steps`) — it does not parse the
-verdict line. A terminal status (`done`) and an issue left at `in-review`
+verdict line. The one result line it does read is a closing
+`BLOCKED: <dependency>`: the step couldn't reach something outside the run.
+The runner then reads the issue's Blocked pass count through the binding's
+`blocked-passes` script (`docs/formann/issue-tracker/blocked-passes <ref>`)
+and records `blocked (<dependency>)`, or `left-for-human (blocked: …)` at
+the third pass. See "Blocked steps" in `afk-runner.md`. A terminal status (`done`) and an issue left at `in-review`
 both return 0 from `dispatch_one` (operational health is fine; the
 verdict is independent); a failed step returns 1 and writes an abort flag.
 

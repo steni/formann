@@ -298,7 +298,7 @@ docs/formann/issue-tracker/body-edit <N> "Triage Notes" /dev/null
 
 ### Comment with `<kind>`
 
-Append a comment to the issue's timeline. Timeline-shaped: append-only, history is preserved. The kind names the producing context — examples: `Implementation`, `Verification`, `Rework notes`, `Wontfix explanation`, `Post-mortem`, `Review (AFK gate)`, `Note`.
+Append a comment to the issue's timeline. Timeline-shaped: append-only, history is preserved. The kind names the producing context — examples: `Implementation`, `Verification`, `Rework notes`, `Wontfix explanation`, `Post-mortem`, `Review (AFK gate)`, `Blocked`, `Note`.
 
 **GitHub-issues realization:** Construct the comment content and pass it inline via `--body` with a quoted heredoc:
 
@@ -364,6 +364,8 @@ If the count is `0`, post without a suffix. If the count is `n ≥ 1`, use suffi
 The third call illustrates why the regex must match both un-suffixed (` — <date>`) and `(N)`-suffixed (` (N) — <date>`) forms: without the `(N)` branch, `### Implementation (2) — 2026-05-16` would not register as a prior heading, so `count` would stay at `1` and the third comment would collide on `(2)`.
 
 **Web-UI comments:** Comments posted through the GitHub web UI that do not carry the `### <Kind> — <date>` heading are treated as unstructured notes. Nothing breaks — the comment-timeline reader ignores them for kind-classification purposes; they remain visible in the timeline.
+
+**Blocked pass count:** `blocked-passes <ref>` (`#N` or `N`) prints the number of `Blocked` comments since the issue's latest `Implementation` comment — all of them when there is none. It reads the timeline through **Read the issue** (`gh issue view <N> --json comments`) and classifies each comment by its first line only (`### Blocked — <date>` or `### Blocked (n) — <date>`), so a heading quoted further down a comment never counts. The AFK runner calls it after a step ends `BLOCKED: <dependency>`. Exit codes: `0` success, `2` usage error, `3` API failure after retries.
 
 ### Create a feature
 

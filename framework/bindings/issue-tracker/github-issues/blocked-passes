@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+###
+### blocked-passes — github-issues binding: count an issue's Blocked passes.
+###
+### Usage: blocked-passes <ref>        (ref: `#N` or `N`)
+###
+### Prints one integer on stdout: the number of `Blocked` comments on the
+### issue since its latest `Implementation` comment (all `Blocked` comments
+### when it has none). A rework posts a new Implementation comment, which
+### resets the count. Comments are read through the "Read the issue" verb
+### (`gh issue view <N> --json comments`), so any machine reads the same
+### count.
+###
+### A comment's kind is its first line, `### <Kind> — <date>` or
+### `### <Kind> (n) — <date>` (see "Comment with `<kind>`" in BINDING.md).
+### Comments without that heading are ignored.
+###
+### Override the GitHub repo for tests via GH_TRACKER_REPO (owner/repo format).
+###
+### Exit codes: 0 success, 2 usage error, 3 API failure after retries.
+###
+
+set -eu
+set -o pipefail
+
+readonly _MAX_RETRIES=3
+
+if [ "$#" -ne 1 ]; then
+  echo "usage: blocked-passes <ref>" >&2
+  exit 2
+fi
+
+_num="${1#\#}"
+case "$_num" in
+  ''|*[!0-9]*)
+    echo "blocked-passes: not an issue ref: '$1' (expected #N)" >&2
+    exit 2
+    ;;
+esac
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "blocked-passes: 'jq' not found or not in PATH." >&2
+  exit 2
+fi
+
+# Same owner/repo detection as tracker-snapshot.
+if [ -n "${GH_TRACKER_REPO:-}" ]; then
+  _repo="$GH_TRACKER_REPO"
+else
+  _remote_url="$(git remote get-url origin 2>/dev/null)" || true
+  if [ -z "$_remote_url" ]; then
+    echo "blocked-passes: no git remote 'origin'; set GH_TRACKER_REPO=owner/repo" >&2
+    exit 2
+  fi
+  _repo="$(printf '%s' "$_remote_url" | \
+    sed -E 's|^https?://[^/]*github\.com/||;s|^git@[^:]*github\.com:||;s|\.git$||')"
+  if [ -z "$_repo" ] || ! printf '%s' "$_repo" | grep -q '/'; then
+    echo "blocked-passes: cannot parse GitHub owner/repo from '$_remote_url'" >&2
+    exit 2
+  fi
+fi
+
+_att=0 _dl=1 _resp=""
+while :; do
+  _ec=0
+  _resp="$(gh issue view "$_num" --repo "$_repo" --json comments)" || _ec=$?
+  [ "$_ec" -eq 0 ] && break
+  _att=$((_att + 1))
+  if [ "$_att" -ge "$_MAX_RETRIES" ]; then
+    echo "blocked-passes: API request failed after $_MAX_RETRIES attempts" >&2
+    exit 3
+  fi
+  sleep "$_dl"
+  _dl=$((_dl * 2))
+done
+
+printf '%s' "$_resp" | jq -r '
+  (.comments // []) | map((.body // "") | split("\n") | (.[0] // "") | rtrimstr("\r")) as $h
+  | ( [ $h | to_entries[]
+        | select(.value | test("^### Implementation( \\([0-9]+\\))? — ")) | .key ]
+      | last // -1 ) as $impl
+  | [ $h[($impl + 1):][] | select(test("^### Blocked( \\([0-9]+\\))? — ")) ]
+  | length
+'
