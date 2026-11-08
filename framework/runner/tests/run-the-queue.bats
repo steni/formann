@@ -7333,6 +7333,300 @@ EOF
   [ "$(drain_outcome_nth 1)" = "beta|drained" ]
 }
 
+# === Claim in the drain loop (#7) ==========================================
+
+# Drain harness plus a bare Shared remote as the host's `origin`, a dummy
+# runner-checkout, and a recording `comment-on-feature` on the role surface.
+setup_claim_drain_test() {
+  setup_drain_test
+  unset RUNNER_SHARED_REMOTE RUNNER_FORMANN_SHA
+  SHARED="$BATS_TEST_TMPDIR/shared.git"
+  git init --quiet --bare --initial-branch=main "$SHARED"
+  git -C "$HOST_REPO" remote add origin "$SHARED"
+  HOST_CHECKOUT="$BATS_TEST_TMPDIR/claim-checkout"
+  git init --quiet --initial-branch=master "$HOST_CHECKOUT"
+  git -C "$HOST_CHECKOUT" -c user.email=t@t -c user.name=t \
+    commit --allow-empty --quiet -m init
+  RUNNER_MACHINE="m1"
+  RUN_TS="20261108-120000"
+  CLAIM_HELD_FEATURE=""
+  CLAIM_HELD_SHA=""
+  NOTES_FILE="$BATS_TEST_TMPDIR/notes"
+  : >"$NOTES_FILE"
+  mkdir -p "$HOST_REPO/docs/formann/issue-tracker"
+  cat >"$HOST_REPO/docs/formann/issue-tracker/comment-on-feature" <<SCRIPT
+#!/usr/bin/env bash
+{ printf '%s %s\n' "\$1" "\$2"; cat; printf '\n--\n'; } >>"$NOTES_FILE"
+echo "#1"
+SCRIPT
+  chmod +x "$HOST_REPO/docs/formann/issue-tracker/comment-on-feature"
+  # The per-issue loop stand-in records whose claim was on the Shared
+  # remote while the feature drained.
+  CLAIM_SEEN_FILE="$BATS_TEST_TMPDIR/claim-seen"
+  : >"$CLAIM_SEEN_FILE"
+  run_loop() {
+    echo "$TARGET_FEATURE" >>"$DRAIN_DRAINED_FILE"
+    local sha
+    sha="$(git -C "$SHARED" rev-parse --verify --quiet "refs/formann/claims/$TARGET_FEATURE" || true)"
+    if [ -n "$sha" ]; then
+      printf '%s %s\n' "$TARGET_FEATURE" \
+        "$(claim_field "$(git -C "$SHARED" log -1 --format=%B "$sha")" machine)" >>"$CLAIM_SEEN_FILE"
+    fi
+    RUN_STOP_REASON="queue-empty"
+    return 0
+  }
+}
+
+# Another runner (machine $2) takes a claim on feature $1.
+claim_by_other() {
+  local other="$BATS_TEST_TMPDIR/other-$2"
+  [ -d "$other" ] || { git init --quiet "$other"; git -C "$other" remote add origin "$SHARED"; }
+  ( HOST_REPO="$other"; RUNNER_MACHINE="$2"; claim take "$1" >/dev/null )
+}
+
+@test "run_drain — claims (#7): a held feature is skipped and the next eligible one drained; SUMMARY says held-by <machine>" {
+  setup_claim_drain_test
+  DISCOVERY_JSON='["alpha","beta"]'
+  claim_by_other alpha m2
+  local alpha_claim
+  alpha_claim="$(git -C "$SHARED" rev-parse refs/formann/claims/alpha)"
+
+  run_drain
+
+  [ "$RUN_STOP_REASON" = "completed" ]
+  [ "$(drain_outcome_nth 0)" = "alpha|held-by m2" ]
+  [ "$(drain_outcome_nth 1)" = "beta|drained" ]
+  # alpha was never drained here, and m2's claim is untouched.
+  [ "$(cat "$DRAIN_DRAINED_FILE")" = "beta" ]
+  [ "$(git -C "$SHARED" rev-parse refs/formann/claims/alpha)" = "$alpha_claim" ]
+  # beta drained under this runner's claim, released at drain end.
+  [ "$(cat "$CLAIM_SEEN_FILE")" = "beta m1" ]
+  ! git -C "$SHARED" rev-parse --verify --quiet refs/formann/claims/beta
+  [ -z "$CLAIM_HELD_FEATURE" ]
+
+  local summary
+  summary="$(print_multi_feature_records | format_multi_feature_summary_md \
+    "$RUN_TS" "12:00:00" "12:01:00" "ended" "completed")"
+  [[ "$summary" == *"## alpha — held-by m2"* ]]
+  [[ "$summary" == *"## beta — drained"* ]]
+}
+
+@test "drain_one_feature — claims (#7): a claim Note is posted on the taken feature through comment-on-feature, never on a held one" {
+  setup_claim_drain_test
+  claim_by_other alpha m2
+
+  drain_one_feature alpha
+  drain_one_feature beta
+
+  # One Note, for beta, naming the machine, the run and the claim ref.
+  [ "$(grep -c '^-- *$' "$NOTES_FILE")" = "1" ]
+  [ "$(head -n 1 "$NOTES_FILE")" = "beta Note" ]
+  grep -q 'AFK runner' "$NOTES_FILE"
+  grep -q '`m1`' "$NOTES_FILE"
+  grep -q '`20261108-120000`' "$NOTES_FILE"
+  grep -q 'refs/formann/claims/beta' "$NOTES_FILE"
+}
+
+@test "drain_one_feature — claims (#7): the claim is released however the feature's loop ends" {
+  setup_claim_drain_test
+  local reason
+  for reason in snapshot-failed propagation-error runaway-halt publish-parked; do
+    run_loop() { RUN_STOP_REASON="$CLAIM_TEST_REASON"; return 1; }
+    CLAIM_TEST_REASON="$reason"
+    RUN_STOP_REASON=""
+    drain_one_feature alpha
+    git -C "$SHARED" rev-parse --verify --quiet refs/formann/claims/alpha \
+      && fail "claim left after a loop ending $reason"
+    [ -z "$CLAIM_HELD_FEATURE" ]
+  done
+}
+
+@test "drain_one_feature — claims (#7): a Note that can't be posted doesn't stop the drain" {
+  setup_claim_drain_test
+  printf '#!/usr/bin/env bash\nexit 3\n' >"$HOST_REPO/docs/formann/issue-tracker/comment-on-feature"
+
+  drain_one_feature alpha
+
+  [ "$(drain_outcome_nth 0)" = "alpha|drained" ]
+  [ "$(cat "$CLAIM_SEEN_FILE")" = "alpha m1" ]
+}
+
+@test "drain_one_feature — claims (#7): unreachable Shared remote: skip:claim-failed, nothing drained" {
+  setup_claim_drain_test
+  git -C "$HOST_REPO" remote set-url origin "$BATS_TEST_TMPDIR/missing.git"
+
+  drain_one_feature alpha
+
+  [ "$(drain_outcome_nth 0)" = "alpha|skip:claim-failed" ]
+  [ ! -s "$DRAIN_DRAINED_FILE" ]
+}
+
+@test "drain_one_feature — claims (#7): no Shared remote: no claim, no Note, drains as before" {
+  setup_claim_drain_test
+  git -C "$HOST_REPO" remote remove origin
+
+  drain_one_feature alpha
+
+  [ "$(drain_outcome_nth 0)" = "alpha|drained" ]
+  [ ! -s "$NOTES_FILE" ]
+  [ ! -s "$CLAIM_SEEN_FILE" ]
+  [ -z "$(git -C "$SHARED" for-each-ref refs/formann/)" ]
+}
+
+@test "run_claimed_loop — claims (#7): loop mode skips a held feature with stop reason held-by, drains and releases a free one" {
+  setup_claim_drain_test
+  RUN_MODE="loop"
+  claim_by_other alpha m2
+
+  TARGET_FEATURE="alpha"
+  run_claimed_loop
+  [ "$RUN_STOP_REASON" = "held-by m2" ]
+  [ ! -s "$DRAIN_DRAINED_FILE" ]
+
+  TARGET_FEATURE="beta"
+  run_claimed_loop
+  [ "$RUN_STOP_REASON" = "queue-empty" ]
+  [ "$(cat "$CLAIM_SEEN_FILE")" = "beta m1" ]
+  ! git -C "$SHARED" rev-parse --verify --quiet refs/formann/claims/beta
+}
+
+# A runner process draining one feature under its claim, interruptible: the
+# per-issue loop stand-in signals readiness, then waits for the interrupt.
+# $1 = the INT handler to install (handle_signal: the drain's own path;
+# handle_preflight_signal: exit at once, leaving only finalize_run).
+claim_interrupt_runner() {
+  cat >"$BATS_TEST_TMPDIR/runner.sh" <<SCRIPT
+source "$RUNNER_SCRIPT"
+HOST_REPO="$HOST_REPO"; HOST_CHECKOUT="$HOST_CHECKOUT"; HOST_ABORT_DIR="$HOST_ABORT_DIR"
+RUNNER_MACHINE=m1; RUN_TS=r1; RUN_DIR=""; RUN_MODE=drain; LOCK_HELD=0
+RUNNER_DISABLE_LIVENESS=1
+ensure_runner_checkout_on_branch() { return 0; }
+take_snapshot() { printf '{"feature":"%s","issues":[{"ref":"%s/01","nn":"01","status":"ready-for-agent","type":"AFK","blocked_by":[],"eligible":true}]}' "\$1" "\$1"; }
+ensure_mvn_cache_for() { MVN_VOLUME=x; return 0; }
+run_loop() {
+  : >"$BATS_TEST_TMPDIR/ready"
+  while [ "\$RUNNER_INTERRUPTED" -eq 0 ]; do sleep 0.1; done
+  RUN_STOP_REASON=interrupted
+  return 0
+}
+trap finalize_run EXIT
+trap $1 INT TERM
+DISCOVERY_JSON='["alpha"]'
+run_drain
+SCRIPT
+  # Job control on: a background job of a non-interactive shell starts with
+  # SIGINT ignored (and an ignored signal can't be trapped), unlike a runner
+  # started from a terminal.
+  set -m
+  bash "$BATS_TEST_TMPDIR/runner.sh" >"$BATS_TEST_TMPDIR/runner.out" 2>&1 &
+  local pid=$! i
+  set +m
+  for i in $(seq 1 100); do
+    [ -f "$BATS_TEST_TMPDIR/ready" ] && break
+    sleep 0.1
+  done
+  [ -f "$BATS_TEST_TMPDIR/ready" ] || fail "runner never reached the loop: $(cat "$BATS_TEST_TMPDIR/runner.out")"
+  git -C "$SHARED" rev-parse --verify --quiet refs/formann/claims/alpha >/dev/null \
+    || fail "no claim while draining"
+  kill -INT "$pid"
+  wait "$pid" || true
+}
+
+@test "claims (#7): SIGINT mid-drain — the drain ends and the claim ref is gone" {
+  setup_claim_drain_test
+  claim_interrupt_runner handle_signal
+  ! git -C "$SHARED" rev-parse --verify --quiet refs/formann/claims/alpha
+  grep -q 'released the claim on alpha' "$BATS_TEST_TMPDIR/runner.out"
+}
+
+@test "claims (#7): SIGINT that exits at once — finalize_run releases the claim" {
+  setup_claim_drain_test
+  claim_interrupt_runner handle_preflight_signal
+  ! git -C "$SHARED" rev-parse --verify --quiet refs/formann/claims/alpha
+  grep -q 'released the claim on alpha' "$BATS_TEST_TMPDIR/runner.out"
+}
+
+@test "drain_one_feature — claims (#7), local-markdown end to end: claim held while draining, Note committed on the PRD and published, claim gone after" {
+  # Real sync, real local-markdown tracker-snapshot and comment-on-feature on
+  # the role surface; only the mvn cache and the per-issue loop are mocked.
+  HOST_REPO="$BATS_TEST_TMPDIR/lm-host"
+  HOST_CHECKOUT="$BATS_TEST_TMPDIR/lm-checkout"
+  HOST_ABORT_DIR="$BATS_TEST_TMPDIR/lm-aborted"
+  SHARED="$BATS_TEST_TMPDIR/lm-shared.git"
+  mkdir -p "$HOST_REPO" "$HOST_ABORT_DIR"
+  unset RUNNER_SHARED_REMOTE
+  RUNNER_MACHINE="m1"
+  RUN_TS="20261108-120000"
+  CLAIM_HELD_FEATURE=""
+
+  git -C "$HOST_REPO" init --quiet --initial-branch=main
+  mkdir -p "$HOST_REPO/docs/formann/issue-tracker" "$HOST_REPO/.features/lmfeat/issues"
+  cp "$HERE/../bindings/issue-tracker/local-markdown/tracker-snapshot" \
+     "$HERE/../bindings/issue-tracker/local-markdown/comment-on-feature" \
+     "$HOST_REPO/docs/formann/issue-tracker/"
+  printf '# LM feature\n\n## Gist\n\nx\n' >"$HOST_REPO/.features/lmfeat/PRD.md"
+  cat >"$HOST_REPO/.features/lmfeat/issues/01-do-the-thing.md" <<'MD'
+---
+status: ready-for-agent
+category: enhancement
+type: AFK
+---
+
+# Do the thing
+
+## What to build
+
+A trivial thing.
+
+## Acceptance criteria
+
+- [ ] It does the thing.
+
+## Blocked by
+
+None — can start immediately.
+MD
+  git -C "$HOST_REPO" add -A
+  git -C "$HOST_REPO" -c user.email=t@t -c user.name=t commit --quiet -m init
+  git -C "$HOST_REPO" branch lmfeat
+  git init --quiet --bare --initial-branch=main "$SHARED"
+  git -C "$HOST_REPO" remote add origin "$SHARED"
+  git -C "$HOST_REPO" push --quiet origin main lmfeat
+  git clone --quiet "$HOST_REPO" "$HOST_CHECKOUT" >&2
+  git -C "$HOST_REPO" remote add runner "$HOST_CHECKOUT"
+
+  LM_SEEN="$BATS_TEST_TMPDIR/lm-seen"
+  : >"$LM_SEEN"
+  ensure_mvn_cache_for() { MVN_VOLUME="lm-mvn"; return 0; }
+  run_loop() {
+    git -C "$SHARED" rev-parse --verify --quiet "refs/formann/claims/$TARGET_FEATURE" >/dev/null \
+      && echo "claimed" >>"$LM_SEEN"
+    RUN_STOP_REASON="queue-empty"
+    return 0
+  }
+  RUN_DIR="$BATS_TEST_TMPDIR/lm-run"
+  mkdir -p "$RUN_DIR"
+  RUNNER_INTERRUPTED=0
+  RUN_FEATURE_OUTCOMES=()
+  RUN_DISPATCHES=()
+  RUN_STOP_REASON=""
+  TARGET_FEATURE=""
+  RUN_MODE="drain"
+
+  drain_one_feature lmfeat
+
+  [ "${RUN_FEATURE_OUTCOMES[0]}" = "lmfeat|drained" ]
+  [ "$(cat "$LM_SEEN")" = "claimed" ]
+  ! git -C "$SHARED" rev-parse --verify --quiet refs/formann/claims/lmfeat
+  # The Note is a tracker: commit on the feature branch, on the Shared remote
+  # and on host.
+  local prd
+  prd="$(git -C "$SHARED" show lmfeat:.features/lmfeat/PRD.md)"
+  [[ "$prd" == *"## Comments"*"### Note — "*"\`m1\`"* ]]
+  [ "$(git -C "$SHARED" log -1 --format=%s lmfeat)" = "tracker: lmfeat — Note on the feature" ]
+  [ "$(git -C "$HOST_REPO" rev-parse lmfeat)" = "$(git -C "$SHARED" rev-parse lmfeat)" ]
+}
+
 # === parse_args — drain mode accepts bare invocation ======================
 
 @test "parse_args — bare invocation enters drain mode (no refusal)" {

@@ -140,7 +140,7 @@ at `.runner-state/runs/<YYYYMMDD-HHMMSS>/` containing:
 | `<NN>.exit` / `<feature>/<NN>.exit` | Per-issue implement-dispatch exit code (a bare integer). |
 | `<NN>-<step>-<label>.{stdout.jsonl,stderr.log,summary.md}` (narrowed) / `<feature>/…` (drain) | The same three per-dispatch artifacts for each post-implement walk step, e.g. `01-01-review.stdout.jsonl` for the default single `review` step. One set per step that ran; absent when the implement stage failed and the walk never started. |
 | `pass-<NNNN>/` (`--idle` only) | One directory per pass that dispatched anything: its own `SUMMARY.md` (same shape as the run's), and that pass's per-issue artifacts (the rows above) inside it instead of directly in the run dir. |
-| `SUMMARY.md` | Markdown end-of-run summary. With `--idle`, it ends with a `## Passes` index linking every `pass-<NNNN>/SUMMARY.md`. Narrowed modes: feature heading + flat per-issue table. Drain mode: `# AFK runner — multi-feature drain` heading + per-feature sections (`## <feature> — drained` or `## <feature> — parked (Shared remote refused the fast-forward)` with nested per-issue table, or `## <feature> — skipped: <reason>` / `## <feature> — feature-snapshot-failed` one-liner). Pre-flight aborts replace the table with a single line naming the failing invariant. |
+| `SUMMARY.md` | Markdown end-of-run summary. With `--idle`, it ends with a `## Passes` index linking every `pass-<NNNN>/SUMMARY.md`. Narrowed modes: feature heading + flat per-issue table. Drain mode: `# AFK runner — multi-feature drain` heading + per-feature sections (`## <feature> — drained` or `## <feature> — parked (Shared remote refused the fast-forward)` with nested per-issue table, or `## <feature> — skipped: <reason>` / `## <feature> — held-by <machine>` / `## <feature> — feature-snapshot-failed` one-liner). Pre-flight aborts replace the table with a single line naming the failing invariant. |
 
 Stdout while a run is in flight uses per-stage progress lines. A typical
 iteration produces four (implement starting/outcome, review starting/outcome):
@@ -233,12 +233,14 @@ The trailing `stop reason:` line varies by mode.
 - `interrupted` — Ctrl-C during the outer loop.
 - `propagation-error` — parking-ref publish failed inside a feature loop; the entire drain halts (exit 1).
 - A feature whose Shared-remote push was refused is not a run-level stop: its section reads `## <feature> — parked (Shared remote refused the fast-forward)` and the drain continues with the next feature.
+- A feature another runner holds a **Claim** on is not a stop either: its section reads `## <feature> — held-by <machine>` and the drain continues with the next feature. A claim that can't be taken at all (Shared remote unreachable) reads `skipped: claim-failed`.
 - `preflight-abort: discovery` — `tracker-snapshot --list` exited non-zero or returned unparseable JSON.
 
 **Narrowed modes (`--feature`, `--issue`):**
 
 - `queue-empty` / `interrupted` / `snapshot-failed` / `propagation-error` — the per-issue loop's stop reasons (see "The dispatch loop" in `afk-runner.md`).
 - `publish-parked` (`--feature`) — the Shared remote refused a fast-forward; the work is on the parking ref and the loop stopped on the feature.
+- `held-by <machine>` (`--feature`) — another runner holds the feature's Claim; nothing was dispatched (with `--idle`, the next pass tries again). `claim-failed` — the claim couldn't be taken (Shared remote unreachable).
 - `feature-restricted (refused: <reason>)` (`--feature`) — `<reason>` is `unknown-feature` (slug not in discovery output).
 - `single-dispatch (success|failure)` (`--issue`); or `single-dispatch (refused: <reason>)` — `<reason>` is one of: HITL type, wrong status, unmet blockers, `unknown-feature`, `snapshot-failed`.
 
@@ -345,6 +347,20 @@ To recover from `parked`, bring the two chains together by hand — `git pull ru
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `RUNNER_SHARED_REMOTE` | `origin` | Name of the host repo's git remote the runner publishes to. A name with no matching remote means `local-only`. |
+
+## Claims across machines
+
+Two runners on two machines never drain the same feature: before a feature's first dispatch (drain mode and `--feature`), the runner takes a **Claim** on it, a ref on the Shared remote, and releases it when the feature's drain ends (ADR-0011). `--issue` takes no claim.
+
+- **The claim ref.** `refs/formann/claims/<feature>` on the Shared remote, pointing at a parentless commit (empty tree) whose message reads `machine: <hostname>`, `run: <run id>`, `formann: <sha or unknown>`, `heartbeat: <UTC ISO-8601>`. Inspect one with `git fetch <remote> refs/formann/claims/<feature> && git log -1 FETCH_HEAD`.
+- **Take** is `git push --force-with-lease=refs/formann/claims/<feature>: <remote> <commit>:refs/formann/claims/<feature>` — the lease expects the ref absent, so of two runners starting the same second exactly one wins. The loser reads the claim and skips the feature: `held-by <machine>` in `SUMMARY.md`, and the drain moves on to the next eligible feature.
+- **Release** is a lease delete on the sha the runner wrote. It runs when the feature's drain ends, however it ends, and again from the EXIT trap (`finalize_run`) — which every interrupt and abort reaches — for a claim still held. A release whose lease is refused (the ref moved) leaves the ref alone.
+- **The rule.** Every claim write is a lease push on the sha the writer last read; a refused lease is never retried as a plain or forced push. `claim.sh` is the only code that writes claim refs, from the host with the host's credentials.
+- **The Note.** On taking a claim, the runner posts a `Note` on the feature's parent through the binding's `comment-on-feature` script — which machine and run claimed it. It is information only: a Note that can't be posted is logged and the drain goes on. Under local-markdown the Note is a `tracker:` commit on the feature's `PRD.md`, propagated (and published) at once.
+- **No Shared remote:** no claims, no Note; the local lock is the only guard, as before. The local lock stays in every case.
+- `RUNNER_MACHINE` overrides the hostname recorded in the claim.
+
+Heartbeat, staleness and takeover of a dead runner's claim are not there yet: a claim left behind by a runner that was killed outright (`kill -9`, power loss) must be deleted by hand — `git push <remote> :refs/formann/claims/<feature>`.
 
 ## Resuming after a technical failure
 

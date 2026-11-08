@@ -49,10 +49,14 @@
 #   - `propagation-error`     — parking-ref publish failed inside a feature loop.
 #   - `runaway-halt (<ref>)`  — post-implement step pushed issue back to eligible.
 #   - `preflight-abort: discovery` — `tracker-snapshot --list` failed.
+#   A feature another runner holds a Claim on (claim.sh) is skipped with a
+#   `held-by <machine>` row; not a stop.
 #
 # Stop reasons (narrowed modes):
 #   - `queue-empty` / `interrupted` / `snapshot-failed` / `propagation-error`.
 #   - `runaway-halt (<ref>)`  — post-implement step pushed issue back to eligible.
+#   - `held-by <machine>` / `claim-failed` (--feature) — the feature's Claim
+#     is another runner's, or could not be taken.
 #   - `feature-restricted (refused: <reason>)` (--feature).
 #   - `single-dispatch (success|failure|refused: <reason>)` (--issue).
 #
@@ -85,6 +89,10 @@ source "$HERE/resolve-manifest.sh"
 # which the progress-line formatters below also use.
 # shellcheck source=liveness.sh
 source "$HERE/liveness.sh"
+# claim.sh provides the Claim module (claim take|release, claim_verdict):
+# the runner's hold on the feature it drains, a ref on the Shared remote.
+# shellcheck source=claim.sh
+source "$HERE/claim.sh"
 
 # === Configuration =========================================================
 
@@ -958,6 +966,9 @@ format_multi_feature_summary_md() {
         in_drained = 1;
         in_table = 1;
       }
+      else if (substr(outcome, 1, 8) == "held-by ") {
+        printf "## %s — %s\n\n", feature, outcome;
+      }
       else if (outcome == "feature-snapshot-failed") {
         printf "## %s — feature-snapshot-failed\n\n", feature;
       }
@@ -1414,6 +1425,9 @@ finalize_run() {
     fi
   fi
 
+  # A claim still held here means the drain did not reach its own release
+  # (interrupt, abort): release it so the next runner needn't wait it out.
+  claim_release_held
   release_lock
   # Drain runner.log before exiting so the operator never sees a
   # truncated tail. Must come after every other print — once this
@@ -4200,6 +4214,35 @@ run_loop() {
   done
 }
 
+# Loop mode (--feature) under the feature's claim: take it before the first
+# dispatch, release it when the loop ends. A feature another runner holds
+# stops the pass with stop reason `held-by <machine>` (with --idle, the next
+# pass tries again). No Shared remote: plain run_loop.
+run_claimed_loop() {
+  if ! claim_shared_remote_present; then
+    run_loop
+    return
+  fi
+  if ! claim take "$TARGET_FEATURE" >/dev/null; then
+    echo "[$(now_clock)] runner: could not claim '$TARGET_FEATURE' (see above); not draining it"
+    RUN_STOP_REASON="claim-failed"
+    return 0
+  fi
+  case "$CLAIM_RESULT" in
+    held-by\ *)
+      echo "[$(now_clock)] runner: '$TARGET_FEATURE' is $CLAIM_RESULT; not draining it"
+      RUN_STOP_REASON="$CLAIM_RESULT"
+      return 0
+      ;;
+  esac
+  echo "[$(now_clock)] runner: claimed $TARGET_FEATURE on $(claim_shared_remote) ($(claim_ref "$TARGET_FEATURE"))"
+  post_claim_note "$TARGET_FEATURE"
+  local rc=0
+  run_loop || rc=$?
+  claim_release_held
+  return "$rc"
+}
+
 # Drain entry — bare invocation. Walks every feature in discovery order,
 # evaluating the per-feature gate (fetch-failed, feature-snapshot-failed,
 # queue-empty). Features that gate `drain` get the per-issue loop body via
@@ -4294,6 +4337,35 @@ drain_one_feature() {
     return 0
   fi
 
+  # Claim the feature on the Shared remote before its first dispatch. A
+  # feature another runner holds is skipped; the drain moves on. No Shared
+  # remote: no claims, the local lock alone guards the run.
+  if claim_shared_remote_present; then
+    if ! claim take "$feature" >/dev/null; then
+      echo "[$(now_clock)] runner: skipping $feature — claim-failed"
+      record_feature_outcome "$feature" "skip:claim-failed"
+      return 0
+    fi
+    case "$CLAIM_RESULT" in
+      held-by\ *)
+        echo "[$(now_clock)] runner: skipping $feature — $CLAIM_RESULT"
+        record_feature_outcome "$feature" "$CLAIM_RESULT"
+        return 0
+        ;;
+    esac
+    echo "[$(now_clock)] runner: claimed $feature on $(claim_shared_remote) ($(claim_ref "$feature"))"
+    post_claim_note "$feature"
+  fi
+
+  drain_claimed_feature "$feature"
+  claim_release_held
+}
+
+# The part of drain_one_feature that runs under the feature's claim (when
+# there is one); drain_one_feature releases the claim however it returns.
+drain_claimed_feature() {
+  local feature="$1"
+
   # Materialize the mvn cache lazily for this feature. A cache miss here
   # is rare (`ensure-mvn-cache.sh` is idempotent and only fails on docker
   # itself), but record the outcome cleanly if it does happen.
@@ -4358,6 +4430,47 @@ drain_one_feature() {
       record_feature_outcome "$feature" "drained"
       ;;
   esac
+}
+
+# Announce a taken claim on the tracker: a `Note` on the feature's parent,
+# through the binding's `comment-on-feature` script on the role surface
+# (the "Comment with `<kind>`" verb). Information only — the claim ref is
+# the lock — so every failure here is logged and the drain goes on.
+#
+# A binding that keeps its tracker in git (local-markdown) commits the Note
+# into the runner-checkout; that commit is propagated at once, so the
+# per-dispatch re-sync doesn't wipe it.
+post_claim_note() {
+  local feature="$1"
+  local script="$HOST_REPO/docs/formann/issue-tracker/comment-on-feature"
+  if [ ! -x "$script" ]; then
+    echo "[$(now_clock)] runner: no comment-on-feature script on the role surface; claim Note not posted"
+    return 0
+  fi
+  local head_before head_after machine body
+  head_before="$(git -C "$HOST_CHECKOUT" rev-parse --verify --quiet HEAD 2>/dev/null || true)"
+  machine="$(claim_machine)"
+  body="$(cat <<NOTE
+> *This was generated by the AFK runner.*
+
+Claimed by the runner on \`${machine}\` (run \`${RUN_TS:-unknown}\`, Formann \`${RUNNER_FORMANN_SHA:-unknown}\`). The claim is the ref \`$(claim_ref "$feature")\` on the Shared remote; this comment is information, never the lock. It is released when the drain ends.
+NOTE
+)"
+  if ! ( cd "$HOST_REPO" && printf '%s\n' "$body" \
+      | TRACKER_CHECKOUT_DIR="$HOST_CHECKOUT" "$script" "$feature" "Note" ) >/dev/null; then
+    echo "[$(now_clock)] runner: could not post the claim Note on $feature (see above); draining anyway"
+    return 0
+  fi
+  echo "[$(now_clock)] runner: posted the claim Note on $feature"
+  head_after="$(git -C "$HOST_CHECKOUT" rev-parse --verify --quiet HEAD 2>/dev/null || true)"
+  if [ -n "$head_after" ] && [ "$head_after" != "$head_before" ]; then
+    if ! propagate_feature "$feature"; then
+      echo "[$(now_clock)] runner: the claim Note's commit could not be propagated; draining anyway"
+    fi
+    RUNNER_LAST_PROPAGATION=""
+    RUNNER_PUBLISH_PARKED=0
+  fi
+  return 0
 }
 
 # Per-feature queue-shape probe. Returns 0 if the snapshot has at least
@@ -4595,7 +4708,7 @@ main() {
   trap handle_signal INT TERM
   case "$RUN_MODE" in
     single) run_single ;;
-    loop)   if [ -n "$ARG_IDLE" ]; then run_idle run_loop; else run_loop; fi ;;
+    loop)   if [ -n "$ARG_IDLE" ]; then run_idle run_claimed_loop; else run_claimed_loop; fi ;;
     drain)  if [ -n "$ARG_IDLE" ]; then run_idle run_drain; else run_drain; fi ;;
     *)
       echo "runner: internal error — unknown run mode '$RUN_MODE'" >&2

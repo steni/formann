@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+###
+### comment-on-feature — github-issues binding: comment on a feature's parent.
+###
+### Usage: comment-on-feature <feature-slug> <Kind>     (comment body on stdin)
+###
+### Realizes "Comment with `<kind>`" on the feature's parent issue, located
+### as "Read the feature" does: the one open issue labelled both
+### `formann:feature` and `formann:slug:<slug>`. Writes the heading
+### `### <Kind> — <YYYY-MM-DD>` (UTC; `### <Kind> (n) — <date>` on a same-day
+### same-kind collision) and posts the stdin body below it. Prints the parent
+### ref (`#N`) on stdout.
+###
+### The AFK runner uses it to post the informational Note when it takes a
+### Claim. Override the GitHub repo for tests via GH_TRACKER_REPO (owner/repo).
+###
+### Exit codes: 0 posted, 1 parent not found / slug collision, 2 usage error,
+### 3 API failure after retries.
+###
+
+set -eu
+set -o pipefail
+
+readonly _MAX_RETRIES=3
+
+if [ "$#" -ne 2 ] || [ -z "$1" ] || [ -z "$2" ]; then
+  echo "usage: comment-on-feature <feature-slug> <Kind>  (body on stdin)" >&2
+  exit 2
+fi
+_slug="$1"
+_kind="$2"
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "comment-on-feature: 'jq' not found or not in PATH." >&2
+  exit 2
+fi
+
+# Same owner/repo detection as tracker-snapshot.
+if [ -n "${GH_TRACKER_REPO:-}" ]; then
+  _repo="$GH_TRACKER_REPO"
+else
+  _remote_url="$(git remote get-url origin 2>/dev/null)" || true
+  if [ -z "$_remote_url" ]; then
+    echo "comment-on-feature: no git remote 'origin'; set GH_TRACKER_REPO=owner/repo" >&2
+    exit 2
+  fi
+  _repo="$(printf '%s' "$_remote_url" | \
+    sed -E 's|^https?://[^/]*github\.com/||;s|^git@[^:]*github\.com:||;s|\.git$||')"
+  if [ -z "$_repo" ] || ! printf '%s' "$_repo" | grep -q '/'; then
+    echo "comment-on-feature: cannot parse GitHub owner/repo from '$_remote_url'" >&2
+    exit 2
+  fi
+fi
+
+_body="$(cat)"
+
+# Run gh with bounded retries; prints its stdout.
+_gh() {
+  local att=0 dl=1 out ec
+  while :; do
+    ec=0
+    out="$(gh "$@")" || ec=$?
+    if [ "$ec" -eq 0 ]; then
+      printf '%s' "$out"
+      return 0
+    fi
+    att=$((att + 1))
+    if [ "$att" -ge "$_MAX_RETRIES" ]; then
+      echo "comment-on-feature: API request failed after $_MAX_RETRIES attempts: gh $1 $2" >&2
+      exit 3
+    fi
+    sleep "$dl"
+    dl=$((dl * 2))
+  done
+}
+
+_parents="$(_gh issue list --repo "$_repo" \
+  --label "formann:feature" --label "formann:slug:$_slug" \
+  --state open --json number --jq '[.[].number] | sort | .[]')"
+_count="$(printf '%s\n' "$_parents" | grep -c '^[0-9]' || true)"
+if [ "$_count" -eq 0 ]; then
+  echo "comment-on-feature: no open feature issue for slug '$_slug'" >&2
+  exit 1
+fi
+if [ "$_count" -ge 2 ]; then
+  echo "comment-on-feature: slug collision for '$_slug' — remove the formann:slug:$_slug label from one of: $(printf '#%s ' $_parents)" >&2
+  exit 1
+fi
+_num="$(printf '%s\n' "$_parents" | head -n 1)"
+
+_date="$(date -u +%Y-%m-%d)"
+_prior="$(_gh issue view "$_num" --repo "$_repo" --json comments)"
+_n="$(printf '%s' "$_prior" | jq -r --arg kind "### $_kind" --arg date "$_date" '
+  [ (.comments // [])[] | (.body // "") | split("\n") | (.[0] // "") | rtrimstr("\r")
+    | select(startswith($kind) and (ltrimstr($kind) | test("^( \\([0-9]+\\))? — " + $date + "$"))) ]
+  | length')"
+if [ "$_n" -eq 0 ]; then
+  _heading="### $_kind — $_date"
+else
+  _heading="### $_kind ($((_n + 1))) — $_date"
+fi
+
+_gh issue comment "$_num" --repo "$_repo" --body "$(printf '%s\n\n%s\n' "$_heading" "$_body")" >/dev/null
+printf '#%s\n' "$_num"

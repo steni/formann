@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- AFK runner takes a Claim on each feature it drains — the ref `refs/formann/claims/<feature>`
+  on the Shared remote, taken with a lease push that expects it absent — so two runners on two
+  machines never drain the same feature. A feature another runner holds is skipped (`held-by
+  <machine>` in `SUMMARY.md`) and the next one drained; the claim is released when the drain
+  ends, including on interrupt. Taking a claim posts an informational `Note` on the feature's
+  parent through each binding's new `comment-on-feature` script. No Shared remote: no claims.
 - AFK runner publishes every dispatch's commit to the Shared remote's feature branch (from the
   host, fast-forward only) before the post-implement steps run. `RUNNER_SHARED_REMOTE` names the
   remote (default `origin`); a refused push parks the work and stops the runner on that feature.

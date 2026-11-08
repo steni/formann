@@ -78,6 +78,8 @@ Append a comment to the issue's timeline. Timeline-shaped: append-only, history 
 - The body above `## Comments` is read-only after triage. Corrections and follow-ups go in a new comment. The only above-the-fold mutations permitted after triage are frontmatter field writes (Set the state, Set issue metadata) and the Triage Notes section (written and cleared by the Record triage notes verb only).
 - Commit the appended comment via a `tracker:` commit (see [Committing tracker changes](#committing-tracker-changes)). A comment posted alongside a status change is the same logical operation — both file edits land in one commit, not two.
 
+**On a feature's parent:** `comment-on-feature <feature> <Kind>` (body on stdin) appends the comment to the `## Comments` section of `.features/<feature>/PRD.md` (creating the section when missing), with the heading and same-day suffix above, and commits it as `tracker: <feature> — <Kind> on the feature`. It writes in `TRACKER_CHECKOUT_DIR` when set (the AFK runner passes its runner-checkout and propagates the commit like a dispatch's), else the `.formann` ancestor of `$PWD`. A PRD-less feature has no parent: exit `1`, nothing written. Exit `2` on a usage error.
+
 **Blocked pass count:** `blocked-passes <feature>/<NN>` prints the number of `### Blocked — <date>` (or `### Blocked (n) — <date>`) subsections of the issue file's `## Comments` section since its latest `### Implementation …` subsection — all of them when there is none. Headings inside fenced code blocks don't count. With `SNAPSHOT_CHECKOUT_DIR` set (as the AFK runner does) it reads the committed file at that checkout's HEAD, the same view `tracker-snapshot` uses. Exit codes: `0` success, `1` issue file not found, `2` usage error.
 
 #### Canonical example

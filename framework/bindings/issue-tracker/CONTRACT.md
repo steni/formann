@@ -58,6 +58,8 @@ The comment's first line must be `### <Kind> — <YYYY-MM-DD>`. Same-day same-ki
 
 **`Blocked`** is the kind a runner step posts when it cannot reach a dependency outside the run (see "Blocked steps" in `afk-runner.md`): it names the dependency and the error, and changes no state. A binding counts an issue's **Blocked passes** as the number of `Blocked` comments since the issue's latest `Implementation` comment (all of them when it has none), classifying each comment by its `### <Kind>` heading line only; a rework's new Implementation comment resets the count. Each binding ships a `blocked-passes <ref>` script that prints that count, read through "Read the issue", so any machine reads the same number.
 
+**Commenting on a feature's parent.** Each binding ships a `comment-on-feature <feature> <Kind>` script (body on stdin) that realizes this verb on the feature's parent — the artifact "Read the feature" reads — writing the `### <Kind> — <date>` heading and its same-day suffix itself. The AFK runner posts the informational `Note` through it when it takes a **Claim** on a feature; the comment is never the lock (ADR-0011). Exit `0` posted, `1` no parent (or a slug collision), `2` usage error.
+
 ### Create a feature
 
 Create a new feature: validate the slug, check for uniqueness, publish the parent artifact (issue or directory), and set up the feature branch, pushing it to the Shared remote when there is one.

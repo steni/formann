@@ -365,6 +365,8 @@ The third call illustrates why the regex must match both un-suffixed (` — <dat
 
 **Web-UI comments:** Comments posted through the GitHub web UI that do not carry the `### <Kind> — <date>` heading are treated as unstructured notes. Nothing breaks — the comment-timeline reader ignores them for kind-classification purposes; they remain visible in the timeline.
 
+**On a feature's parent:** `comment-on-feature <slug> <Kind>` (body on stdin) posts on the feature's parent issue, located as **Read the feature** does (the one open issue labelled `formann:feature` and `formann:slug:<slug>`), with the heading and same-day suffix above. It prints `#N`. The AFK runner posts its claim `Note` through it. Exit codes: `0` posted, `1` no open parent or a slug collision, `2` usage error, `3` API failure after retries.
+
 **Blocked pass count:** `blocked-passes <ref>` (`#N` or `N`) prints the number of `Blocked` comments since the issue's latest `Implementation` comment — all of them when there is none. It reads the timeline through **Read the issue** (`gh issue view <N> --json comments`) and classifies each comment by its first line only (`### Blocked — <date>` or `### Blocked (n) — <date>`), so a heading quoted further down a comment never counts. The AFK runner calls it after a step ends `BLOCKED: <dependency>`. Exit codes: `0` success, `2` usage error, `3` API failure after retries.
 
 ### Create a feature
