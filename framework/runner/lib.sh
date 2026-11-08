@@ -145,3 +145,9 @@ RUNNER_CONSUMER_PROMPTS_DIR="runner"
 # A pre-flight invariant verifies the file's presence and validity before
 # the loop starts.
 RUNNER_MANIFEST_FILE="${RUNNER_CONSUMER_PROMPTS_DIR}/manifest.md"
+
+# Consumer-repo-relative path to the post-drain steps manifest: host-side
+# steps the runner runs once a feature has drained, before it releases the
+# feature's Claim (post-drain.sh). Same line format as the post-implement
+# manifest. Optional: a missing or empty manifest means no post-drain steps.
+RUNNER_POST_DRAIN_MANIFEST_FILE="${RUNNER_CONSUMER_PROMPTS_DIR}/post-drain.md"

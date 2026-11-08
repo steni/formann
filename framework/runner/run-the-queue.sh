@@ -50,6 +50,10 @@
 # `tracker-snapshot` call, so issues unblocked mid-run by an earlier
 # success become selectable without restarting.
 #
+# Once a feature has drained (drain mode and --feature), the runner runs the
+# consumer's optional post-drain steps (`runner/post-drain.md`) on the host,
+# still under the feature's Claim, then releases it — see post-drain.sh.
+#
 # Stop reasons (drain mode):
 #   - `completed`             — every discovery slug considered.
 #   - `interrupted`           — Ctrl-C during the outer loop.
@@ -109,6 +113,11 @@ source "$HERE/claim.sh"
 # the configured ref before every drain.
 # shellcheck source=formann-update.sh
 source "$HERE/formann-update.sh"
+# post-drain.sh provides the Post-drain phase (check_post_drain_manifest,
+# maybe_run_post_drain, format_post_drain_section): host-side steps run once a
+# feature has drained, before its Claim is released.
+# shellcheck source=post-drain.sh
+source "$HERE/post-drain.sh"
 
 # === Configuration =========================================================
 
@@ -1468,6 +1477,9 @@ finalize_run() {
     if [ "${#RUN_SWEPT_REFS[@]}" -gt 0 ]; then
       format_swept_refs_section >>"$RUN_DIR/SUMMARY.md"
     fi
+    if [ -z "$RUN_PREFLIGHT_INVARIANT" ]; then
+      format_post_drain_section >>"$RUN_DIR/SUMMARY.md"
+    fi
     if [ -n "${ARG_IDLE:-}" ] && [ -z "$RUN_PREFLIGHT_INVARIANT" ]; then
       format_passes_section >>"$RUN_DIR/SUMMARY.md"
     fi
@@ -2260,6 +2272,7 @@ preflight() {
   check_docker_daemon                    # invariant 3
   ensure_image                           # invariant 4
   check_manifest                         # invariant 4b (post-implement manifest)
+  check_post_drain_manifest              # invariant 4c (post-drain manifest, optional)
   if [ "$RUN_MODE" != "drain" ]; then
     ensure_mvn_cache                     # invariant 5
   fi
@@ -4296,8 +4309,11 @@ run_loop() {
 # pass tries again). No Shared remote: plain run_loop.
 run_claimed_loop() {
   if ! claim_shared_remote_present; then
-    run_loop
-    return
+    local rc=0 dispatches_before
+    dispatches_before="$(feature_dispatch_count "$TARGET_FEATURE")"
+    run_loop || rc=$?
+    maybe_run_post_drain "$TARGET_FEATURE" "$RUN_STOP_REASON" "$dispatches_before"
+    return "$rc"
   fi
   if ! claim take "$TARGET_FEATURE" >/dev/null; then
     echo "[$(now_clock)] runner: could not claim '$TARGET_FEATURE' (see above); not draining it"
@@ -4312,8 +4328,10 @@ run_claimed_loop() {
       ;;
   esac
   announce_claim "$TARGET_FEATURE"
-  local rc=0
+  local rc=0 dispatches_before
+  dispatches_before="$(feature_dispatch_count "$TARGET_FEATURE")"
   run_loop || rc=$?
+  maybe_run_post_drain "$TARGET_FEATURE" "$RUN_STOP_REASON" "$dispatches_before"
   claim_release_held
   return "$rc"
 }
@@ -4406,7 +4424,10 @@ drain_one_feature() {
   # Queue check: ≥1 eligible non-aborted ref. Uses the same predicate as
   # the per-issue loop's selection so the verdict matches what `run_loop`
   # would compute.
-  if ! feature_has_dispatchable_ref "$feature" "$snap"; then
+  # A post-drain step left Blocked by an earlier pass is work too: the
+  # feature is claimed and its post-drain phase re-run from that step.
+  if ! feature_has_dispatchable_ref "$feature" "$snap" \
+      && { [ -z "$RESOLVED_POST_DRAIN" ] || [ -z "$(post_drain_pending_step "$feature")" ]; }; then
     echo "[$(now_clock)] runner: skipping $feature — queue-empty"
     record_feature_outcome "$feature" "skip:queue-empty"
     return 0
@@ -4454,12 +4475,17 @@ drain_claimed_feature() {
   # mid-feature snapshot crash, we record `feature-snapshot-failed` instead
   # of `drained` so the SUMMARY narrates the failure correctly.
   local saved_stop_reason="$RUN_STOP_REASON"
+  local dispatches_before
+  dispatches_before="$(feature_dispatch_count "$feature")"
   RUN_STOP_REASON=""
   set +e
   run_loop
   set -e
 
   local inner_reason="$RUN_STOP_REASON"
+  # The feature has drained: run its post-drain phase on the host, still
+  # under the claim (drain_one_feature releases it afterwards).
+  maybe_run_post_drain "$feature" "$inner_reason" "$dispatches_before"
   # The outer drain loop owns the run-level stop reason. Restore whatever
   # was set before we entered the per-feature loop so a mid-drain run_loop
   # stop (queue-empty, snapshot-failed) doesn't leak as the run's final
@@ -4724,7 +4750,7 @@ prepare_idle_pass() {
 finish_idle_pass() {
   local n="$RUN_PASS" stop="${RUN_STOP_REASON:-unknown}"
   local count="${#RUN_DISPATCHES[@]}"
-  if [ "$count" -gt 0 ]; then
+  if [ "$count" -gt 0 ] || [ "${#RUN_POST_DRAIN[@]}" -gt 0 ]; then
     mkdir -p "$RUN_PASS_DIR"
     local end_state="ended"
     [ "${RUNNER_INTERRUPTED:-0}" -eq 1 ] && end_state="interrupted"
@@ -4737,6 +4763,7 @@ finish_idle_pass() {
         "$RUN_FEATURE" "$RUN_TS pass $n" "$RUN_PASS_START_CLOCK" "$(now_clock)" \
         "$end_state" "$stop" "${ARG_MODEL:-}" "$(runner_formann_label)" >"$RUN_PASS_DIR/SUMMARY.md"
     fi
+    format_post_drain_section >>"$RUN_PASS_DIR/SUMMARY.md"
     RUN_PASSES+=("$n|$stop|$count")
   else
     [ -d "$RUN_PASS_DIR" ] && rmdir "$RUN_PASS_DIR" 2>/dev/null || true
@@ -4744,6 +4771,7 @@ finish_idle_pass() {
   fi
   RUN_DISPATCHES=()
   RUN_FEATURE_OUTCOMES=()
+  RUN_POST_DRAIN=()
 }
 
 # SUMMARY.md's "## Passes" index (--idle only): one line per pass that

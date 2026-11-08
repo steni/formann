@@ -385,10 +385,10 @@ Two runners on two machines never drain the same feature: before a feature's fir
 
 - **The claim ref.** `refs/formann/claims/<feature>` on the Shared remote, pointing at a parentless commit (empty tree) whose message reads `machine: <hostname>`, `run: <run id>`, `formann: <sha or unknown>`, `heartbeat: <UTC ISO-8601>`. Inspect one with `git fetch <remote> refs/formann/claims/<feature> && git log -1 FETCH_HEAD`.
 - **Take** is `git push --force-with-lease=refs/formann/claims/<feature>: <remote> <commit>:refs/formann/claims/<feature>` — the lease expects the ref absent, so of two runners starting the same second exactly one wins. The loser reads the claim and skips the feature: `held-by <machine>` in `SUMMARY.md`, and the drain moves on to the next eligible feature.
-- **Heartbeat.** Between dispatches — before each `/implement` dispatch and before each post-implement step — the holder replaces its claim commit with one carrying a fresh `heartbeat:`, a lease push on the sha it last wrote. A heartbeat that fails for a network reason is logged and tried again at the next heartbeat point; the drain goes on.
+- **Heartbeat.** Between dispatches — before each `/implement` dispatch, each post-implement step and each post-drain step — the holder replaces its claim commit with one carrying a fresh `heartbeat:`, a lease push on the sha it last wrote. A heartbeat that fails for a network reason is logged and tried again at the next heartbeat point; the drain goes on.
 - **Stale and takeover.** A claim whose heartbeat is more than `RUNNER_CLAIM_STALE_AFTER` seconds old (default 1800, thirty minutes) by the reader's own clock is stale; nobody writes "stale". A runner that finds a stale claim takes it over with a lease push on the stale claim's sha — logged and announced with a Note like a take (`taken-over-from <machine>`). A refused lease means the holder heart-beat meanwhile: the newcomer backs off as `held-by <machine>`. Of a takeover and a late heartbeat racing, exactly one wins.
 - **Lost claim.** A holder whose heartbeat lease is refused, and whose re-read shows another runner's claim, has lost it: it finishes the dispatch in flight (including that dispatch's remaining post-implement steps), takes no further issue on the feature, does not release the claim, and reports `taken-over-by <machine>` in `SUMMARY.md` (or as the `--feature` stop reason). Its last commit reaches the Shared remote by the Publisher's fast-forward, or parks. A heartbeat is only taken between dispatches, so a single dispatch longer than the stale-after time can be taken over while it runs.
-- **Release** is a lease delete on the sha the runner wrote. It runs when the feature's drain ends, however it ends, and again from the EXIT trap (`finalize_run`) — which every interrupt and abort reaches — for a claim still held. A release whose lease is refused (the ref moved) leaves the ref alone.
+- **Release** is a lease delete on the sha the runner wrote. It runs when the feature's drain ends (after its post-drain phase, when there is one), however it ends, and again from the EXIT trap (`finalize_run`) — which every interrupt and abort reaches — for a claim still held. A release whose lease is refused (the ref moved) leaves the ref alone.
 - **The rule.** Every claim write is a lease push on the sha the writer last read; a refused lease is never retried as a plain or forced push. `claim.sh` is the only code that writes claim refs, from the host with the host's credentials.
 - **The Note.** On taking a claim, the runner posts a `Note` on the feature's parent through the binding's `comment-on-feature` script — which machine and run claimed it. It is information only: a Note that can't be posted is logged and the drain goes on. Under local-markdown the Note is a `tracker:` commit on the feature's `PRD.md`, propagated (and published) at once.
 - **No Shared remote:** no claims, no Note; the local lock is the only guard, as before. The local lock stays in every case.
@@ -399,6 +399,24 @@ A claim left behind by a runner that was killed outright (`kill -9`, power loss)
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `RUNNER_CLAIM_STALE_AFTER` | `1800` | Seconds after its last heartbeat at which a claim is stale and may be taken over. |
+
+## Post-drain phase
+
+Once a feature has drained — no eligible issue left and none Blocked — and while the runner still holds the feature's Claim, it runs the host-side steps listed in `runner/post-drain.md`, then releases the claim. Use it for end-of-feature work that needs the host's credentials: reviewing the whole branch, opening a pull request. The manifest is optional; without it nothing changes.
+
+```
+# runner/post-drain.md — same line format as runner/manifest.md
+review-branch.md        # a prompt: claude -p on the host, feature slug appended
+scripts/open-pr.sh      # a command: run with the feature slug as $1 (and $RUNNER_FEATURE)
+```
+
+- Entries resolve against `runner/` first, then the framework's `steps/`; an invalid entry is `preflight-abort: post-drain-manifest`.
+- Steps run on the host, never in the sandbox, in the consumer root with the host's environment (git, `gh`, keychain). A command must be executable. `RUNNER_HOST_CLAUDE` names the `claude` binary for prompt steps (default `claude` on `PATH`).
+- The phase runs after a loop (drain mode or `--feature`) that dispatched and ended with an empty queue; `--issue` never runs it.
+- A step ends `ok`, `failed (exit N)` or — when its last non-blank output line is `BLOCKED: <dependency>` — `blocked (<dependency>)`. The phase stops at the first step that isn't `ok`. A failure writes the abort flag `.runner-state/aborted/<feature>/post-drain-<label>` (remove it to let the step run again); a Blocked step is re-run from where it stopped on the next pass.
+- Every step gets a progress line and a row in `SUMMARY.md`'s `## Post-drain` section.
+
+See "The post-drain phase" in `afk-runner.md` for the full contract.
 
 ## Resuming after a technical failure
 

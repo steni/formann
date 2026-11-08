@@ -290,6 +290,17 @@ Three compositions follow:
 
 GLOSSARY.md (*Building-block step*, *Review↔gate contract*) holds the term definitions.
 
+## The post-drain phase
+
+Once a feature has drained, the runner runs the **post-drain phase** (`post-drain.sh`): host-side steps named in the Consumer's optional `runner/post-drain.md`, while it still holds the feature's Claim. They are for end-of-feature work that needs the host's credentials — reviewing the whole branch, opening a pull request — and so can never run in the sandbox.
+
+- **Manifest.** Same line format as the post-implement manifest. The file is read from the Consumer's `runner/` first, then the framework root; the framework ships none, so a Consumer without one has no post-drain steps and the runner behaves as before. Entries resolve against `runner/` first, then `framework/runner/steps/`, and are validated at pre-flight (invariant 4c) into `RESOLVED_POST_DRAIN`.
+- **When.** After the feature's per-issue loop (drain mode and `--feature`) stops with `queue-empty`, provided the loop dispatched something — or a post-drain step is pending from a Blocked pass — and a fresh snapshot says the feature has drained: no eligible issue left (an aborted one included) and no issue Blocked. Any other loop stop (interrupt, parked, taken over, snapshot or fetch failure) skips it. `--issue` never runs it.
+- **On the host.** Each step runs in the Consumer root with the host's environment and stdin from `/dev/null`. A `.md` entry is a prompt: `claude -p "<prompt>\n<feature>" --output-format stream-json` on the host (`RUNNER_HOST_CLAUDE` names the binary; `--model` applies). Any other entry is a command, executed with the feature slug as `$1` and in `RUNNER_FEATURE`; it must be executable.
+- **Claim.** The claim is heart-beaten before every step and released after the phase (by `drain_one_feature` / `run_claimed_loop`, as for every drain). A claim lost to another runner stops the phase before its next step.
+- **Outcome.** `ok` (exit 0); `blocked (<dependency>)` when a clean step's last non-blank line (a prompt's result text, a command's stdout) is `BLOCKED: <dependency>`; `failed (exit N)` otherwise, including a prompt whose stream has no clean `result` event. The phase stops at the first step that does not end `ok`. A failed step writes the abort flag `.runner-state/aborted/<feature>/post-drain-<label>` (`dispatch: post-drain:<label>`); dispatches are not undone, and while the flag exists later phases stop at that step (`skipped (aborted)`). A Blocked step writes no abort flag but a marker `.runner-state/blocked/<feature>/post-drain`; on the next pass the feature is claimed even with nothing to dispatch, and the phase re-runs from that step.
+- **Output.** Each step has a progress line (`<feature> post-drain:<label> → <outcome>`), logs at `<run-dir>/[<feature>/]post-drain-<NN>-<label>.{stdout.jsonl|stdout.log,stderr.log,summary.md}`, and a row in `SUMMARY.md`'s `## Post-drain` table (`feature | step | outcome | duration | log`). A post-drain outcome never changes the run's stop reason or exit code.
+
 ## Outcome classification
 
 Two pure functions in `run-the-queue.sh`. Both take JSON snapshots and return a string verdict.
@@ -368,6 +379,7 @@ Fail-fast checks run before the loop starts. A failure prints `runner: <invarian
 | 3  | `docker-daemon`    | `docker info` succeeds.                                                                         |
 | 4  | `runner-image`     | The consumer's sandbox image exists and matches `runner/`, else it is built.                    |
 | 4b | `manifest`         | `runner/manifest.md` (Consumer-owned) exists and `resolve_manifest` validates every entry's label + prompt path. |
+| 4c | `post-drain-manifest` | When `runner/post-drain.md` exists, `resolve_manifest` validates every entry (see "The post-drain phase"). A missing manifest passes: no post-drain steps. |
 | 5  | `mvn-cache`        | Per-feature Docker volume exists (created on first use). **Drain mode**: deferred to the per-feature loop — features the runner skips don't get a cache volume. |
 | 6  | `sandbox-network`  | Custom Docker bridge + RFC1918-deny rules in place.                                            |
 | 7  | `oauth-token`      | Keychain retrieval succeeds; the token is captured into a shell variable.                      |

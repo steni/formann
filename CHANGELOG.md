@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- AFK runner runs a post-drain phase: host-side steps named in an optional consumer manifest
+  `runner/post-drain.md` (same format as `runner/manifest.md`; a `.md` entry is a prompt for the
+  host's `claude -p`, anything else a command given the feature slug), run once a feature has
+  drained and before its Claim is released — for a branch review or opening a pull request with
+  host credentials. Outcomes (`ok`, `failed`, `blocked`) go into the progress line and a
+  `## Post-drain` section of `SUMMARY.md`; a failed step writes the abort flag
+  `post-drain-<label>`, a Blocked one is re-run on the next pass. No manifest: nothing changes.
 - AFK runner keeps its own Formann checkout (`RUNNER_FORMANN_DIR`, a git clone, separate from the
   sessions' `.formann`) and fast-forwards it to `RUNNER_FORMANN_REF` (default `origin/main`) at the
   start of every run and every idle pass, re-executing itself from the updated checkout, so every
