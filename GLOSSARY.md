@@ -85,6 +85,22 @@ _Avoid_: "shadow branch", "runner branch"
 The local git remote named `runner` in the **Consumer**'s repo, pointing at `.runner-state/checkout/`. Registered lazily on the **Runner**'s first invocation. The **Parking ref**s live under this remote (`refs/remotes/runner/<feature>`).
 _Avoid_: "runner clone" (that's the **Runner-checkout** at `.runner-state/checkout/`, a separate concept).
 
+**Shared remote**:
+The git remote that every machine working on a **Consumer** fetches from and pushes to (`origin` unless configured otherwise). Together with the tracker, reached only through its canonical verbs, it is the only state two machines share: the **Runner** fast-forwards each **Dispatch**'s commit onto the **Shared remote**'s feature branch, from the host and never from the sandbox, before the **Post-implement phase** runs. A **Consumer** without a **Shared remote** keeps today's one-machine behaviour: the work stays on the **Parking ref**. Independent of the chosen tracker **Binding**.
+_Avoid_: "GitHub", "origin" (a hosting service and a default name, not the concept)
+
+**Claim**:
+A **Runner**'s exclusive hold on a feature while it drains it, so two machines never drain the same feature. A ref on the **Shared remote** (`refs/formann/claims/<feature>`), taken with an atomic push that succeeds only when no claim exists, refreshed as a heartbeat while the drain runs, and deleted when it ends. A **Claim** without a heartbeat for 30 minutes is stale and may be taken over. Lives in git, not in the tracker, so it is the same under every **Binding**; a tracker comment announcing it is information, never the lock.
+_Avoid_: "lock" (the per-machine runner lock is a different, local thing), "assignment"
+
+**Runner's Formann**:
+The **Runner**'s own checkout of **Formann**, separate from the one the **Consumer**'s interactive sessions read through `.formann`. At the start of every drain, before taking a **Claim**, the **Runner** fast-forwards it to a configured Formann ref (upstream `main` by default, or a maintainer's integration branch) and refuses to drain if it cannot. Its sha is recorded in the **Claim** and the run's summary, so every run says which Formann built it. An update never changes skills under a live session.
+_Avoid_: "the .formann checkout" (that one belongs to the sessions)
+
+**Blocked**:
+The outcome of a **Post-implement phase** step that could not run because something outside the run is unreachable (a consumer's service, the tracker, the **Shared remote**). The step posts a `Blocked` comment naming the dependency and the error. It is neither a finding nor an abort: the issue keeps its state, the **Runner** moves on and re-runs the step on its next idle pass, and after three **Blocked** passes the issue is left for a human with those comments as the reason. Like **Window-exhausted**, a cause outside the code that the **Runner** waits out.
+_Avoid_: "failed", "Critical" (a **Blocked** step says nothing about the code)
+
 **Post-implement phase**:
 The ordered sequence of **Dispatch**es the **Runner** executes after a successful `/implement`. Driven by a **Consumer**-owned manifest (`runner/manifest.md`) resolved at pre-flight; each manifest line is a prompt path resolved against the consumer root (`runner/`) first, then the framework root (`framework/runner/steps/`). The step label is the filename without its `.md` extension. The **Runner** walks the manifest one item at a time: dispatch → propagate → snapshot → classify → react. The default manifest contains exactly one entry (`review-and-gate.md`) running the fused `review-and-gate` prompt, reproducing the original hardcoded gate stage. An issue left at `in-review` after all items are exhausted is recorded as `left-for-human` (no abort flag). A **Dispatch** error in any item writes an abort flag keyed by the item's label.
 _Avoid_: "gate stage", "review phase" (those describe specific prompts, not the configurable walk structure)
