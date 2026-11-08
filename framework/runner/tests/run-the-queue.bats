@@ -6974,7 +6974,8 @@ case "$1" in
     label="" tag=""
     while [ $# -gt 0 ]; do
       case "$1" in
-        --label) label="${2#formann.runner.context-hash=}"; shift ;;
+        # build-image.sh passes more than one label; only the context hash is stored.
+        --label) case "$2" in formann.runner.context-hash=*) label="${2#formann.runner.context-hash=}" ;; esac; shift ;;
         --tag)   tag="$2"; shift ;;
       esac
       shift
