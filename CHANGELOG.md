@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `blocked (<dependency>)` and moves on. The next run re-runs the walk from the blocked step,
   without re-running `/implement`, and the third Blocked pass leaves the issue for a human. The
   pass count is read from the tracker through each binding's new `blocked-passes` script.
+- AFK runner `--idle <seconds>` (drain and `--feature` modes): instead of exiting when nothing is
+  left to do, the runner sleeps and starts a fresh pass, dispatching work that became ready
+  meanwhile and re-running steps that ended Blocked on the previous pass. Each pass that dispatched
+  anything writes `pass-<NNNN>/SUMMARY.md`; SIGINT/SIGTERM stops it cleanly. The runner README
+  has launchd and systemd recipes for running it as a service.
 
 ### Fixed
 - AFK runner puts the runner-checkout's `origin` back to the host repo before every sync and logs

@@ -390,7 +390,7 @@ the classifier runs.
    │        │                   gate-failed, propagation-error, ret 1);        │
    │        │                   write Blocked marker (step); record blocked    │
    │        │                   (<dep>); ret 0 (no abort flag, no state change;│
-   │        │                   run moves on; next run retries from the step)  │
+   │        │                   run moves on; next pass retries from the step) │
    │        │                                                                  │
    │        ├─ left-for-human (blocked, passes ≥ 3) ─► same, but clear the     │
    │        │                   marker and record left-for-human (blocked:     │

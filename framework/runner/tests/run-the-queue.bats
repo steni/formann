@@ -9333,3 +9333,250 @@ one_run() {
   assert_success
   assert_output --partial '| f/01 | blocked (preview-daemon) | 42s | - | [01.summary.md](01.summary.md) [01-01-review.summary.md](01-01-review.summary.md) |'
 }
+
+# === Idle loop (--idle, #6) ================================================
+
+@test "parse_args — --idle takes a whole number of seconds; refused with --issue and for bad values" {
+  parse_args --idle 60
+  [ "$ARG_IDLE" = "60" ]
+  [ "$RUN_MODE" = "drain" ]
+  ARG_IDLE=""
+  parse_args --feature f --idle 5
+  [ "$ARG_IDLE" = "5" ]
+  [ "$RUN_MODE" = "loop" ]
+
+  ARG_IDLE=""
+  run parse_args --issue f/01 --idle 60
+  assert_failure 2
+  assert_output --partial "--idle applies to drain and --feature modes"
+  run parse_args --idle 0
+  assert_failure 2
+  run parse_args --idle soon
+  assert_failure 2
+  assert_output --partial "--idle must be a whole number of seconds"
+  run parse_args --idle
+  assert_failure 2
+}
+
+@test "parse_args — without --idle, ARG_IDLE stays empty (main runs one pass as before)" {
+  ARG_IDLE=""
+  parse_args --feature f
+  [ -z "$ARG_IDLE" ]
+  parse_args
+  [ -z "$ARG_IDLE" ]
+}
+
+@test "--help — usage documents --idle" {
+  run bash "$RUNNER_SCRIPT" --help
+  assert_success
+  assert_output --partial "--idle <seconds>"
+  assert_output --partial "Exit codes:"
+}
+
+@test "idle_sleep — counts the wall clock, and stops early on an interrupt" {
+  TEST_NOW=1000
+  runner_epoch_now() { echo "$TEST_NOW"; }
+  TEST_TICKS=0
+  idle_sleep_tick() { TEST_TICKS=$((TEST_TICKS + 1)); TEST_NOW=$((TEST_NOW + 1)); }
+  RUNNER_INTERRUPTED=0
+  idle_sleep 5
+  [ "$TEST_TICKS" -eq 5 ]
+
+  # A throttled host whose one tick took 30s: the deadline ends the wait.
+  TEST_TICKS=0
+  idle_sleep_tick() { TEST_TICKS=$((TEST_TICKS + 1)); TEST_NOW=$((TEST_NOW + 30)); }
+  idle_sleep 5
+  [ "$TEST_TICKS" -eq 1 ]
+
+  # An interrupt arriving during a tick ends the wait at once.
+  TEST_TICKS=0
+  idle_sleep_tick() { TEST_TICKS=$((TEST_TICKS + 1)); TEST_NOW=$((TEST_NOW + 1)); RUNNER_INTERRUPTED=1; }
+  idle_sleep 60
+  [ "$TEST_TICKS" -eq 1 ]
+}
+
+@test "run_idle — an issue made ready while the runner sleeps is dispatched on the next pass, no restart" {
+  setup_loop_test
+  RUN_MODE=loop
+  ARG_IDLE=60
+  RUN_DIR="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$RUN_DIR"
+  RUN_DISPATCHES=()
+  ensure_runner_checkout_on_branch() { echo sync >>"$BATS_TEST_TMPDIR/syncs"; }
+  dispatch_one() {
+    echo "$1/$2" >>"$TEST_DISPATCHED_FILE"
+    : >"$TEST_QUEUE_FILE"
+    record_dispatch "$1" "$2" "$1/$2" "in-review" 5
+  }
+  TEST_SLEEPS="$BATS_TEST_TMPDIR/sleeps"
+  : >"$TEST_SLEEPS"
+  idle_sleep() {
+    echo "$1" >>"$TEST_SLEEPS"
+    case "$(wc -l <"$TEST_SLEEPS" | tr -d ' ')" in
+      1) plant_queue 01 ;;           # made ready while the runner sleeps
+      3) RUNNER_INTERRUPTED=1 ;;
+    esac
+  }
+  : >"$TEST_QUEUE_FILE"
+
+  run_idle run_loop >"$BATS_TEST_TMPDIR/progress"
+
+  [ "$RUN_STOP_REASON" = "interrupted" ]
+  [ "$(dispatched_count)" = "1" ]
+  [ "$(dispatched_nth 1)" = "f/01" ]
+  [ "$RUN_PASS" -eq 3 ]
+  [ "$(head -n 1 "$TEST_SLEEPS")" = "60" ]
+  # Passes 2 and 3 re-synced the runner-checkout first; pass 1 relied on pre-flight.
+  [ "$(wc -l <"$BATS_TEST_TMPDIR/syncs" | tr -d ' ')" -eq 2 ]
+  # Only the pass that dispatched wrote a pass directory.
+  [ ! -e "$RUN_DIR/pass-0001" ]
+  [ -f "$RUN_DIR/pass-0002/SUMMARY.md" ]
+  [ ! -e "$RUN_DIR/pass-0003" ]
+  grep -qF '| f/01 | in-review |' "$RUN_DIR/pass-0002/SUMMARY.md"
+  grep -qF -- '- Stop reason: queue-empty' "$RUN_DIR/pass-0002/SUMMARY.md"
+  [ "${#RUN_DISPATCHES[@]}" -eq 0 ]
+  run format_passes_section
+  assert_output --partial '- 3 pass(es) in total; 2 found nothing to do.'
+  assert_output --partial '- [pass 2](pass-0002/SUMMARY.md): 1 dispatch(es), stop reason: queue-empty'
+}
+
+@test "run_loop — without --idle, dispatch artifacts still land in the run dir itself" {
+  setup_loop_test
+  RUN_DIR="$BATS_TEST_TMPDIR/run"
+  RUN_PASS_DIR=""
+  dispatch_one() { echo "$3" >"$BATS_TEST_TMPDIR/dir"; : >"$TEST_QUEUE_FILE"; }
+  plant_queue 01
+  run_loop >/dev/null
+  [ "$(cat "$BATS_TEST_TMPDIR/dir")" = "$RUN_DIR" ]
+}
+
+@test "run_idle — a Blocked step is re-run on each next pass; the count continues from the tracker to left-for-human" {
+  setup_real_tracker_runs
+  RUN_MODE=loop
+  ARG_IDLE=60
+  RUN_DIR="$BATS_TEST_TMPDIR/runs/idle"
+  mkdir -p "$RUN_DIR"
+  RUN_DISPATCHES=()
+  RUN_BLOCKED_THIS_RUN=""
+  ensure_runner_checkout_on_branch() { :; }
+  TEST_SLEEPS="$BATS_TEST_TMPDIR/sleeps"
+  : >"$TEST_SLEEPS"
+  idle_sleep() {
+    echo "$1" >>"$TEST_SLEEPS"
+    [ "$(wc -l <"$TEST_SLEEPS" | tr -d ' ')" -lt 4 ] || RUNNER_INTERRUPTED=1
+  }
+
+  run_idle run_loop >"$BATS_TEST_TMPDIR/progress"
+
+  [ "$RUN_STOP_REASON" = "interrupted" ]
+  # Pass 1: implement, review, gate Blocked. Passes 2–3: only the gate.
+  [ "$(cat "$TEST_CALLS")" = "$(printf 'implement\nreview\ngate\ngate\ngate')" ]
+  grep -qF '| f/01 | blocked (preview-daemon) |' "$RUN_DIR/pass-0001/SUMMARY.md"
+  grep -qF '| f/01 | blocked (preview-daemon) |' "$RUN_DIR/pass-0002/SUMMARY.md"
+  grep -qF '| f/01 | left-for-human (blocked: preview-daemon) |' "$RUN_DIR/pass-0003/SUMMARY.md"
+  grep -qF 'f/01 retrying Blocked walk from gate' "$BATS_TEST_TMPDIR/progress"
+  grep -qF '3 passes' "$BATS_TEST_TMPDIR/progress"
+  [ "$(grep -c '^### Blocked' "$ISSUE_FILE")" -eq 3 ]
+  # Per-pass logs do not overwrite each other.
+  [ -f "$RUN_DIR/pass-0001/01.summary.md" ]
+  [ -f "$RUN_DIR/pass-0002/01.summary.md" ]
+  # Pass 4 had nothing to do.
+  [ "$RUN_PASS" -eq 4 ]
+  [ ! -e "$RUN_DIR/pass-0004" ]
+}
+
+@test "run_idle — a propagation error leaves the idle loop with that stop reason; a queue-empty or tracker outage does not" {
+  setup_loop_test
+  RUN_MODE=loop
+  ARG_IDLE=1
+  RUN_DIR="$BATS_TEST_TMPDIR/run"
+  RUN_DISPATCHES=()
+  ensure_runner_checkout_on_branch() { :; }
+  TEST_N="$BATS_TEST_TMPDIR/n"
+  : >"$TEST_N"
+  idle_sleep() { :; }
+  fake_pass() {
+    echo x >>"$TEST_N"
+    case "$(wc -l <"$TEST_N" | tr -d ' ')" in
+      1) RUN_STOP_REASON="queue-empty"; return 0 ;;
+      2) RUN_STOP_REASON="snapshot-failed"; return 1 ;;
+      *) RUN_STOP_REASON="propagation-error"; return 1 ;;
+    esac
+  }
+  set +e
+  run_idle fake_pass >/dev/null
+  local rc=$?
+  set -e
+  [ "$rc" -eq 1 ]
+  [ "$RUN_STOP_REASON" = "propagation-error" ]
+  [ "$RUN_PASS" -eq 3 ]
+}
+
+@test "run_idle — drain mode re-runs discovery on later passes; a failed discovery keeps the old list" {
+  RUN_MODE=drain
+  ARG_IDLE=1
+  RUN_DIR="$BATS_TEST_TMPDIR/run"
+  RUN_DISPATCHES=()
+  RUNNER_INTERRUPTED=0
+  HOST_REPO="$BATS_TEST_TMPDIR/host"
+  mkdir -p "$HOST_REPO/docs/formann/issue-tracker"
+  local ts="$HOST_REPO/docs/formann/issue-tracker/tracker-snapshot"
+  printf '#!/usr/bin/env bash\ncat "%s"\n' "$BATS_TEST_TMPDIR/list" >"$ts"
+  DISCOVERY_JSON='["a"]'
+  echo '["a","b"]' >"$BATS_TEST_TMPDIR/list"
+  TEST_SEEN="$BATS_TEST_TMPDIR/seen"
+  : >"$TEST_SEEN"
+  fake_pass() { echo "$DISCOVERY_JSON" | jq -c . >>"$TEST_SEEN"; RUN_STOP_REASON=completed; }
+  idle_sleep() {
+    case "$RUN_PASS" in
+      1) : ;;
+      2) printf '#!/usr/bin/env bash\nexit 3\n' >"$ts" ;;
+      *) RUNNER_INTERRUPTED=1 ;;
+    esac
+  }
+  run_idle fake_pass >"$BATS_TEST_TMPDIR/progress"
+  [ "$(cat "$TEST_SEEN")" = "$(printf '["a"]\n["a","b"]\n["a","b"]')" ]
+  grep -qF 'discovery failed' "$BATS_TEST_TMPDIR/progress"
+}
+
+@test "run_idle — SIGTERM during the sleep exits 0 promptly with an interrupted SUMMARY.md" {
+  local driver="$BATS_TEST_TMPDIR/driver.sh"
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  cat >"$driver" <<DRIVER
+#!/usr/bin/env bash
+source "$RUNNER_SCRIPT"
+set -euo pipefail
+RUN_MODE=loop
+ARG_IDLE=60
+TARGET_FEATURE=f
+RUN_FEATURE=f
+RUN_DIR="$run_dir"
+RUN_TS=test
+RUN_START_CLOCK=00:00:00
+HOST_ABORT_DIR="$run_dir/aborted"
+HOST_BLOCKED_DIR="$run_dir/blocked"
+take_snapshot() { printf '{"feature":"f","issues":[]}'; }
+ensure_runner_checkout_on_branch() { :; }
+idle_sleep_tick() { : >"$run_dir/sleeping"; sleep 1; }
+trap finalize_run EXIT
+trap handle_signal INT TERM
+run_idle run_loop
+DRIVER
+  bash "$driver" >"$BATS_TEST_TMPDIR/out" 2>&1 &
+  local pid=$!
+  local i=0
+  while [ ! -e "$run_dir/sleeping" ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+  [ -e "$run_dir/sleeping" ]
+  local start=$SECONDS
+  kill -TERM "$pid"
+  local rc=0
+  wait "$pid" || rc=$?
+  [ "$rc" -eq 0 ]
+  [ $((SECONDS - start)) -lt 10 ]
+  grep -qF -- '- Stop reason: interrupted' "$run_dir/SUMMARY.md"
+  grep -qF '(started 00:00:00, interrupted' "$run_dir/SUMMARY.md"
+  grep -qF '## Passes' "$run_dir/SUMMARY.md"
+  grep -qF '1 pass(es) in total; 1 found nothing to do.' "$run_dir/SUMMARY.md"
+  grep -qF 'stop reason: interrupted' "$BATS_TEST_TMPDIR/out"
+}

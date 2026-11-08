@@ -11,11 +11,119 @@ dispatching `/implement` per issue inside a sandboxed Docker container.
 
 `--model <id>` overrides the model for every dispatch in the run (implement stage and each post-implement walk item). An unknown id is rejected by the CLI inside the container and surfaces as a normal dispatch failure — the runner keeps no model whitelist. Without the flag, the `RUNNER_MODEL` environment variable (when set) supplies the model — export it in your shell profile to pin a default model for every run; `--model` still overrides it. When a model is chosen either way, it appears in the SUMMARY.md run line and `runner.log`; with neither, behavior is byte-identical to prior runs.
 
+Drain and loop mode also accept `--idle <seconds>`: instead of exiting when there is nothing left to do, the runner sleeps and starts a fresh pass — see [Idle loop](#idle-loop). It is refused with `--issue`.
+
 Every form also accepts `--no-caffeinate`. By default the runner holds a macOS wake assertion for the whole run (`caffeinate -i -s` tied to the runner pid, released automatically on any exit) so an unattended host doesn't idle-sleep or timer-throttle a multi-hour run — the flag skips it for operators who manage power assertions themselves. On hosts without `caffeinate` (non-macOS) the runner logs a note and continues; either way `runner.log` records whether an assertion was held.
 
 Drain mode stops on: every feature considered (`completed`); Ctrl-C (`interrupted`); or `tracker-snapshot --list` itself failing (`preflight-abort: discovery`).
 
 Narrowed modes stop on: queue empty; Ctrl-C (the in-flight container receives SIGTERM, then SIGKILL after `RUNNER_KILL_GRACE_SECONDS` if it lingers); or a mid-loop `tracker-snapshot` crash (`snapshot-failed`, exit 1). The full stop-reason vocabulary — including the pre-flight-phase stops — is enumerated below the per-issue table.
+
+## Idle loop
+
+`run-the-queue.sh --idle <seconds>` (with or without `--feature <slug>`) keeps the runner alive. Each **pass** is one drain (or one loop over the feature) exactly as a run without `--idle` would do it; when the pass ends — queue empty, every feature considered, a feature parked, or a tracker or fetch outage — the runner sleeps `<seconds>` and starts the next pass:
+
+- **Fresh state every pass.** Drain mode re-runs discovery (`tracker-snapshot --list`; on failure it keeps the previous list), and every feature is re-synced and re-snapshotted, so an issue made ready — or a feature created — while the runner slept is dispatched on the next pass, without a restart. Loop mode re-syncs the runner-checkout before its snapshot (a sync failure skips that pass).
+- **Blocked steps are re-run every pass.** A step that ended `blocked (<dependency>)` is re-run, from that step, on the next pass (never twice in one pass). The pass count is read from the tracker each time, so passes made by another machine count; the third leaves the issue for a human.
+- **One summary per pass.** A pass that dispatched anything writes `pass-<NNNN>/SUMMARY.md` in the run dir, and its per-issue artifacts land beside it, so a later pass never overwrites an earlier one's logs. A pass with nothing to do leaves no directory. The run's own `SUMMARY.md` ends with a `## Passes` index linking each pass.
+- **Stopping.** Ctrl-C or SIGTERM — during a dispatch or during the sleep (honoured within a second) — stops the runner with stop reason `interrupted`, exit 0, and the usual summary. A `propagation-error` or `runaway-halt` stops it with exit 1, as it would stop a single drain. A pre-flight failure exits 2 before the first pass.
+
+Without `--idle`, nothing changes: the runner makes one pass and exits.
+
+## Running as a service
+
+On an unattended machine, start the runner with `--idle` from the OS service manager so it starts with the machine and comes back after a crash. Both recipes below run it as **your user** (it needs your git credentials, your Docker access and your OAuth token), from the consumer repo root, restart it only when it exits non-zero, and append its terminal output to `.runner-state/service.log`. Each run still writes its own `runner.log` and `SUMMARY.md` under `.runner-state/runs/<ts>/`; `service.log` adds whatever happened before a run dir existed (a pre-flight abort, a crash).
+
+Replace `/path/to/consumer` with the consumer repo's absolute path, and set `PATH` to include `docker`, `git`, `jq` and (for the github-issues binding) `gh`. A crashed runner leaves its pidfile lock behind; the next start finds the owner gone and reclaims it.
+
+**macOS — launchd.** Save as `~/Library/LaunchAgents/dev.formann.runner.plist`. A LaunchAgent runs in your login session, so the Keychain entry holding the OAuth token is readable; the runner's own wake assertion keeps the machine awake while it runs.
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.formann.runner</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/path/to/consumer/.formann/runner/run-the-queue.sh</string>
+    <string>--idle</string>
+    <string>300</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/path/to/consumer</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>60</integer>
+  <key>ExitTimeOut</key>
+  <integer>60</integer>
+  <key>StandardOutPath</key>
+  <string>/path/to/consumer/.runner-state/service.log</string>
+  <key>StandardErrorPath</key>
+  <string>/path/to/consumer/.runner-state/service.log</string>
+</dict>
+</plist>
+```
+
+```sh
+mkdir -p /path/to/consumer/.runner-state
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.formann.runner.plist   # start now and at every login
+launchctl print gui/$(id -u)/dev.formann.runner                                    # state, pid, last exit code
+launchctl kickstart -k gui/$(id -u)/dev.formann.runner                             # restart (e.g. after pulling a new Formann)
+launchctl bootout gui/$(id -u)/dev.formann.runner                                  # stop (SIGTERM → interrupted) and unload
+```
+
+`KeepAlive` → `SuccessfulExit: false` restarts the runner after a non-zero exit (a crash, `propagation-error`, a pre-flight abort) but not after a clean stop; `ThrottleInterval` spaces restarts a minute apart. `bootout` sends SIGTERM, and `ExitTimeOut` gives an in-flight dispatch time to stop before launchd escalates to SIGKILL. A LaunchAgent starts at login: on a Mac that must run after a reboot with nobody at the screen, enable automatic login for that user.
+
+**Linux — systemd (user unit).** Save as `~/.config/systemd/user/formann-runner.service`:
+
+```ini
+[Unit]
+Description=Formann AFK runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/consumer
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/bin/bash /path/to/consumer/.formann/runner/run-the-queue.sh --idle 300
+Restart=on-failure
+RestartSec=60
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=60
+StandardOutput=append:/path/to/consumer/.runner-state/service.log
+StandardError=append:/path/to/consumer/.runner-state/service.log
+
+[Install]
+WantedBy=default.target
+```
+
+```sh
+mkdir -p /path/to/consumer/.runner-state
+sudo loginctl enable-linger "$USER"                # start your user units at boot, without a login
+systemctl --user daemon-reload
+systemctl --user enable --now formann-runner       # start now and at every boot
+systemctl --user status formann-runner             # state, pid, last exit code
+systemctl --user restart formann-runner            # restart (e.g. after pulling a new Formann)
+systemctl --user stop formann-runner               # stop (SIGTERM → interrupted)
+```
+
+`Restart=on-failure` restarts the runner after a non-zero exit or a kill, not after a clean stop; `RestartSec` spaces restarts a minute apart. `KillMode=mixed` sends SIGTERM to the runner alone, so it stops its in-flight container itself, and `TimeoutStopSec` bounds that before systemd sends SIGKILL. Your user must be in the `docker` group. The OAuth token must be readable without a desktop session: on a headless box with no unlocked GNOME Keyring, libsecret lookups fail, and the kernel keyring's `@s` session keyring does not survive into a service — store the token where the service can read it before relying on the unit (check with `systemctl --user start formann-runner` and `.runner-state/service.log`: a token failure is a `preflight-abort: oauth-token`).
 
 ## Per-run output
 
@@ -31,7 +139,8 @@ at `.runner-state/runs/<YYYYMMDD-HHMMSS>/` containing:
 | `<NN>.summary.md` / `<feature>/<NN>.summary.md` | The implement dispatch's readable closing message, extracted from the terminal `result` event — the skim-the-outcome artifact. This is what the SUMMARY table links. |
 | `<NN>.exit` / `<feature>/<NN>.exit` | Per-issue implement-dispatch exit code (a bare integer). |
 | `<NN>-<step>-<label>.{stdout.jsonl,stderr.log,summary.md}` (narrowed) / `<feature>/…` (drain) | The same three per-dispatch artifacts for each post-implement walk step, e.g. `01-01-review.stdout.jsonl` for the default single `review` step. One set per step that ran; absent when the implement stage failed and the walk never started. |
-| `SUMMARY.md` | Markdown end-of-run summary. Narrowed modes: feature heading + flat per-issue table. Drain mode: `# AFK runner — multi-feature drain` heading + per-feature sections (`## <feature> — drained` or `## <feature> — parked (Shared remote refused the fast-forward)` with nested per-issue table, or `## <feature> — skipped: <reason>` / `## <feature> — feature-snapshot-failed` one-liner). Pre-flight aborts replace the table with a single line naming the failing invariant. |
+| `pass-<NNNN>/` (`--idle` only) | One directory per pass that dispatched anything: its own `SUMMARY.md` (same shape as the run's), and that pass's per-issue artifacts (the rows above) inside it instead of directly in the run dir. |
+| `SUMMARY.md` | Markdown end-of-run summary. With `--idle`, it ends with a `## Passes` index linking every `pass-<NNNN>/SUMMARY.md`. Narrowed modes: feature heading + flat per-issue table. Drain mode: `# AFK runner — multi-feature drain` heading + per-feature sections (`## <feature> — drained` or `## <feature> — parked (Shared remote refused the fast-forward)` with nested per-issue table, or `## <feature> — skipped: <reason>` / `## <feature> — feature-snapshot-failed` one-liner). Pre-flight aborts replace the table with a single line naming the failing invariant. |
 
 Stdout while a run is in flight uses per-stage progress lines. A typical
 iteration produces four (implement starting/outcome, review starting/outcome):
@@ -112,7 +221,7 @@ combined-outcome column. The combined-outcome vocabulary is:
 | `window-exhausted` | The dispatch (implement or walk item — the abort flag's `dispatch:` field names the stage) still died usage-window-rejected after `RUNNER_WINDOW_RETRY_MAX_WAITS` window-waits. The quota is structurally insufficient for this dispatch, not a blip to `rm` and re-run. Runner writes a `type: window` abort flag and continues. |
 | `in-review` | AFK iteration interrupted between implement-finish and the start of the post-implement walk: implement landed `in-review`, the interrupt pre-empted the first walk step, and the iteration is recorded at its implement outcome. |
 | `FAIL` | Implement-stage failure (classifier verdict, container error, or parking-ref publish failure). Any `tracker:` work the dispatch did commit (notably the comment `/implement` posts on a bail) is still propagated to the host so it shows up on your branch when you return. |
-| `blocked (<dependency>)` | A post-implement step couldn't reach a dependency outside the run and ended `BLOCKED: <dependency>` after posting a Blocked comment. The issue keeps its state, no abort flag is written, and the run moves on to the next eligible issue; the next run re-runs the walk from the blocked step (`.runner-state/blocked/<feature>/<NN>` names it), without re-running `/implement`. |
+| `blocked (<dependency>)` | A post-implement step couldn't reach a dependency outside the run and ended `BLOCKED: <dependency>` after posting a Blocked comment. The issue keeps its state, no abort flag is written, and the run moves on to the next eligible issue; the next run (with `--idle`, the next pass) re-runs the walk from the blocked step (`.runner-state/blocked/<feature>/<NN>` names it), without re-running `/implement`. |
 | `left-for-human (blocked: <dependency>)` | The third Blocked pass (counted from the issue's Blocked comments since its latest Implementation comment). The issue is left for you with those comments as the reason. No abort flag. |
 | `halt → runaway` | A post-implement step drove the issue back to `ready-for-agent` (eligible) — a misconfigured manifest that would otherwise re-dispatch the same ref forever. The runner halts the entire run immediately. No abort flag (the issue is eligible, not stuck); the maintainer fixes the manifest. |
 

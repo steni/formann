@@ -6,6 +6,15 @@
 #   run-the-queue.sh [--model <id>] [--no-caffeinate] --feature <slug>       # loop mode — one feature
 #   run-the-queue.sh [--model <id>] [--no-caffeinate] --issue <feature>/<NN> # single-dispatch mode
 #
+# `--idle <seconds>` (drain and loop modes only) keeps the runner alive: when
+# a pass finds nothing to do it sleeps <seconds> and starts a fresh pass
+# (re-discovering features, re-syncing, re-snapshotting) instead of exiting.
+# Each pass re-runs the steps that ended Blocked on the previous pass, and
+# writes its own `pass-<NNNN>/SUMMARY.md` when it dispatched anything; the
+# run's SUMMARY.md indexes the passes. SIGINT/SIGTERM — during a dispatch or
+# during the sleep — stops cleanly with stop reason `interrupted`. Without
+# `--idle` the runner drains once and exits, as before.
+#
 # `--model <id>` overrides the model for every dispatch in the run (implement
 # and each walk item). An unknown id is rejected by the CLI inside the
 # container and surfaces as a normal dispatch failure. Without the flag,
@@ -1141,9 +1150,10 @@ blocked_marker_step() {
   sed -n 's/^step: //p' "$f" | head -n 1
 }
 
-# Issues whose walk ended Blocked during this run (`<feature>/<nn>`, one per
-# line). A Blocked issue is retried on the next run, never twice in one run —
-# until the idle loop (#6) exists, the next pass is the next run.
+# Issues whose walk ended Blocked during this pass (`<feature>/<nn>`, one per
+# line). A Blocked issue is retried on the next pass, never twice in one pass.
+# Without --idle a run is one pass, so the next pass is the next run; with
+# --idle, run_idle clears this at the start of every pass.
 RUN_BLOCKED_THIS_RUN=""
 
 # Print the step to retry for an issue, or nothing when it is not a Blocked
@@ -1195,6 +1205,14 @@ RUNNER_PUBLISH_PARKED=0      # 1 when propagate_feature's Shared-remote push was
 RUN_SWEPT_REFS=()     # parking refs deleted by sweep_stale_parking_refs; populated during pre-flight
 DISCOVERY_JSON=""     # populated by check_discovery pre-flight invariant
 RESOLVED_MANIFEST=""  # populated by check_manifest pre-flight invariant; tab-delimited label<TAB>path pairs
+# Idle loop (--idle) state. RUN_PASS_DIR is where the current pass's per-issue
+# artifacts land (`<run-dir>/pass-<NNNN>`); empty without --idle, so dispatches
+# write to RUN_DIR as before. RUN_PASSES is the pass index (`n|stop reason|
+# dispatch count` strings) that finalize_run renders into SUMMARY.md.
+RUN_PASS=0
+RUN_PASS_DIR=""
+RUN_PASSES=()
+RUN_IDLE_PASSES=0     # passes that dispatched nothing (no pass dir written)
 
 # Set RUN_TS / RUN_DIR / RUN_START_CLOCK and create the per-run dir under
 # `<host>/.runner-state/runs/<ts>/`. Idempotent within a run; no-op if
@@ -1391,6 +1409,9 @@ finalize_run() {
     if [ "${#RUN_SWEPT_REFS[@]}" -gt 0 ]; then
       format_swept_refs_section >>"$RUN_DIR/SUMMARY.md"
     fi
+    if [ -n "${ARG_IDLE:-}" ] && [ -z "$RUN_PREFLIGHT_INVARIANT" ]; then
+      format_passes_section >>"$RUN_DIR/SUMMARY.md"
+    fi
   fi
 
   release_lock
@@ -1407,6 +1428,7 @@ ARG_ISSUE_REF=""
 ARG_FEATURE=""
 ARG_MODEL=""
 ARG_NO_CAFFEINATE=0
+ARG_IDLE=""           # --idle <seconds>; empty = drain once and exit
 RUN_MODE=""           # "single" | "loop" | "drain", set by parse_args
 ISSUE_FEATURE=""
 ISSUE_NN=""
@@ -1452,8 +1474,20 @@ parse_args() {
         ARG_NO_CAFFEINATE=1
         shift
         ;;
+      --idle)
+        if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+          echo "runner: --idle requires an argument" >&2
+          exit 2
+        fi
+        if [[ ! "$2" =~ ^[1-9][0-9]*$ ]]; then
+          echo "runner: --idle must be a whole number of seconds > 0, got: $2" >&2
+          exit 2
+        fi
+        ARG_IDLE="$2"
+        shift 2
+        ;;
       -h|--help)
-        sed -n '2,64p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+        sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
         exit 0
         ;;
       *)
@@ -1471,6 +1505,10 @@ parse_args() {
     ISSUE_FEATURE="${BASH_REMATCH[1]}"
     ISSUE_NN="${BASH_REMATCH[2]}"
     RUN_MODE="single"
+    if [ -n "$ARG_IDLE" ]; then
+      echo "runner: --idle applies to drain and --feature modes, not --issue" >&2
+      exit 2
+    fi
   elif [ -n "$ARG_FEATURE" ]; then
     RUN_MODE="loop"
   else
@@ -4118,10 +4156,11 @@ run_loop() {
     RUNNER_LAST_PROPAGATION=""
     RUNNER_PUBLISH_PARKED=0
     local dispatch_rc=0
+    local dispatch_dir="${RUN_PASS_DIR:-$RUN_DIR}"
     if [ -n "$retry_step" ]; then
-      retry_blocked_walk "$TARGET_FEATURE" "$nn_sel" "$RUN_DIR" "$retry_step" || dispatch_rc=$?
+      retry_blocked_walk "$TARGET_FEATURE" "$nn_sel" "$dispatch_dir" "$retry_step" || dispatch_rc=$?
     else
-      dispatch_one "$TARGET_FEATURE" "$nn_sel" "$RUN_DIR" || dispatch_rc=$?
+      dispatch_one "$TARGET_FEATURE" "$nn_sel" "$dispatch_dir" || dispatch_rc=$?
     fi
 
     # If Ctrl-C arrived during the dispatch, exit immediately.
@@ -4361,6 +4400,171 @@ ensure_mvn_cache_for() {
   return 0
 }
 
+# === Idle loop (--idle) ====================================================
+#
+# With `--idle <seconds>` the runner is long-lived: `run_idle` repeats a pass
+# (one run_drain or run_loop) and, between passes, sleeps <seconds>. Every
+# pass after the first refreshes what a fresh run would see — drain mode
+# re-runs discovery (so a feature created while the runner slept is
+# considered), loop mode re-syncs the runner-checkout (so a local-markdown
+# issue made ready on the host is seen by the snapshot) — and clears
+# RUN_BLOCKED_THIS_RUN, so a step that ended Blocked on the previous pass is
+# re-run. The Blocked pass count is still read from the tracker, never from
+# the runner.
+#
+# Each pass that dispatched anything writes `<run-dir>/pass-<NNNN>/SUMMARY.md`
+# (its per-issue logs land beside it) and its records are cleared, so the run
+# directory of a long-lived runner stays readable. Passes that dispatched
+# nothing leave no directory; they are only counted in SUMMARY.md's
+# "## Passes" index (format_passes_section).
+#
+# Stops: an interrupt (SIGINT/SIGTERM, during a pass or the sleep) returns 0
+# with RUN_STOP_REASON="interrupted"; a propagation error or the runaway guard
+# return 1 with that pass's stop reason, exactly as a single pass would.
+# Every other pass outcome (queue empty, a tracker or fetch outage, a parked
+# feature) sleeps and tries again.
+
+# One sleep tick. Its own function so tests can drive the sleep without
+# waiting on the wall clock.
+idle_sleep_tick() { sleep 1; }
+
+# Sleep for $1 seconds in one-second ticks, against a wall-clock deadline (a
+# throttled or suspended host must not stretch the wait — issue #80), and
+# return early as soon as RUNNER_INTERRUPTED is set. Bash runs the
+# SIGINT/SIGTERM trap when the foreground `sleep` tick returns, so an
+# interrupt during the sleep is honoured within a second.
+idle_sleep() {
+  local seconds="$1"
+  local deadline
+  deadline=$(( $(runner_epoch_now) + seconds ))
+  while [ "${RUNNER_INTERRUPTED:-0}" -eq 0 ] \
+      && [ "$(runner_epoch_now)" -lt "$deadline" ]; do
+    idle_sleep_tick
+  done
+}
+
+# Re-run discovery for a later drain pass. Soft: on failure the previous
+# DISCOVERY_JSON is kept (a tracker outage must not stop a long-lived
+# runner) and the failure is logged.
+refresh_discovery() {
+  local rc=0 result
+  result="$(TRACKER_ROOT="$HOST_REPO/.features" \
+    bash "$HOST_REPO/docs/formann/issue-tracker/tracker-snapshot" --list)" || rc=$?
+  if [ "$rc" -ne 0 ] \
+      || ! jq -e 'if type == "array" then . else error end' >/dev/null 2>&1 <<<"$result"; then
+    echo "[$(now_clock)] runner: discovery failed (tracker-snapshot --list exited $rc); keeping the previous feature list"
+    return 1
+  fi
+  DISCOVERY_JSON="$result"
+}
+
+# Before every pass after the first: pick up what changed while the runner
+# slept. Returns 1 when the pass should be skipped (loop mode could not sync
+# its runner-checkout); the caller records the pass and sleeps.
+prepare_idle_pass() {
+  case "$RUN_MODE" in
+    drain)
+      refresh_discovery || true
+      ;;
+    loop)
+      if ! ensure_runner_checkout_on_branch "$TARGET_FEATURE" >&2; then
+        echo "[$(now_clock)] runner: could not sync the runner-checkout for '$TARGET_FEATURE'; skipping this pass"
+        RUN_STOP_REASON="fetch-failed"
+        return 1
+      fi
+      ;;
+  esac
+  return 0
+}
+
+# Close the current pass: write its SUMMARY.md when it dispatched anything,
+# append it to the pass index, and clear its records.
+finish_idle_pass() {
+  local n="$RUN_PASS" stop="${RUN_STOP_REASON:-unknown}"
+  local count="${#RUN_DISPATCHES[@]}"
+  if [ "$count" -gt 0 ]; then
+    mkdir -p "$RUN_PASS_DIR"
+    local end_state="ended"
+    [ "${RUNNER_INTERRUPTED:-0}" -eq 1 ] && end_state="interrupted"
+    if [ "$RUN_MODE" = "drain" ]; then
+      print_multi_feature_records | format_multi_feature_summary_md \
+        "$RUN_TS pass $n" "$RUN_PASS_START_CLOCK" "$(now_clock)" \
+        "$end_state" "$stop" "${ARG_MODEL:-}" >"$RUN_PASS_DIR/SUMMARY.md"
+    else
+      print_dispatch_records | format_summary_md \
+        "$RUN_FEATURE" "$RUN_TS pass $n" "$RUN_PASS_START_CLOCK" "$(now_clock)" \
+        "$end_state" "$stop" "${ARG_MODEL:-}" >"$RUN_PASS_DIR/SUMMARY.md"
+    fi
+    RUN_PASSES+=("$n|$stop|$count")
+  else
+    [ -d "$RUN_PASS_DIR" ] && rmdir "$RUN_PASS_DIR" 2>/dev/null || true
+    RUN_IDLE_PASSES=$(( RUN_IDLE_PASSES + 1 ))
+  fi
+  RUN_DISPATCHES=()
+  RUN_FEATURE_OUTCOMES=()
+}
+
+# SUMMARY.md's "## Passes" index (--idle only): one line per pass that
+# dispatched anything, linking its own SUMMARY.md, then the idle-pass count.
+format_passes_section() {
+  printf '\n## Passes\n\n'
+  printf -- '- %d pass(es) in total; %d found nothing to do.\n' \
+    "$RUN_PASS" "$RUN_IDLE_PASSES"
+  if [ "${#RUN_PASSES[@]}" -eq 0 ]; then return 0; fi
+  local rec n stop count name
+  for rec in "${RUN_PASSES[@]}"; do
+    n="${rec%%|*}"; rec="${rec#*|}"
+    stop="${rec%|*}"; count="${rec##*|}"
+    name="$(printf 'pass-%04d' "$n")"
+    printf -- '- [pass %d](%s/SUMMARY.md): %d dispatch(es), stop reason: %s\n' \
+      "$n" "$name" "$count" "$stop"
+  done
+}
+
+RUN_PASS_START_CLOCK=""
+
+# Args: $1 = the pass function (run_drain | run_loop).
+run_idle() {
+  local pass_fn="$1"
+  while :; do
+    if [ "${RUNNER_INTERRUPTED:-0}" -eq 1 ]; then
+      echo "[$(now_clock)] runner: interrupted; not starting the next pass"
+      RUN_STOP_REASON="interrupted"
+      return 0
+    fi
+
+    RUN_PASS=$(( RUN_PASS + 1 ))
+    RUN_PASS_DIR="$RUN_DIR/$(printf 'pass-%04d' "$RUN_PASS")"
+    RUN_PASS_START_CLOCK="$(now_clock)"
+    RUN_BLOCKED_THIS_RUN=""
+    RUN_STOP_REASON=""
+    echo "[$(now_clock)] runner: pass $RUN_PASS"
+
+    local rc=0 run_pass=1
+    if [ "$RUN_PASS" -gt 1 ]; then
+      prepare_idle_pass || run_pass=0
+    fi
+    if [ "$run_pass" -eq 1 ]; then
+      "$pass_fn" || rc=$?
+    fi
+    finish_idle_pass
+
+    if [ "${RUNNER_INTERRUPTED:-0}" -eq 1 ]; then
+      RUN_STOP_REASON="interrupted"
+      return 0
+    fi
+    case "$RUN_STOP_REASON" in
+      propagation-error|runaway-halt*)
+        echo "[$(now_clock)] runner: pass $RUN_PASS stopped on $RUN_STOP_REASON; leaving the idle loop"
+        return 1 ;;
+    esac
+    : "$rc"
+
+    echo "[$(now_clock)] runner: pass $RUN_PASS ended ($RUN_STOP_REASON); sleeping ${ARG_IDLE}s"
+    idle_sleep "$ARG_IDLE"
+  done
+}
+
 # === Main ==================================================================
 
 main() {
@@ -4391,8 +4595,8 @@ main() {
   trap handle_signal INT TERM
   case "$RUN_MODE" in
     single) run_single ;;
-    loop)   run_loop ;;
-    drain)  run_drain ;;
+    loop)   if [ -n "$ARG_IDLE" ]; then run_idle run_loop; else run_loop; fi ;;
+    drain)  if [ -n "$ARG_IDLE" ]; then run_idle run_drain; else run_drain; fi ;;
     *)
       echo "runner: internal error — unknown run mode '$RUN_MODE'" >&2
       exit 2
