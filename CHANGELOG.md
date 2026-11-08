@@ -58,6 +58,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   has launchd and systemd recipes for running it as a service.
 
 ### Fixed
+- Runner Dockerfile template installs Node.js 22 (NodeSource `setup_22.x`) instead of 20. On Node 20,
+  npm quietly installed the last Claude Code whose `engines` still allowed it (2.1.197), too old for
+  Opus 5.5, so every dispatch failed with an API 400. The install layer now compares `claude
+  --version` with `npm view @anthropic-ai/claude-code version` and fails the image build, naming
+  both versions and the Node version, if they differ. **Migration:** the installer never overwrites
+  an existing `runner/Dockerfile`, so existing consumers must refresh theirs: delete
+  `runner/Dockerfile` and re-run `installer/install.sh` (or, if you have customised it, port the
+  Node / Claude CLI `RUN` layer from `installer/templates/Dockerfile` by hand). The changed file
+  changes the image's build-context hash, so the runner rebuilds the image on its next dispatch.
 - AFK runner keeps its Claim fresh while a dispatch runs, not only between dispatches: a companion
   process heart-beats it every `RUNNER_CLAIM_HEARTBEAT_SECONDS` (default a third of the stale-after
   time, 600 s) for the life of each `/implement` or post-implement container and each post-drain

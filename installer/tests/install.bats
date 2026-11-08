@@ -158,6 +158,85 @@ _run_installer() {
   grep -q "core_pattern=" "$CONSUMER/runner/Dockerfile"
 }
 
+# Prints the shell command of the RUN layer that installs the Claude CLI, with
+# continuation lines joined the way Docker joins them (backslash-newline
+# removed). Fails if no such layer exists.
+_claude_cli_layer() {
+  awk '
+    /^RUN / { in_run = 1; block = "" }
+    in_run {
+      line = $0
+      cont = sub(/\\$/, "", line)
+      block = block line
+      if (!cont) {
+        in_run = 0
+        if (block ~ /npm install -g @anthropic-ai\/claude-code/) { sub(/^RUN /, "", block); print block; found = 1 }
+      }
+    }
+    END { exit !found }
+  ' "$1"
+}
+
+@test "runner/Dockerfile installs Node 22 from NodeSource" {
+  run _run_installer
+  assert_success
+  grep -q "deb.nodesource.com/setup_22.x" "$CONSUMER/runner/Dockerfile"
+  grep -q "^# Node.js 22 from NodeSource" "$CONSUMER/runner/Dockerfile"
+  run grep -q "setup_20.x" "$CONSUMER/runner/Dockerfile"
+  assert_failure
+}
+
+@test "runner/Dockerfile checks installed vs latest Claude Code in the install layer" {
+  run _run_installer
+  assert_success
+  run _claude_cli_layer "$CONSUMER/runner/Dockerfile"
+  assert_success
+  assert_output --partial "setup_22.x"
+  assert_output --partial "claude --version"
+  assert_output --partial "npm view @anthropic-ai/claude-code version"
+}
+
+# Runs the Claude CLI layer under /bin/sh (as Docker's shell-form RUN does)
+# with every external command stubbed: npm reports $FAKE_LATEST as the
+# registry's latest, claude reports $FAKE_INSTALLED.
+_run_claude_cli_layer_stubbed() {
+  local stubs="$BATS_TEST_TMPDIR/stubs"
+  mkdir -p "$stubs"
+  local cmd
+  for cmd in curl apt-get rm; do
+    printf '#!/bin/sh\nexit 0\n' > "$stubs/$cmd"
+  done
+  printf '#!/bin/sh\necho v20.19.5\n' > "$stubs/node"
+  printf '#!/bin/sh\necho "$FAKE_INSTALLED (Claude Code)"\n' > "$stubs/claude"
+  cat > "$stubs/npm" <<'EOF'
+#!/bin/sh
+[ "$1" = view ] && echo "$FAKE_LATEST"
+exit 0
+EOF
+  chmod +x "$stubs"/*
+  local layer
+  layer="$(_claude_cli_layer "$CONSUMER/runner/Dockerfile")"
+  PATH="$stubs:$PATH" /bin/sh -c "$layer"
+}
+
+@test "Claude CLI layer fails the build when npm installed a stale Claude Code" {
+  run _run_installer
+  assert_success
+  FAKE_INSTALLED=2.1.197 FAKE_LATEST=2.1.319 run _run_claude_cli_layer_stubbed
+  assert_failure
+  assert_output --partial "2.1.197"
+  assert_output --partial "2.1.319"
+  assert_output --partial "Node"
+  assert_output --partial "too old"
+}
+
+@test "Claude CLI layer succeeds when the installed Claude Code is the latest" {
+  run _run_installer
+  assert_success
+  FAKE_INSTALLED=2.1.319 FAKE_LATEST=2.1.319 run _run_claude_cli_layer_stubbed
+  assert_success
+}
+
 # ---------------------------------------------------------------------------
 # runner/manifest.md
 # ---------------------------------------------------------------------------
