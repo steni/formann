@@ -34,7 +34,7 @@ Without `--idle`, nothing changes: the runner makes one pass and exits.
 
 On an unattended machine, start the runner with `--idle` from the OS service manager so it starts with the machine and comes back after a crash. Both recipes below run it as **your user** (it needs your git credentials, your Docker access and your OAuth token), from the consumer repo root, restart it only when it exits non-zero, and append its terminal output to `.runner-state/service.log`. Each run still writes its own `runner.log` and `SUMMARY.md` under `.runner-state/runs/<ts>/`; `service.log` adds whatever happened before a run dir existed (a pre-flight abort, a crash).
 
-Replace `/path/to/consumer` with the consumer repo's absolute path, and set `PATH` to include `docker`, `git`, `jq` and (for the github-issues binding) `gh`. A crashed runner leaves its pidfile lock behind; the next start finds the owner gone and reclaims it.
+Replace `/path/to/consumer` with the consumer repo's absolute path, and set `PATH` to include `docker`, `git`, `jq` and (for the github-issues binding) `gh`. Add `RUNNER_FORMANN_DIR` (and `RUNNER_FORMANN_REF` if not `origin/main`) to the unit's environment so the service runs — and keeps updating — its own Formann; see [The Runner's Formann](#the-runners-formann). A crashed runner leaves its pidfile lock behind; the next start finds the owner gone and reclaims it.
 
 **macOS — launchd.** Save as `~/Library/LaunchAgents/dev.formann.runner.plist`. A LaunchAgent runs in your login session, so the Keychain entry holding the OAuth token is readable; the runner's own wake assertion keeps the machine awake while it runs.
 
@@ -124,6 +124,33 @@ systemctl --user stop formann-runner               # stop (SIGTERM → interrupt
 ```
 
 `Restart=on-failure` restarts the runner after a non-zero exit or a kill, not after a clean stop; `RestartSec` spaces restarts a minute apart. `KillMode=mixed` sends SIGTERM to the runner alone, so it stops its in-flight container itself, and `TimeoutStopSec` bounds that before systemd sends SIGKILL. Your user must be in the `docker` group. The OAuth token must be readable without a desktop session: on a headless box with no unlocked GNOME Keyring, libsecret lookups fail, and the kernel keyring's `@s` session keyring does not survive into a service — store the token where the service can read it before relying on the unit (check with `systemctl --user start formann-runner` and `.runner-state/service.log`: a token failure is a `preflight-abort: oauth-token`).
+
+## The Runner's Formann
+
+The runner runs from a Formann checkout of its own, never from the one your interactive sessions read through `.formann`. At the start of every run — and, with `--idle`, before every pass after the first — it fast-forwards that checkout to a configured ref and runs the code there, so every machine runs the same Formann without anyone pulling on each one, and an update never changes skills under a live session.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `RUNNER_FORMANN_DIR` | _(unset)_ | Path of the runner's own Formann checkout: a **git clone** of the Formann remote, used by nothing else. Unset: the runner runs from wherever it was started, updates nothing, and records that checkout's sha as `<sha> (not self-updated: RUNNER_FORMANN_DIR is unset)`. |
+| `RUNNER_FORMANN_REF` | `origin/main` | `<remote>/<branch>` the checkout follows — upstream `main`, or your own integration branch (e.g. `fork/integration`, after `git -C "$RUNNER_FORMANN_DIR" remote add fork <url>`). |
+
+**Setting it up.** Clone the Formann remote somewhere of its own and point the runner at it — in the service unit's environment, or your shell profile:
+
+```sh
+git clone https://github.com/<owner>/formann.git ~/formann-runner     # the runner's Formann; never edit it
+export RUNNER_FORMANN_DIR=~/formann-runner
+export RUNNER_FORMANN_REF=origin/main                                 # or <remote>/<your-integration-branch>
+```
+
+Keep starting the runner as before (`.formann/runner/run-the-queue.sh`, or the service recipes above): the copy you start only updates the runner's checkout and then re-executes `$RUNNER_FORMANN_DIR/framework/runner/run-the-queue.sh` with the same arguments, so the drain runs the checkout's code. The sandbox still sees the consumer's `.formann` (read-only) for the skills it runs.
+
+**An rsync copy must become a clone.** A checkout copied from another machine with `rsync` (as on smia today) has no git history the runner can fast-forward — or carries the other machine's local state — and is refused as `not a git clone`. Replace it: move it aside, `git clone` the configured remote into `RUNNER_FORMANN_DIR`, and start the runner. Never edit the clone in place: carry your own changes on a branch of a remote and point `RUNNER_FORMANN_REF` at it.
+
+**What happens at each drain:**
+
+- **Fast-forward.** `formann_self_update` (`formann-update.sh`) fetches `<branch>` from `<remote>` and fast-forwards the checkout to it. When the sha moved, or the runner was started from another copy, the runner re-executes itself from the checkout before it takes the lock or any claim. In the idle loop a pass that finds the ref moved ends the run (stop reason `formann-updated`; summary, claims and lock released as usual) and the same process re-executes on the new code, which starts a fresh run.
+- **Refusal.** Local changes (modified, staged or untracked files), divergence (commits the ref lacks — the checkout is ahead of it or has diverged), a missing directory, a directory that is not a git clone, or a ref that cannot be fetched refuse the drain with the reason, before any claim is taken: at startup `preflight-abort: runner-formann` (exit 2; the reason is the line `runner: runner-formann: refusing to drain: <reason>` in `runner.log`); in the idle loop the pass is skipped as `formann-refused` and the runner tries again after the sleep. Reconcile the checkout by hand (`git -C "$RUNNER_FORMANN_DIR" status`, `reset --hard <remote>/<branch>` if the local state is not wanted) — the runner never discards it for you.
+- **Record.** The sha is the `formann:` line of the **Claim** and the `- Formann: <sha> (<ref>)` line of `SUMMARY.md` (every variant, including a pre-flight abort and each pass's summary), and `runner.log` opens with `runner: Formann <sha> (<ref>)`. A bad run points straight at the version that produced it.
 
 ## Per-run output
 
@@ -249,7 +276,9 @@ The trailing `stop reason:` line varies by mode.
 **All modes — pre-flight-phase:**
 
 - `interrupted-during-preflight` — Ctrl-C arrived before the loop started.
-- `preflight-abort: <invariant>` — a pre-flight invariant tripped before the loop began.
+- `preflight-abort: <invariant>` — a pre-flight invariant tripped before the loop began. `preflight-abort: runner-formann` — the Runner's Formann could not be fast-forwarded to its ref (see [The Runner's Formann](#the-runners-formann)); nothing was locked or claimed.
+
+**With `--idle`, per pass:** `formann-refused` — the Runner's Formann update refused; the pass drained nothing and the runner tries again after the sleep. `formann-updated` — the ref moved; the run ends (exit 0) and the runner re-executes on the new Formann.
 
 ## Transport-class retry
 

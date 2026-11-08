@@ -15,6 +15,13 @@
 # during the sleep — stops cleanly with stop reason `interrupted`. Without
 # `--idle` the runner drains once and exits, as before.
 #
+# With RUNNER_FORMANN_DIR set, the runner first fast-forwards its own Formann
+# checkout there to RUNNER_FORMANN_REF (`<remote>/<branch>`, default
+# `origin/main`) and re-executes from it (see "Runner's Formann" below); a
+# refusal is `preflight-abort: runner-formann`. With --idle each later pass
+# repeats the update: `formann-refused` skips the pass, `formann-updated` ends
+# the run, which then re-executes on the new code.
+#
 # `--model <id>` overrides the model for every dispatch in the run (implement
 # and each walk item). An unknown id is rejected by the CLI inside the
 # container and surfaces as a normal dispatch failure. Without the flag,
@@ -97,6 +104,11 @@ source "$HERE/liveness.sh"
 # the runner's hold on the feature it drains, a ref on the Shared remote.
 # shellcheck source=claim.sh
 source "$HERE/claim.sh"
+# formann-update.sh provides the Runner's Formann updater
+# (formann_self_update): the runner's own Formann checkout, fast-forwarded to
+# the configured ref before every drain.
+# shellcheck source=formann-update.sh
+source "$HERE/formann-update.sh"
 
 # === Configuration =========================================================
 
@@ -856,9 +868,11 @@ format_end_of_run_table() {
 # any dispatch parked; it is omitted entirely when no dispatch parked.
 # `end_state` is the verb used in the run line — "ended" or "interrupted".
 # Optional $7 = model id (when set, appended to the run line as ", model: <id>").
+# Optional $8 = the Runner's Formann label (when set, a "- Formann: <label>"
+# line follows the run line).
 format_summary_md() {
   local feature="$1" ts="$2" start_clock="$3" end_clock="$4" end_state="$5" stop_reason="$6" \
-        model="${7:-}"
+        model="${7:-}" formann="${8:-}"
   # Capture once so the table awk and the parked-work aggregator both see the
   # same records without the caller having to materialize them twice.
   local records
@@ -868,6 +882,9 @@ format_summary_md() {
     printf -- '- Run: %s (started %s, %s %s, model: %s)\n' "$ts" "$start_clock" "$end_state" "$end_clock" "$model"
   else
     printf -- '- Run: %s (started %s, %s %s)\n' "$ts" "$start_clock" "$end_state" "$end_clock"
+  fi
+  if [ -n "$formann" ]; then
+    printf -- '- Formann: %s\n' "$formann"
   fi
   printf -- '- Stop reason: %s\n\n' "$stop_reason"
   printf '| issue | outcome | duration | propagation | logs |\n'
@@ -923,9 +940,11 @@ format_summary_md() {
 # section follows when any dispatch parked, and is omitted entirely when no
 # dispatch parked.
 # Optional $6 = model id (when set, appended to the run line as ", model: <id>").
+# Optional $7 = the Runner's Formann label (when set, a "- Formann: <label>"
+# line follows the run line).
 format_multi_feature_summary_md() {
   local ts="$1" start_clock="$2" end_clock="$3" end_state="$4" stop_reason="$5" \
-        model="${6:-}"
+        model="${6:-}" formann="${7:-}"
   # Capture once so the per-feature renderer and `format_parked_ledger` both
   # see the same records.
   local records
@@ -935,6 +954,9 @@ format_multi_feature_summary_md() {
     printf -- '- Run: %s (started %s, %s %s, model: %s)\n' "$ts" "$start_clock" "$end_state" "$end_clock" "$model"
   else
     printf -- '- Run: %s (started %s, %s %s)\n' "$ts" "$start_clock" "$end_state" "$end_clock"
+  fi
+  if [ -n "$formann" ]; then
+    printf -- '- Formann: %s\n' "$formann"
   fi
   printf -- '- Stop reason: %s\n\n' "$stop_reason"
   printf '%s' "$records" | awk -F'|' '
@@ -1054,13 +1076,18 @@ format_parked_ledger() {
 
 # SUMMARY.md content for a pre-flight abort. Replaces the per-issue
 # table with a single line naming the failing invariant.
+# Optional $6 = the Runner's Formann label (when set, a "- Formann: <label>"
+# line follows the run line).
 format_preflight_summary_md() {
-  local feature="$1" ts="$2" start_clock="$3" abort_clock="$4" invariant="$5"
+  local feature="$1" ts="$2" start_clock="$3" abort_clock="$4" invariant="$5" formann="${6:-}"
   if [ -z "$feature" ]; then
     feature="(undetermined)"
   fi
   printf '# AFK runner — %s\n\n' "$feature"
   printf -- '- Run: %s (started %s, aborted %s)\n' "$ts" "$start_clock" "$abort_clock"
+  if [ -n "$formann" ]; then
+    printf -- '- Formann: %s\n' "$formann"
+  fi
   printf -- '- Stop reason: preflight-abort: %s\n\n' "$invariant"
   printf 'Pre-flight invariant `%s` failed before the loop began. See `runner.log` for details.\n' "$invariant"
 }
@@ -1272,6 +1299,10 @@ start_runner_log_capture() {
   # also writing to runner.log.
   tee "$RUN_DIR/runner.log" <"$RUNNER_LOG_FIFO" &
   RUNNER_TEE_PID=$!
+  # Keep the original stdout/stderr on fds 7/8, so a re-exec after a Formann
+  # update (finalize_run → runner_formann_reexec) hands the new process the
+  # operator's terminal (or the service log), not this run's closed fifo.
+  exec 7>&1 8>&2
   exec >"$RUNNER_LOG_FIFO" 2>&1
 }
 
@@ -1282,7 +1313,12 @@ start_runner_log_capture() {
 # Called as the last step of `finalize_run`, after every other write.
 stop_runner_log_capture() {
   if [ -z "${RUNNER_TEE_PID:-}" ]; then return 0; fi
-  exec >&- 2>&-
+  if [ "${1:-}" = "--restore" ]; then
+    exec >&7 2>&8
+  else
+    exec >&- 2>&-
+  fi
+  exec 7>&- 8>&-
   wait "$RUNNER_TEE_PID" 2>/dev/null || true
   rm -f "$RUNNER_LOG_FIFO"
   RUNNER_TEE_PID=""
@@ -1406,7 +1442,7 @@ finalize_run() {
     if [ -n "$RUN_PREFLIGHT_INVARIANT" ]; then
       format_preflight_summary_md \
         "$RUN_FEATURE" "$RUN_TS" "$RUN_START_CLOCK" "$end_clock" \
-        "$RUN_PREFLIGHT_INVARIANT" >"$RUN_DIR/SUMMARY.md"
+        "$RUN_PREFLIGHT_INVARIANT" "$(runner_formann_label)" >"$RUN_DIR/SUMMARY.md"
       printf '\nstop reason: preflight-abort: %s\n' "$RUN_PREFLIGHT_INVARIANT"
     else
       local end_state="ended"
@@ -1419,11 +1455,11 @@ finalize_run() {
       if [ "$RUN_MODE" = "drain" ]; then
         print_multi_feature_records | format_multi_feature_summary_md \
           "$RUN_TS" "$RUN_START_CLOCK" "$end_clock" \
-          "$end_state" "$stop_reason" "${ARG_MODEL:-}" >"$RUN_DIR/SUMMARY.md"
+          "$end_state" "$stop_reason" "${ARG_MODEL:-}" "$(runner_formann_label)" >"$RUN_DIR/SUMMARY.md"
       else
         print_dispatch_records | format_summary_md \
           "$RUN_FEATURE" "$RUN_TS" "$RUN_START_CLOCK" "$end_clock" \
-          "$end_state" "$stop_reason" "${ARG_MODEL:-}" >"$RUN_DIR/SUMMARY.md"
+          "$end_state" "$stop_reason" "${ARG_MODEL:-}" "$(runner_formann_label)" >"$RUN_DIR/SUMMARY.md"
       fi
     fi
     # Append swept parking refs section when at least one ref was swept. Both
@@ -1441,6 +1477,13 @@ finalize_run() {
   # (interrupt, abort): release it so the next runner needn't wait it out.
   claim_release_held
   release_lock
+  # A later idle pass found the Runner's Formann moved: this run has ended
+  # cleanly (summary written, claim and lock released); the updated runner
+  # takes over in this same process.
+  if [ "${RUNNER_FORMANN_REEXEC_PENDING:-0}" -eq 1 ] && [ "$rc" -eq 0 ]; then
+    stop_runner_log_capture --restore
+    runner_formann_reexec
+  fi
   # Drain runner.log before exiting so the operator never sees a
   # truncated tail. Must come after every other print — once this
   # returns, stdout/stderr are closed.
@@ -4655,9 +4698,12 @@ refresh_discovery() {
 }
 
 # Before every pass after the first: pick up what changed while the runner
-# slept. Returns 1 when the pass should be skipped (loop mode could not sync
-# its runner-checkout); the caller records the pass and sleeps.
+# slept. Returns 1 when the pass should be skipped (the Runner's Formann
+# refused its update or moved — see refresh_runner_formann — or loop mode
+# could not sync its runner-checkout); the caller records the pass and
+# sleeps, or ends the run to re-execute.
 prepare_idle_pass() {
+  refresh_runner_formann || return 1
   case "$RUN_MODE" in
     drain)
       refresh_discovery || true
@@ -4685,11 +4731,11 @@ finish_idle_pass() {
     if [ "$RUN_MODE" = "drain" ]; then
       print_multi_feature_records | format_multi_feature_summary_md \
         "$RUN_TS pass $n" "$RUN_PASS_START_CLOCK" "$(now_clock)" \
-        "$end_state" "$stop" "${ARG_MODEL:-}" >"$RUN_PASS_DIR/SUMMARY.md"
+        "$end_state" "$stop" "${ARG_MODEL:-}" "$(runner_formann_label)" >"$RUN_PASS_DIR/SUMMARY.md"
     else
       print_dispatch_records | format_summary_md \
         "$RUN_FEATURE" "$RUN_TS pass $n" "$RUN_PASS_START_CLOCK" "$(now_clock)" \
-        "$end_state" "$stop" "${ARG_MODEL:-}" >"$RUN_PASS_DIR/SUMMARY.md"
+        "$end_state" "$stop" "${ARG_MODEL:-}" "$(runner_formann_label)" >"$RUN_PASS_DIR/SUMMARY.md"
     fi
     RUN_PASSES+=("$n|$stop|$count")
   else
@@ -4745,6 +4791,10 @@ run_idle() {
     fi
     finish_idle_pass
 
+    if [ "${RUNNER_FORMANN_REEXEC_PENDING:-0}" -eq 1 ]; then
+      echo "[$(now_clock)] runner: ending the run to re-execute on Formann $RUNNER_FORMANN_NEXT_SHA"
+      return 0
+    fi
     if [ "${RUNNER_INTERRUPTED:-0}" -eq 1 ]; then
       RUN_STOP_REASON="interrupted"
       return 0
@@ -4761,12 +4811,145 @@ run_idle() {
   done
 }
 
+# === Runner's Formann ======================================================
+#
+# The runner runs from a Formann checkout of its own ($RUNNER_FORMANN_DIR, a
+# git clone), never from the one the consumer's sessions read through
+# `.formann`. Before every drain it fast-forwards that checkout to
+# $RUNNER_FORMANN_REF (formann-update.sh) and, when the code it is running is
+# not the checkout's current code — the sha moved, or it was started from
+# another copy such as `.formann/runner/run-the-queue.sh` — re-executes
+# itself from `$RUNNER_FORMANN_DIR/framework/runner/run-the-queue.sh` with the
+# same arguments, so the drain runs the new code. A refusal (local changes,
+# divergence, no clone, fetch failure) stops the drain before any claim is
+# taken: pre-flight abort `runner-formann` at startup, a skipped pass
+# (`formann-refused`) in the idle loop.
+#
+# Without RUNNER_FORMANN_DIR the runner is unmanaged: it runs from wherever
+# it was started, updates nothing, and records that checkout's sha.
+#
+# RUNNER_FORMANN_SHA is the sha this process's runner code came from; the
+# claim (claim.sh) and SUMMARY.md record it.
+
+RUNNER_ARGV=()                    # main's arguments, for the re-exec
+RUNNER_FORMANN_SHA=""
+RUNNER_FORMANN_MANAGED=0          # 1 when RUNNER_FORMANN_DIR is set
+RUNNER_FORMANN_REFUSAL=""         # the startup refusal's reason; main aborts pre-flight on it
+RUNNER_FORMANN_REEXEC_PENDING=0   # 1 once an idle pass found the Formann moved; finalize_run re-executes
+RUNNER_FORMANN_NEXT_SHA=""
+
+# The runner script inside the Runner's Formann.
+runner_formann_script() {
+  printf '%s/framework/runner/run-the-queue.sh\n' "$RUNNER_FORMANN_DIR"
+}
+
+# True when this process's code is the Runner's Formann's (HERE is its
+# framework/runner directory, symlinks resolved).
+runner_formann_runs_here() {
+  local mine theirs
+  mine="$(cd "$HERE" 2>/dev/null && pwd -P)" || return 1
+  theirs="$(cd "$RUNNER_FORMANN_DIR/framework/runner" 2>/dev/null && pwd -P)" || return 1
+  [ "$mine" = "$theirs" ]
+}
+
+# The SUMMARY.md label: `<sha> (<ref>)`, or the unmanaged form. Empty before
+# start_runner_formann has run (tests that drive the formatters directly).
+runner_formann_label() {
+  [ -n "$RUNNER_FORMANN_SHA" ] || return 0
+  if [ "$RUNNER_FORMANN_MANAGED" -eq 1 ]; then
+    printf '%s (%s)\n' "$RUNNER_FORMANN_SHA" "$(formann_update_ref)"
+  else
+    printf '%s (not self-updated: RUNNER_FORMANN_DIR is unset)\n' "$RUNNER_FORMANN_SHA"
+  fi
+}
+
+# Replace this process with the Runner's Formann's runner, same arguments.
+# RUNNER_FORMANN_REEXEC tells the new process the update already ran.
+runner_formann_reexec() {
+  local sha="${RUNNER_FORMANN_NEXT_SHA:-$RUNNER_FORMANN_SHA}" script
+  script="$(runner_formann_script)"
+  echo "[$(now_clock)] runner: re-executing from the Runner's Formann at $sha ($script)" >&2
+  export RUNNER_FORMANN_REEXEC="$sha"
+  exec bash "$script" ${RUNNER_ARGV[@]+"${RUNNER_ARGV[@]}"}
+}
+
+# Startup: update the Runner's Formann and re-execute from it when needed.
+# Returns 0 in every case it stays in this process; on refusal it sets
+# RUNNER_FORMANN_REFUSAL (main turns that into a pre-flight abort once the
+# run dir exists).
+start_runner_formann() {
+  if [ -z "${RUNNER_FORMANN_DIR:-}" ]; then
+    RUNNER_FORMANN_MANAGED=0
+    RUNNER_FORMANN_SHA="$(formann_checkout_sha "$HERE")"
+    return 0
+  fi
+  RUNNER_FORMANN_MANAGED=1
+
+  if [ -n "${RUNNER_FORMANN_REEXEC:-}" ]; then
+    local handed="$RUNNER_FORMANN_REEXEC"
+    unset RUNNER_FORMANN_REEXEC
+    if runner_formann_runs_here; then
+      RUNNER_FORMANN_SHA="$handed"
+      return 0
+    fi
+    # Never loop: a re-exec that didn't land in the checkout refuses.
+    RUNNER_FORMANN_REFUSAL="re-executed, but not running from $RUNNER_FORMANN_DIR/framework/runner"
+    return 0
+  fi
+
+  local before out
+  before="$(formann_checkout_sha "$RUNNER_FORMANN_DIR")"
+  if ! out="$(formann_self_update 2>&1)"; then
+    RUNNER_FORMANN_REFUSAL="$(printf '%s\n' "$out" | sed -n 's/^formann-update: //p' | tail -n 1)"
+    [ -n "$RUNNER_FORMANN_REFUSAL" ] || RUNNER_FORMANN_REFUSAL="$out"
+    return 0
+  fi
+  RUNNER_FORMANN_SHA="${out##*$'\n'}"
+  if [ "$RUNNER_FORMANN_SHA" != "$before" ]; then
+    echo "[$(now_clock)] runner: Runner's Formann fast-forwarded $before → $RUNNER_FORMANN_SHA ($(formann_update_ref))" >&2
+  fi
+  if [ "$RUNNER_FORMANN_SHA" != "$before" ] || ! runner_formann_runs_here; then
+    RUNNER_FORMANN_NEXT_SHA="$RUNNER_FORMANN_SHA"
+    runner_formann_reexec
+  fi
+  return 0
+}
+
+# Idle loop, before every pass after the first: update the Runner's Formann
+# again. Returns 1 to skip the pass — with RUN_STOP_REASON `formann-refused`
+# when the update refused (the runner keeps idling on the code it runs, and
+# drains nothing until the checkout is reconciled), or `formann-updated` when
+# the sha moved (RUNNER_FORMANN_REEXEC_PENDING: run_idle ends the run and
+# finalize_run re-executes on the new code). Unmanaged: always 0.
+refresh_runner_formann() {
+  [ "$RUNNER_FORMANN_MANAGED" -eq 1 ] || return 0
+  local out sha
+  if ! out="$(formann_self_update 2>&1)"; then
+    echo "[$(now_clock)] runner: refusing this pass — $(printf '%s\n' "$out" | sed -n 's/^formann-update: //p' | tail -n 1)"
+    RUN_STOP_REASON="formann-refused"
+    return 1
+  fi
+  sha="${out##*$'\n'}"
+  if [ "$sha" != "$RUNNER_FORMANN_SHA" ]; then
+    echo "[$(now_clock)] runner: Runner's Formann fast-forwarded $RUNNER_FORMANN_SHA → $sha ($(formann_update_ref))"
+    RUNNER_FORMANN_NEXT_SHA="$sha"
+    RUNNER_FORMANN_REEXEC_PENDING=1
+    RUN_STOP_REASON="formann-updated"
+    return 1
+  fi
+  return 0
+}
+
 # === Main ==================================================================
 
 main() {
   set -euo pipefail
+  RUNNER_ARGV=("$@")
   parse_args "$@"
   resolve_host_repo
+  # Before the run dir, the lock and any claim: bring the Runner's Formann to
+  # its ref, and re-execute from it when this isn't its current code.
+  start_runner_formann
   # Set TARGET_FEATURE and RUN_FEATURE before setup_run_dir so the per-run
   # dir and SUMMARY.md always know the feature context (single/loop only).
   case "$RUN_MODE" in
@@ -4787,6 +4970,10 @@ main() {
   # still runs the trap.
   trap finalize_run EXIT
   trap handle_preflight_signal INT TERM
+  if [ -n "$RUNNER_FORMANN_REFUSAL" ]; then
+    fail_invariant "runner-formann" "refusing to drain: $RUNNER_FORMANN_REFUSAL"
+  fi
+  echo "[$(now_clock)] runner: Formann $(runner_formann_label)"
   preflight
   trap handle_signal INT TERM
   case "$RUN_MODE" in

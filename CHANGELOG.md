@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- AFK runner keeps its own Formann checkout (`RUNNER_FORMANN_DIR`, a git clone, separate from the
+  sessions' `.formann`) and fast-forwards it to `RUNNER_FORMANN_REF` (default `origin/main`) at the
+  start of every run and every idle pass, re-executing itself from the updated checkout, so every
+  machine runs the same Formann without anyone pulling. Local changes, divergence, an rsync copy or
+  an unreachable ref refuse the drain with the reason (`preflight-abort: runner-formann`; idle pass
+  `formann-refused`) before any claim is taken. The sha is recorded in the Claim and `SUMMARY.md`.
 - AFK runner heart-beats its Claim between dispatches (before each `/implement` and each
   post-implement step). A claim without a heartbeat for thirty minutes (`RUNNER_CLAIM_STALE_AFTER`,
   default 1800 s, judged by each reader's own clock) is stale and is taken over with a lease push on
