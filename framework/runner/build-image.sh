@@ -63,7 +63,10 @@ Every build labels the image formann.runner.context-hash with a hash of the
 consumer's runner/ directory. Without flags, builds only when no image exists
 under the name or its label differs from the current hash (any file under
 runner/ edited, added, removed, renamed or made (non-)executable); that build
-reuses the layer cache. Otherwise the existing image is reused.
+reuses the layer cache. Otherwise the existing image is reused. On Linux the
+sandbox user is built as the host user (RUNNER_UID/RUNNER_GID build args,
+recorded in the formann.runner.sandbox-ids label), since a bind mount there
+carries the host's uids; a label mismatch also rebuilds.
 
 --rebuild forces a build that still reuses the layer cache, so it leaves
 already-installed tools at their cached versions. --fresh forces a build
@@ -84,6 +87,17 @@ resolve_host_repo
 image_name="$(runner_image_name "$HOST_REPO")"
 context_hash="$(runner_context_hash "$HOST_REPO")"
 
+# On Linux a bind mount carries the host's uids, so the sandbox user must be
+# the host user or the dispatch cannot write the runner-checkout. The
+# consumer's Dockerfile takes RUNNER_UID/RUNNER_GID build args for that; the
+# image is labelled with the ids it was built for, and a mismatch rebuilds.
+# Docker Desktop on macOS maps ownership itself, so there the Dockerfile's
+# defaults stand and the label stays empty.
+sandbox_ids=""
+if [[ "$OSTYPE" == linux-gnu* ]]; then
+  sandbox_ids="$(id -u):$(id -g)"
+fi
+
 needs_build=false
 if $REBUILD || $FRESH; then
   needs_build=true
@@ -93,6 +107,11 @@ elif ! image_hash="$(docker image inspect \
   needs_build=true
 elif [ "$image_hash" != "$context_hash" ]; then
   needs_build=true
+elif image_ids="$(docker image inspect \
+    --format "{{ index .Config.Labels \"$RUNNER_SANDBOX_IDS_LABEL\" }}" \
+    "$image_name" 2>/dev/null)" \
+    && [ "${image_ids/<no value>/}" != "$sandbox_ids" ]; then
+  needs_build=true
 fi
 
 if $needs_build; then
@@ -100,7 +119,12 @@ if $needs_build; then
   # install layers (which fetch current versions at build time), and --pull
   # refreshes the base-image tag. Without it a build reuses cached layers and
   # freezes those versions.
-  build_args=(--label "$RUNNER_CONTEXT_HASH_LABEL=$context_hash")
+  build_args=(--label "$RUNNER_CONTEXT_HASH_LABEL=$context_hash"
+              --label "$RUNNER_SANDBOX_IDS_LABEL=$sandbox_ids")
+  if [ -n "$sandbox_ids" ]; then
+    build_args+=(--build-arg "RUNNER_UID=${sandbox_ids%%:*}"
+                 --build-arg "RUNNER_GID=${sandbox_ids##*:}")
+  fi
   if $FRESH; then
     build_args+=(--no-cache --pull)
   fi

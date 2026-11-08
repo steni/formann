@@ -48,6 +48,8 @@ runner_image_name() {
 
 # Image label carrying the context hash the image was built from.
 RUNNER_CONTEXT_HASH_LABEL="formann.runner.context-hash"
+# Label naming the host uid:gid the sandbox user was built as (Linux only; empty on macOS).
+RUNNER_SANDBOX_IDS_LABEL="formann.runner.sandbox-ids"
 
 # Print the SHA-256 over the consumer's runner/ build context (consumer root
 # $1). Every entry under runner/ contributes its path relative to runner/,

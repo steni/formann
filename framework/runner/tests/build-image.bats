@@ -22,12 +22,19 @@ setup() {
   mkdir -p "$BATS_TEST_TMPDIR/bin"
   STUB_OUTPUT="$BATS_TEST_TMPDIR/docker-build-args"
   STUB_IMAGE_LABEL="$BATS_TEST_TMPDIR/docker-image-label"
-  export STUB_OUTPUT STUB_IMAGE_LABEL
+  # $STUB_IMAGE_IDS, when it exists, is the image's formann.runner.sandbox-ids
+  # label; absent, the stub answers "<no value>" like docker does for a label
+  # the image was never given.
+  STUB_IMAGE_IDS="$BATS_TEST_TMPDIR/docker-image-ids"
+  export STUB_OUTPUT STUB_IMAGE_LABEL STUB_IMAGE_IDS
   cat > "$BATS_TEST_TMPDIR/bin/docker" <<'STUB'
 #!/usr/bin/env bash
 if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
   [ -f "$STUB_IMAGE_LABEL" ] || exit 1
-  cat "$STUB_IMAGE_LABEL"
+  case "$*" in
+    *sandbox-ids*) [ -f "$STUB_IMAGE_IDS" ] && cat "$STUB_IMAGE_IDS" || echo "<no value>" ;;
+    *) cat "$STUB_IMAGE_LABEL" ;;
+  esac
   exit 0
 fi
 if [ "$1" = "build" ]; then
@@ -217,4 +224,46 @@ STUB
     echo "expected --rebuild to reuse the layer cache, got --no-cache: $build_args" >&2
     return 1
   }
+}
+
+# --- sandbox user = host user on Linux ---------------------------------------
+
+@test "build-image.sh on Linux builds the sandbox user as the host user and labels the ids" {
+  cd "$CONSUMER"
+  OSTYPE="linux-gnu" run bash "$SCRIPT" --rebuild
+  assert_success
+  build_args="$(cat "$STUB_OUTPUT")"
+  [[ "$build_args" == *"--build-arg RUNNER_UID=$(id -u)"* ]] || { echo "no RUNNER_UID in: $build_args" >&2; return 1; }
+  [[ "$build_args" == *"--build-arg RUNNER_GID=$(id -g)"* ]] || { echo "no RUNNER_GID in: $build_args" >&2; return 1; }
+  [[ "$build_args" == *"--label formann.runner.sandbox-ids=$(id -u):$(id -g)"* ]] || { echo "no ids label in: $build_args" >&2; return 1; }
+}
+
+@test "build-image.sh on Linux rebuilds an image whose context hash matches but whose sandbox ids differ" {
+  cd "$CONSUMER"
+  runner_context_hash "$CONSUMER" > "$STUB_IMAGE_LABEL"
+  printf '1000:1000' > "$STUB_IMAGE_IDS"
+  OSTYPE="linux-gnu" run bash "$SCRIPT"
+  assert_success
+  [ -f "$STUB_OUTPUT" ] || { echo "expected a docker build for the id mismatch" >&2; return 1; }
+}
+
+@test "build-image.sh on Linux skips the build when both the context hash and the sandbox ids match" {
+  cd "$CONSUMER"
+  runner_context_hash "$CONSUMER" > "$STUB_IMAGE_LABEL"
+  printf '%s:%s' "$(id -u)" "$(id -g)" > "$STUB_IMAGE_IDS"
+  OSTYPE="linux-gnu" run bash "$SCRIPT"
+  assert_success
+  [ ! -f "$STUB_OUTPUT" ] || { echo "expected no docker build, got: $(cat "$STUB_OUTPUT")" >&2; return 1; }
+}
+
+@test "build-image.sh on macOS passes no RUNNER_UID and keeps reusing an image that has no ids label" {
+  cd "$CONSUMER"
+  runner_context_hash "$CONSUMER" > "$STUB_IMAGE_LABEL"
+  OSTYPE="darwin24" run bash "$SCRIPT"
+  assert_success
+  [ ! -f "$STUB_OUTPUT" ] || { echo "expected no docker build, got: $(cat "$STUB_OUTPUT")" >&2; return 1; }
+  OSTYPE="darwin24" run bash "$SCRIPT" --rebuild
+  assert_success
+  build_args="$(cat "$STUB_OUTPUT")"
+  [[ "$build_args" != *"RUNNER_UID"* ]] || { echo "unexpected RUNNER_UID in: $build_args" >&2; return 1; }
 }

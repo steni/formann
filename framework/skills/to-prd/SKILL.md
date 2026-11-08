@@ -3,21 +3,28 @@ name: to-prd
 description: Turn the current conversation context into a PRD and publish it. Use when user wants to create a PRD from the current context.
 ---
 
-This skill takes the current conversation context and codebase understanding and produces a PRD. Do NOT interview the user — just synthesize what you already know.
+This skill takes the current conversation context and codebase understanding and produces a PRD. Do NOT interview the user about the feature — the grilling did that; synthesize what you already know. The one check-in is the module design in step 2.
 
 ## Process
 
 1. Explore the repo to understand the current state of the codebase, if you haven't already. Use the project's domain glossary vocabulary throughout the PRD, and respect any ADRs in the area you're touching.
 
-2. Sketch out the major modules you will need to build or modify to complete the implementation. Actively look for opportunities to extract deep modules that can be tested in isolation.
+2. Design the modules before writing any PRD text. Sketch the major modules you will need to build or modify, actively looking for opportunities to extract deep modules that can be tested in isolation. Read the module maps of the areas you touch (see `docs/formann/domain.md`) so existing modules keep their names and new ones fit beside them.
 
 A deep module (as opposed to a shallow module) is one which encapsulates a lot of functionality in a simple, testable interface which rarely changes.
 
-Check with the user that these modules match their expectations. Check with the user which modules they want tests written for.
+A class earns a row as a **module** only when it hides a decision its callers would otherwise each repeat, behind an interface small enough to state in one line — a status rule three pages read, a row shape three lists draw, an audience predicate the header should not know. A class that only assembles other parts in order, or that the feature merely touches, is not a module: list it as **modified** with its interface change and no structural claim, so the reader sees what changes without mistaking page assembly for design. If no row passes the test, say so rather than inventing one.
+
+Present the design to the user as its own message, before the PRD, in two parts:
+
+- **Module table** — one row per module: name; new or modified; responsibility in one sentence; interface in one line (what callers give it, what they get back); and the structural claim it must hold, if any ("pure: no I/O", "the only place points are summed", "never depends on X"). Leave the claim empty when there is none — don't invent one.
+- **Primary flow** — the main path through the feature as a short numbered sequence: who calls whom, in what order, carrying what.
+
+Ask the user to edit it: a module they would merge, split, rename or drop; an arrow that is wrong; a claim they don't want to hold. Iterate until they approve it, then carry both parts into the PRD's Implementation Decisions unchanged. Also check which modules they want tests written for.
 
 3. Pick a feature slug from the grilling context and confirm it with the maintainer.
 
-4. Set up the feature workspace per `docs/formann/issue-tracker/BINDING.md`.
+4. Set up the feature workspace per `docs/formann/issue-tracker/BINDING.md`. The grill's uncommitted edits to `GLOSSARY.md` and `docs/adr/` are part of this feature: they ride along when the feature branch is created from HEAD and become its first commit, referencing the parent issue. Never stash or discard them, and don't count them as the "dirty tree" the binding asks about.
 
 5. Write and publish the PRD using the template below; publish per `docs/formann/issue-tracker/BINDING.md`.
 
@@ -64,9 +71,19 @@ This list of user stories should be extremely extensive and cover all aspects of
 
 ## Implementation Decisions
 
-A list of implementation decisions that were made. This can include:
+Open with the design approved in step 2, verbatim:
 
-- The modules that will be built/modified
+### Modules
+
+| Module | New or modified | Responsibility | Interface | Structural claim |
+| ------ | --------------- | -------------- | --------- | ---------------- |
+
+### Primary flow
+
+1. …
+
+Then the remaining decisions. This can include:
+
 - The interfaces of those modules that will be modified
 - Technical clarifications from the developer
 - Architectural decisions
