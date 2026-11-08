@@ -127,9 +127,11 @@ Wraps the per-issue loop and walks every feature in the discovery output.
 │   [feature empty?] ──yes──► RUN_STOP_REASON = "completed"; stop           │
 │         │ no                                                              │
 │         ▼                                                                 │
-│   ensure_runner_checkout_on_branch(feature)  (lazy: inits from resolved   │
+│   ensure_runner_checkout_on_branch(feature)  (reads <shared>/<feature>;   │
+│                                                lazy: inits from resolved  │
 │                                                default branch's host tip  │
-│                                                if host has no ref yet)    │
+│                                                and pushes it, if no ref   │
+│                                                exists anywhere yet)       │
 │         │                                                                 │
 │   [fetch failed?] ──yes──► record skip:fetch-failed; next feature         │
 │         │ no                                                              │
@@ -195,8 +197,11 @@ Wraps the per-issue loop and walks every feature in the discovery output.
 │         │ no                                                             │
 │         ▼                                                                │
 │   ensure_runner_checkout                (re-sync to chosen tip;          │
-│         │                                parking-ref when strictly ahead │
-│         │                                or diverged, else host branch;  │
+│         │                                select_sync_base: remote branch │
+│         │                                when strictly ahead of host and │
+│         │                                parking ref; else parking-ref   │
+│         │                                when strictly ahead or diverged,│
+│         │                                else host branch;               │
 │         │                                fetch + checkout + reset --hard │
 │         │                                + clean -fd; HEAD must match)   │
 │         ▼                                                                │

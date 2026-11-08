@@ -60,7 +60,7 @@ The comment's first line must be `### <Kind> — <YYYY-MM-DD>`. Same-day same-ki
 
 ### Create a feature
 
-Create a new feature: validate the slug, check for uniqueness, publish the parent artifact (issue or directory), and set up the feature branch.
+Create a new feature: validate the slug, check for uniqueness, publish the parent artifact (issue or directory), and set up the feature branch, pushing it to the Shared remote when there is one.
 
 **Inputs:** `slug` — must be unique across all features, open or closed. `title`, `body` (PRD content).
 

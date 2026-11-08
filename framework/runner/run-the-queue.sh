@@ -490,34 +490,97 @@ read_blocked_passes() {
   printf '%s\n' "$out"
 }
 
-# Pre-dispatch sync-base selector. Pure function — takes a pre-computed
-# parking-ref relation and returns which tip the runner-checkout should sync
-# to before each dispatch.
+# Pre-dispatch sync-base selector (#5). Pure function — takes pre-computed
+# relations and returns which tip the runner-checkout should sync to before
+# each dispatch.
 #
-# Input:
-#   $1 — parking_rel: absent | equal | ahead | behind | diverged
-#          absent   — parking ref doesn't exist yet (no prior runner output)
-#          equal    — parking ref tip equals host's branch tip
-#          ahead    — parking ref tip is strictly ahead of host's branch tip
-#          behind   — host's branch tip is strictly ahead of parking ref tip
+# Inputs (each: absent | equal | behind | ahead | diverged):
+#   $1 — remote_rel:  the Shared remote's branch relative to the host branch
+#   $2 — parking_rel: the parking ref relative to the host branch
+#          absent   — the ref doesn't exist
+#          equal    — its tip equals the host branch's tip
+#          behind   — the host branch is strictly ahead of it
+#          ahead    — it is strictly ahead of the host branch
 #          diverged — neither tip is an ancestor of the other
+#        An absent host branch is the empty history: every present ref is
+#        `ahead` of it.
+#   $3 — remote_to_parking (optional): the remote branch relative to the
+#        parking ref, same vocabulary. Read only when both $1 and $2 are
+#        ahead/diverged — the one case the host-relative pair cannot order.
 #
-# Output (stdout): host-branch | parking-ref
+# Output (stdout): remote-branch | host-branch | parking-ref
 #
-# Rules: absent → host-branch; equal → host-branch; ahead → parking-ref;
-#        behind → host-branch; diverged → parking-ref.
-# Rationale for diverged → parking-ref: the runner's chain is authoritative;
-# the maintainer reconciles via `git pull runner <feature>`.
+# Rule: the most advanced ref that the others are ancestors of wins.
+#   - parking ref ahead/diverged, remote not: parking-ref (the runner's chain
+#     is authoritative; a diverged chain parks at publish time, #2).
+#   - remote ahead, parking ref not: remote-branch.
+#   - both ahead/diverged: remote-branch only when the remote is strictly
+#     ahead of the parking ref ($3 = ahead); otherwise parking-ref. The
+#     parking ref is force-updated by the next propagation, so building on a
+#     remote that lacks its commits would discard them; parking-ref never
+#     does, and the ff-only publish parks the feature if the two diverged.
+#   - neither ahead/diverged: host-branch (including a diverged remote:
+#     local work is never dropped; publish parks instead).
 select_sync_base() {
-  local parking_rel="${1:-}"
-  case "$parking_rel" in
-    absent|equal|behind) echo "host-branch" ;;
-    ahead|diverged)      echo "parking-ref" ;;
+  local remote_rel="${1:-}" parking_rel="${2:-}" remote_to_parking="${3:-}"
+  local rel
+  for rel in "$remote_rel" "$parking_rel"; do
+    case "$rel" in
+      absent|equal|behind|ahead|diverged) ;;
+      *)
+        echo "runner: select_sync_base: unknown relation '$rel'" >&2
+        return 1
+        ;;
+    esac
+  done
+  case "$remote_to_parking" in
+    ''|absent|equal|behind|ahead|diverged) ;;
     *)
-      echo "runner: select_sync_base: unknown relation '$parking_rel'" >&2
+      echo "runner: select_sync_base: unknown relation '$remote_to_parking'" >&2
       return 1
       ;;
   esac
+  case "$parking_rel" in
+    ahead|diverged)
+      case "$remote_rel" in
+        ahead|diverged)
+          if [ "$remote_to_parking" = "ahead" ]; then
+            echo "remote-branch"
+          else
+            echo "parking-ref"
+          fi
+          ;;
+        *) echo "parking-ref" ;;
+      esac
+      ;;
+    *)
+      if [ "$remote_rel" = "ahead" ]; then
+        echo "remote-branch"
+      else
+        echo "host-branch"
+      fi
+      ;;
+  esac
+}
+
+# Relation of one ref tip to a base tip, in select_sync_base's vocabulary.
+# An empty base is the empty history (every present tip is `ahead`).
+# Args: $1 = repo, $2 = base tip (may be empty), $3 = tip (may be empty).
+ref_relation() {
+  local repo="$1" base="$2" tip="$3"
+  if [ -z "$tip" ]; then
+    echo "absent"
+  elif [ -z "$base" ]; then
+    echo "ahead"
+  elif [ "$tip" = "$base" ]; then
+    echo "equal"
+  elif git -C "$repo" merge-base --is-ancestor "$tip" "$base" 2>/dev/null; then
+    echo "behind"
+  elif git -C "$repo" merge-base --is-ancestor "$base" "$tip" 2>/dev/null; then
+    echo "ahead"
+  else
+    echo "diverged"
+  fi
 }
 
 # Select the next feature the outer drain loop should consider. Analogue
@@ -1689,14 +1752,43 @@ ensure_runner_checkout_on_branch() {
   host_tip="$(git -C "$HOST_REPO" rev-parse --verify "refs/heads/$branch" 2>/dev/null || true)"
   parking_tip="$(git -C "$HOST_REPO" rev-parse --verify "refs/remotes/runner/$branch" 2>/dev/null || true)"
 
-  if [ -z "$host_tip" ] && [ -z "$parking_tip" ]; then
-    # Neither the host branch nor a parking ref exists yet — first dispatch
-    # for a slug whose branch was never pre-created on host. Initialize the
-    # runner-checkout's branch from the default branch's *current host tip*:
-    # resolve the default deliberately (resolve_default_branch, #77), fetch it
-    # at sync time, and base the new branch on the fresh tracking ref. The
-    # first propagation's `<slug>:<slug>` refspec is create-on-missing and
-    # will create refs/heads/<slug> on host.
+  # The Shared remote's branch (#5, ADR-0011). The host repo reads it (with
+  # the host's credentials) into refs/remotes/<shared-remote>/<branch>; the
+  # runner-checkout later fetches it from host, like the parking ref. A host
+  # repo without the remote keeps the one-machine behaviour. ls-remote first
+  # tells "branch absent on the remote" from "remote unreachable": the latter
+  # fails the sync (the caller records fetch-failed), since building without
+  # knowing the remote's tip could start a feature twice.
+  local shared_remote="${RUNNER_SHARED_REMOTE:-origin}" shared_url remote_tip=""
+  shared_url="$(git -C "$HOST_REPO" remote get-url "$shared_remote" 2>/dev/null || true)"
+  if [ -n "$shared_url" ]; then
+    local ls_out ls_rc=0
+    ls_out="$(GIT_TERMINAL_PROMPT=0 git -C "$HOST_REPO" ls-remote --heads \
+        "$shared_remote" "refs/heads/$branch" 2>&1)" || ls_rc=$?
+    if [ "$ls_rc" -ne 0 ]; then
+      printf 'runner: ensure_runner_checkout_on_branch: cannot read %s/%s from the Shared remote:\n%s\n' \
+        "$shared_remote" "$branch" "$ls_out" >&2
+      return 1
+    fi
+    remote_tip="$(printf '%s\n' "$ls_out" | awk -v r="refs/heads/$branch" '$2 == r { print $1; exit }')"
+    if [ -n "$remote_tip" ]; then
+      if ! GIT_TERMINAL_PROMPT=0 git -C "$HOST_REPO" fetch --quiet "$shared_remote" \
+          "+refs/heads/$branch:refs/remotes/$shared_remote/$branch" >&2; then
+        echo "runner: ensure_runner_checkout_on_branch: cannot read $shared_remote/$branch from the Shared remote: fetch failed" >&2
+        return 1
+      fi
+      remote_tip="$(git -C "$HOST_REPO" rev-parse --verify "refs/remotes/$shared_remote/$branch" 2>/dev/null || true)"
+    fi
+  fi
+
+  if [ -z "$host_tip" ] && [ -z "$parking_tip" ] && [ -z "$remote_tip" ]; then
+    # The branch is missing everywhere — first dispatch for a slug whose
+    # branch was never created. Initialize the runner-checkout's branch from
+    # the default branch's *current host tip*: resolve the default
+    # deliberately (resolve_default_branch, #77), fetch it at sync time, and
+    # base the new branch on the fresh tracking ref. The first propagation's
+    # `<slug>:<slug>` refspec is create-on-missing and will create
+    # refs/heads/<slug> on host; the Shared remote gets it right here.
     local default_branch
     if ! default_branch="$(resolve_default_branch)"; then
       echo "runner: ensure_runner_checkout_on_branch: default-branch resolution failed (lazy init for $branch)" >&2
@@ -1733,54 +1825,73 @@ ensure_runner_checkout_on_branch() {
       echo "runner: ensure_runner_checkout_on_branch: git reset --hard origin/$default_branch (lazy init) failed" >&2
       return 1
     fi
+    # Push the new branch to the Shared remote at once (#5), from the host
+    # with the host's credentials, so it is visible to every machine before
+    # the first dispatch. No `+`, no `--force`: the remote branch was absent
+    # a moment ago, and a branch that appeared since is never overwritten.
+    if [ -n "$shared_url" ]; then
+      local new_tip push_stderr push_rc=0
+      new_tip="$(git -C "$HOST_CHECKOUT" rev-parse --verify HEAD)"
+      push_stderr="$(GIT_TERMINAL_PROMPT=0 git -C "$HOST_REPO" push --quiet \
+          "$shared_remote" "${new_tip}:refs/heads/${branch}" 2>&1)" || push_rc=$?
+      if [ "$push_rc" -ne 0 ]; then
+        printf 'runner: ensure_runner_checkout_on_branch: could not push the new branch %s to %s/%s:\n%s\n' \
+          "$branch" "$shared_remote" "$branch" "$push_stderr" >&2
+        return 1
+      fi
+      echo "runner: created $branch from $default_branch and pushed it to $shared_remote/$branch" >&2
+    fi
   else
-    local parking_rel sync_verdict
-    if [ -z "$parking_tip" ]; then
-      parking_rel="absent"
-    elif [ "$parking_tip" = "$host_tip" ]; then
-      parking_rel="equal"
-    elif git -C "$HOST_REPO" merge-base --is-ancestor "$parking_tip" "$host_tip" 2>/dev/null; then
-      # parking tip is ancestor of host tip → host is strictly ahead
-      parking_rel="behind"
-    elif git -C "$HOST_REPO" merge-base --is-ancestor "$host_tip" "$parking_tip" 2>/dev/null; then
-      # host tip is ancestor of parking tip → parking ref is strictly ahead
-      parking_rel="ahead"
-    else
-      parking_rel="diverged"
+    local parking_rel remote_rel remote_to_parking sync_verdict
+    parking_rel="$(ref_relation "$HOST_REPO" "$host_tip" "$parking_tip")"
+    remote_rel="$(ref_relation "$HOST_REPO" "$host_tip" "$remote_tip")"
+    remote_to_parking="$(ref_relation "$HOST_REPO" "$parking_tip" "$remote_tip")"
+    if [ -z "$parking_tip" ]; then remote_to_parking="absent"; fi
+
+    if ! sync_verdict="$(select_sync_base "$remote_rel" "$parking_rel" "$remote_to_parking")"; then
+      return 1
     fi
 
-    sync_verdict="$(select_sync_base "$parking_rel")"
-
-    if [ "$sync_verdict" = "host-branch" ]; then
-      if ! git -C "$HOST_CHECKOUT" fetch --quiet origin "$branch" >&2; then
-        echo "runner: ensure_runner_checkout_on_branch: git fetch origin $branch failed" >&2
-        return 1
-      fi
-      if ! git -C "$HOST_CHECKOUT" checkout --quiet -B "$branch" "origin/$branch" >&2; then
-        echo "runner: ensure_runner_checkout_on_branch: git checkout -B $branch failed" >&2
-        return 1
-      fi
-      if ! git -C "$HOST_CHECKOUT" reset --quiet --hard "origin/$branch" >&2; then
-        echo "runner: ensure_runner_checkout_on_branch: git reset --hard origin/$branch failed" >&2
-        return 1
-      fi
-    else
-      # parking-ref verdict: fetch the parking-ref's objects from host into the
-      # runner-checkout (the runner-checkout's origin fetch won't carry them),
-      # then sync to the parking-ref tip so successive dispatches chain linearly.
-      if ! git -C "$HOST_CHECKOUT" fetch --quiet "$HOST_REPO" \
-          "refs/remotes/runner/$branch:refs/remotes/host-parking/$branch" >&2; then
-        echo "runner: ensure_runner_checkout_on_branch: fetch parking-ref tip from host failed" >&2
-        return 1
-      fi
-      if ! git -C "$HOST_CHECKOUT" checkout --quiet -B "$branch" "$parking_tip" >&2; then
-        echo "runner: ensure_runner_checkout_on_branch: git checkout -B $branch $parking_tip failed" >&2
-        return 1
-      fi
-      if ! git -C "$HOST_CHECKOUT" reset --quiet --hard "$parking_tip" >&2; then
-        echo "runner: ensure_runner_checkout_on_branch: git reset --hard $parking_tip failed" >&2
-        return 1
-      fi
+    local base_ref base_tip
+    case "$sync_verdict" in
+      host-branch)
+        if ! git -C "$HOST_CHECKOUT" fetch --quiet origin "$branch" >&2; then
+          echo "runner: ensure_runner_checkout_on_branch: git fetch origin $branch failed" >&2
+          return 1
+        fi
+        base_ref="origin/$branch"
+        base_tip="origin/$branch"
+        ;;
+      parking-ref)
+        # Fetch the parking-ref's objects from host into the runner-checkout
+        # (the runner-checkout's origin fetch won't carry them), then sync to
+        # the parking-ref tip so successive dispatches chain linearly.
+        if ! git -C "$HOST_CHECKOUT" fetch --quiet "$HOST_REPO" \
+            "refs/remotes/runner/$branch:refs/remotes/host-parking/$branch" >&2; then
+          echo "runner: ensure_runner_checkout_on_branch: fetch parking-ref tip from host failed" >&2
+          return 1
+        fi
+        base_ref="$parking_tip"
+        base_tip="$parking_tip"
+        ;;
+      remote-branch)
+        # The Shared remote's branch, as just read into host.
+        if ! git -C "$HOST_CHECKOUT" fetch --quiet "$HOST_REPO" \
+            "+refs/remotes/$shared_remote/$branch:refs/remotes/host-shared/$branch" >&2; then
+          echo "runner: ensure_runner_checkout_on_branch: fetch $shared_remote/$branch from host failed" >&2
+          return 1
+        fi
+        base_ref="$remote_tip"
+        base_tip="$remote_tip"
+        ;;
+    esac
+    if ! git -C "$HOST_CHECKOUT" checkout --quiet -B "$branch" "$base_ref" >&2; then
+      echo "runner: ensure_runner_checkout_on_branch: git checkout -B $branch $base_ref failed" >&2
+      return 1
+    fi
+    if ! git -C "$HOST_CHECKOUT" reset --quiet --hard "$base_tip" >&2; then
+      echo "runner: ensure_runner_checkout_on_branch: git reset --hard $base_tip failed" >&2
+      return 1
     fi
   fi
 

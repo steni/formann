@@ -5579,40 +5579,315 @@ setup_propagate_test() {
 
 # === select_sync_base — pre-dispatch sync-base selector ====================
 #
-# Pure function: takes a pre-computed parking-ref relation and returns
-# which tip the runner-checkout should sync to.
+# Pure function: takes the Shared remote's branch relation and the parking
+# ref's relation, both relative to the host branch, and returns which tip the
+# runner-checkout should sync to (#5).
 #
-# Relation vocabulary: absent | equal | ahead | behind | diverged
-# Rules:
-#   absent   → host-branch   (no prior runner output)
-#   equal    → host-branch   (runner output already at host tip)
-#   ahead    → parking-ref   (runner output is ahead; chain from it)
-#   behind   → host-branch   (host has moved past runner output)
-#   diverged → parking-ref   (runner chain authoritative; maintainer reconciles)
+# Relation vocabulary: absent | equal | behind | ahead | diverged
+# (an absent host branch counts as the empty history: every present ref is
+# `ahead` of it). Rule: the most advanced ref that the others are ancestors of
+# wins. When the remote branch and the parking ref are both ahead of (or
+# diverged from) the host branch, their order is the optional third input,
+# the remote branch's relation to the parking ref: only a remote strictly
+# ahead of the parking ref wins; anything else (including an omitted third
+# input) is `parking-ref`, and publish parks the feature if the two diverged.
 
-@test "select_sync_base — absent: no parking ref → host-branch" {
-  result="$(select_sync_base absent)"
-  [ "$result" = "host-branch" ]
+# Expected verdict for every (remote-rel, parking-rel) pair with the third
+# input omitted. Rows: remote-rel; columns: parking-rel in REL_ORDER.
+REL_ORDER=(absent equal behind ahead diverged)
+
+expected_sync_base() {
+  local remote="$1" parking="$2"
+  case "$parking" in
+    ahead|diverged) echo "parking-ref" ;;
+    *)
+      case "$remote" in
+        ahead) echo "remote-branch" ;;
+        *)     echo "host-branch" ;;
+      esac ;;
+  esac
 }
 
-@test "select_sync_base — equal: parking ref equals host's branch → host-branch" {
-  result="$(select_sync_base equal)"
-  [ "$result" = "host-branch" ]
+@test "select_sync_base — exhaustive over the 25 relation pairs (third input omitted)" {
+  local r p got want count=0
+  for r in "${REL_ORDER[@]}"; do
+    for p in "${REL_ORDER[@]}"; do
+      got="$(select_sync_base "$r" "$p")"
+      want="$(expected_sync_base "$r" "$p")"
+      if [ "$got" != "$want" ]; then
+        echo "select_sync_base $r $p → '$got', want '$want'"
+        return 1
+      fi
+      count=$((count + 1))
+    done
+  done
+  [ "$count" -eq 25 ]
 }
 
-@test "select_sync_base — ahead: parking ref strictly ahead of host's branch → parking-ref" {
-  result="$(select_sync_base ahead)"
-  [ "$result" = "parking-ref" ]
+@test "select_sync_base — remote and parking both ahead/diverged: only a remote strictly ahead of the parking ref wins" {
+  local r p rp got want count=0
+  for r in ahead diverged; do
+    for p in ahead diverged; do
+      for rp in absent equal behind ahead diverged; do
+        got="$(select_sync_base "$r" "$p" "$rp")"
+        if [ "$rp" = "ahead" ]; then want="remote-branch"; else want="parking-ref"; fi
+        if [ "$got" != "$want" ]; then
+          echo "select_sync_base $r $p $rp → '$got', want '$want'"
+          return 1
+        fi
+        count=$((count + 1))
+      done
+    done
+  done
+  [ "$count" -eq 20 ]
 }
 
-@test "select_sync_base — behind: host's branch strictly ahead of parking ref → host-branch" {
-  result="$(select_sync_base behind)"
-  [ "$result" = "host-branch" ]
+@test "select_sync_base — the third input does not change any unambiguous pair" {
+  local r p rp got
+  for r in "${REL_ORDER[@]}"; do
+    for p in "${REL_ORDER[@]}"; do
+      case "$r/$p" in ahead/ahead|ahead/diverged|diverged/ahead|diverged/diverged) continue ;; esac
+      for rp in absent equal behind ahead diverged; do
+        got="$(select_sync_base "$r" "$p" "$rp")"
+        [ "$got" = "$(expected_sync_base "$r" "$p")" ] || {
+          echo "select_sync_base $r $p $rp → '$got'"; return 1; }
+      done
+    done
+  done
 }
 
-@test "select_sync_base — diverged: neither ancestor → parking-ref" {
-  result="$(select_sync_base diverged)"
-  [ "$result" = "parking-ref" ]
+@test "select_sync_base — named cases: remote ahead of host and parking ref is the base; parking ref ahead of the remote is the base" {
+  [ "$(select_sync_base ahead absent)" = "remote-branch" ]
+  [ "$(select_sync_base ahead equal)" = "remote-branch" ]
+  [ "$(select_sync_base ahead ahead ahead)" = "remote-branch" ]
+  [ "$(select_sync_base ahead ahead behind)" = "parking-ref" ]
+  [ "$(select_sync_base equal ahead)" = "parking-ref" ]
+  [ "$(select_sync_base absent ahead)" = "parking-ref" ]
+  # Remote and parking diverged from each other → parking-ref (publish parks).
+  [ "$(select_sync_base ahead ahead diverged)" = "parking-ref" ]
+  [ "$(select_sync_base diverged diverged diverged)" = "parking-ref" ]
+  # One-machine behaviour unchanged when there is no remote branch.
+  [ "$(select_sync_base absent absent)" = "host-branch" ]
+  [ "$(select_sync_base absent behind)" = "host-branch" ]
+  [ "$(select_sync_base absent diverged)" = "parking-ref" ]
+}
+
+@test "select_sync_base — pure: no I/O, no git, deterministic output" {
+  # With PATH emptied, any external command would fail; the selector runs on
+  # bash builtins alone and writes nothing but its verdict.
+  local out
+  out="$(PATH=/nonexistent; cd /; select_sync_base ahead ahead ahead 2>&1)"
+  [ "$out" = "remote-branch" ]
+  out="$(PATH=/nonexistent; select_sync_base diverged absent 2>&1)"
+  [ "$out" = "host-branch" ]
+}
+
+@test "select_sync_base — unknown relations are refused" {
+  run select_sync_base bogus absent
+  assert_failure
+  assert_output --partial "unknown relation 'bogus'"
+  run select_sync_base absent bogus
+  assert_failure
+  run select_sync_base ahead ahead bogus
+  assert_failure
+  run select_sync_base
+  assert_failure
+}
+
+# === Runner-checkout sync from the Shared remote (#5) ======================
+#
+# Real host repo, runner-checkout cloned from it, and a bare repo standing in
+# for the Shared remote. Outcomes only: which commit the runner-checkout is
+# on, and which refs exist on the bare repo.
+
+# Host repo with `main` (one commit) and a bare Shared remote registered as
+# $1 (default `origin`) holding `main`. Host HEAD stays on main.
+setup_sync_shared_test() {
+  local remote_name="${1:-origin}"
+  HOST_REPO="$BATS_TEST_TMPDIR/sync-host"
+  HOST_CHECKOUT="$BATS_TEST_TMPDIR/sync-checkout"
+  SHARED_BARE="$BATS_TEST_TMPDIR/sync-shared.git"
+  TARGET_FEATURE="f"
+  mkdir -p "$HOST_REPO"
+  git -C "$HOST_REPO" init --quiet --initial-branch=main
+  git -C "$HOST_REPO" -c user.email=t@t -c user.name=t \
+    commit --allow-empty --quiet -m "main"
+  git init --quiet --bare --initial-branch=main "$SHARED_BARE"
+  git -C "$HOST_REPO" remote add "$remote_name" "$SHARED_BARE"
+  git -C "$HOST_REPO" push --quiet "$remote_name" main
+  git clone --quiet "$HOST_REPO" "$HOST_CHECKOUT" >&2
+  unset RUNNER_SHARED_REMOTE
+}
+
+# Another machine pushes commit(s) to the Shared remote's `$1`, starting
+# from `$2` (a ref on the remote, default: `$1` itself). Prints the new tip.
+other_machine_push() {
+  local branch="$1" from="${2:-$1}"
+  local other="$BATS_TEST_TMPDIR/other-$RANDOM"
+  git clone --quiet "$SHARED_BARE" "$other" >&2
+  git -C "$other" checkout --quiet -B "$branch" "origin/$from" >&2
+  git -C "$other" -c user.email=o@o -c user.name=o \
+    commit --allow-empty --quiet -m "other machine's work on $branch"
+  git -C "$other" push --quiet origin "$branch" >&2
+  git -C "$other" rev-parse HEAD
+}
+
+# Commits on top of `$2` in the host repo and points the host ref `$1` at it.
+host_commit_on() {
+  local ref="$1" base="$2" sha
+  sha="$(git -C "$HOST_REPO" -c user.email=t@t -c user.name=t \
+    commit-tree -p "$base" -m "commit on $ref" "$(git -C "$HOST_REPO" rev-parse "$base^{tree}")")"
+  git -C "$HOST_REPO" update-ref "$ref" "$sha"
+  echo "$sha"
+}
+
+shared_ref() { git -C "$SHARED_BARE" rev-parse --verify "refs/heads/$1" 2>/dev/null || true; }
+
+@test "sync from Shared remote — branch only on the Shared remote: a machine that never had it builds from it" {
+  setup_sync_shared_test
+  local remote_tip
+  remote_tip="$(other_machine_push f main)"
+  # This machine has never seen f: no host branch, no parking ref.
+  ! git -C "$HOST_REPO" show-ref --quiet --verify refs/heads/f
+  ! git -C "$HOST_REPO" show-ref --quiet --verify refs/remotes/runner/f
+
+  run ensure_runner_checkout_on_branch f
+
+  assert_success
+  [ "$(git -C "$HOST_CHECKOUT" symbolic-ref --short HEAD)" = "f" ]
+  [ "$(git -C "$HOST_CHECKOUT" rev-parse HEAD)" = "$remote_tip" ]
+  # Not re-created from main, and the remote branch is untouched.
+  [ "$(shared_ref f)" = "$remote_tip" ]
+}
+
+@test "sync from Shared remote — remote branch ahead of the host branch (no parking ref): remote is the base" {
+  setup_sync_shared_test
+  git -C "$HOST_REPO" branch f main
+  git -C "$HOST_REPO" push --quiet origin f
+  local remote_tip
+  remote_tip="$(other_machine_push f)"
+
+  run ensure_runner_checkout_on_branch f
+
+  assert_success
+  [ "$(git -C "$HOST_CHECKOUT" rev-parse HEAD)" = "$remote_tip" ]
+}
+
+@test "sync from Shared remote — remote branch ahead of host and parking ref: remote is the base" {
+  setup_sync_shared_test
+  git -C "$HOST_REPO" branch f main
+  local parked
+  parked="$(host_commit_on refs/remotes/runner/f refs/heads/f)"
+  git -C "$HOST_REPO" push --quiet origin "$parked:refs/heads/f"
+  local remote_tip
+  remote_tip="$(other_machine_push f)"
+
+  run ensure_runner_checkout_on_branch f
+
+  assert_success
+  [ "$(git -C "$HOST_CHECKOUT" rev-parse HEAD)" = "$remote_tip" ]
+  git -C "$HOST_CHECKOUT" merge-base --is-ancestor "$parked" HEAD
+}
+
+@test "sync from Shared remote — parking ref ahead of the remote branch: parking ref is the base" {
+  setup_sync_shared_test
+  git -C "$HOST_REPO" branch f main
+  git -C "$HOST_REPO" push --quiet origin f
+  local p1 p2
+  p1="$(host_commit_on refs/remotes/runner/f refs/heads/f)"
+  git -C "$HOST_REPO" push --quiet origin "$p1:refs/heads/f"
+  p2="$(host_commit_on refs/remotes/runner/f "$p1")"
+
+  run ensure_runner_checkout_on_branch f
+
+  assert_success
+  [ "$(git -C "$HOST_CHECKOUT" rev-parse HEAD)" = "$p2" ]
+  [ "$(shared_ref f)" = "$p1" ]
+}
+
+@test "sync from Shared remote — remote branch and parking ref diverged: parking ref is the base, remote untouched" {
+  setup_sync_shared_test
+  git -C "$HOST_REPO" branch f main
+  git -C "$HOST_REPO" push --quiet origin f
+  local parked theirs
+  parked="$(host_commit_on refs/remotes/runner/f refs/heads/f)"
+  theirs="$(other_machine_push f)"
+
+  run ensure_runner_checkout_on_branch f
+
+  assert_success
+  [ "$(git -C "$HOST_CHECKOUT" rev-parse HEAD)" = "$parked" ]
+  [ "$(shared_ref f)" = "$theirs" ]
+}
+
+@test "sync from Shared remote — remote branch equal to the host branch: host branch path, unchanged" {
+  setup_sync_shared_test
+  git -C "$HOST_REPO" branch f main
+  git -C "$HOST_REPO" push --quiet origin f
+
+  run ensure_runner_checkout_on_branch f
+
+  assert_success
+  [ "$(git -C "$HOST_CHECKOUT" rev-parse HEAD)" = "$(git -C "$HOST_REPO" rev-parse refs/heads/f)" ]
+}
+
+@test "sync from Shared remote — branch missing everywhere: created from main and on the Shared remote before the first dispatch" {
+  setup_sync_shared_test
+  local main_tip
+  main_tip="$(git -C "$HOST_REPO" rev-parse refs/heads/main)"
+  [ -z "$(shared_ref f)" ]
+
+  run ensure_runner_checkout_on_branch f
+
+  assert_success
+  [ "$(git -C "$HOST_CHECKOUT" symbolic-ref --short HEAD)" = "f" ]
+  [ "$(git -C "$HOST_CHECKOUT" rev-parse HEAD)" = "$main_tip" ]
+  [ "$(shared_ref f)" = "$main_tip" ]
+  assert_output --partial "runner: created f from main and pushed it to origin/f"
+}
+
+@test "sync from Shared remote — branch missing everywhere, RUNNER_SHARED_REMOTE names a non-origin remote: pushed there" {
+  setup_sync_shared_test upstream
+  export RUNNER_SHARED_REMOTE=upstream
+
+  run ensure_runner_checkout_on_branch f
+
+  assert_success
+  [ "$(shared_ref f)" = "$(git -C "$HOST_REPO" rev-parse refs/heads/main)" ]
+}
+
+@test "sync from Shared remote — the first dispatch's propagation publishes onto the branch created at sync" {
+  setup_sync_shared_test
+  ensure_runner_checkout_on_branch f >/dev/null 2>&1
+  git -C "$HOST_CHECKOUT" -c user.email=t@t -c user.name=t \
+    commit --allow-empty --quiet -m "dispatch 1"
+
+  propagate_feature f >/dev/null 2>&1
+
+  [ "$RUNNER_LAST_PROPAGATION" = "published → origin/f" ]
+  [ "$(shared_ref f)" = "$(git -C "$HOST_CHECKOUT" rev-parse HEAD)" ]
+}
+
+@test "sync from Shared remote — no Shared remote: branch missing everywhere is created from main, nothing pushed" {
+  setup_sync_shared_test
+  git -C "$HOST_REPO" remote remove origin
+
+  run ensure_runner_checkout_on_branch f
+
+  assert_success
+  [ "$(git -C "$HOST_CHECKOUT" rev-parse HEAD)" = "$(git -C "$HOST_REPO" rev-parse refs/heads/main)" ]
+  [ -z "$(shared_ref f)" ]
+}
+
+@test "sync from Shared remote — unreachable Shared remote: sync fails with a diagnostic" {
+  setup_sync_shared_test
+  git -C "$HOST_REPO" branch f main
+  git -C "$HOST_REPO" remote set-url origin "$BATS_TEST_TMPDIR/does-not-exist.git"
+
+  run ensure_runner_checkout_on_branch f
+
+  assert_failure
+  assert_output --partial "cannot read origin/f from the Shared remote"
 }
 
 # === ensure_runner_checkout_on_branch — parking-ref sync path ==============
@@ -6736,6 +7011,91 @@ EOF
   # The issue is dispatched (per-issue loop reached), not skipped.
   [ "${RUN_FEATURE_OUTCOMES[0]}" = "newfeat|drained" ]
   grep -qx "newfeat" "$REPRO_DRAINED_FILE"
+}
+
+@test "drain_one_feature — feature branch only on the Shared remote (#5): a machine that never had it drains it from the remote's tip" {
+  # Another machine created `remotefeat` (with one eligible AFK issue) and
+  # pushed it to the Shared remote; this machine's host repo has only main.
+  # Real ensure_runner_checkout_on_branch and real take_snapshot via the real
+  # local-markdown tracker-snapshot; only the mvn cache and the per-issue loop
+  # are mocked. Built from main instead, the snapshot would find no issues
+  # and the drain would skip queue-empty.
+  HOST_REPO="$BATS_TEST_TMPDIR/rf-host"
+  HOST_CHECKOUT="$BATS_TEST_TMPDIR/rf-checkout"
+  HOST_ABORT_DIR="$BATS_TEST_TMPDIR/rf-aborted"
+  SHARED_BARE="$BATS_TEST_TMPDIR/rf-shared.git"
+  mkdir -p "$HOST_REPO" "$HOST_ABORT_DIR"
+  unset RUNNER_SHARED_REMOTE
+
+  git -C "$HOST_REPO" init --quiet --initial-branch=main
+  mkdir -p "$HOST_REPO/docs/formann/issue-tracker" "$HOST_REPO/.features"
+  cp "$HERE/../bindings/issue-tracker/local-markdown/tracker-snapshot" \
+     "$HOST_REPO/docs/formann/issue-tracker/tracker-snapshot"
+  chmod +x "$HOST_REPO/docs/formann/issue-tracker/tracker-snapshot"
+  touch "$HOST_REPO/.features/.gitkeep"
+  git -C "$HOST_REPO" add -A
+  git -C "$HOST_REPO" -c user.email=t@t -c user.name=t \
+    commit --quiet -m "initial main commit"
+  git init --quiet --bare --initial-branch=main "$SHARED_BARE"
+  git -C "$HOST_REPO" remote add origin "$SHARED_BARE"
+  git -C "$HOST_REPO" push --quiet origin main
+  git clone --quiet "$HOST_REPO" "$HOST_CHECKOUT" >&2
+
+  # The other machine.
+  local other="$BATS_TEST_TMPDIR/rf-other"
+  git clone --quiet "$SHARED_BARE" "$other" >&2
+  git -C "$other" checkout --quiet -b remotefeat
+  mkdir -p "$other/.features/remotefeat/issues"
+  cat >"$other/.features/remotefeat/issues/01-do-the-thing.md" <<'EOF'
+---
+status: ready-for-agent
+category: enhancement
+type: AFK
+---
+
+# Do the thing
+
+## What to build
+
+A trivial thing.
+
+## Acceptance criteria
+
+- [ ] It does the thing.
+
+## Blocked by
+
+None — can start immediately.
+EOF
+  git -C "$other" add -A
+  git -C "$other" -c user.email=o@o -c user.name=o \
+    commit --quiet -m "remotefeat: feature with one eligible issue"
+  git -C "$other" push --quiet origin remotefeat >&2
+  local remote_tip
+  remote_tip="$(git -C "$other" rev-parse HEAD)"
+  ! git -C "$HOST_REPO" show-ref --quiet --verify refs/heads/remotefeat
+
+  RF_DRAINED_FILE="$BATS_TEST_TMPDIR/rf-drained"
+  : >"$RF_DRAINED_FILE"
+  ensure_mvn_cache_for() { MVN_VOLUME="rf-mvn"; return 0; }
+  run_loop() {
+    echo "$TARGET_FEATURE $(git -C "$HOST_CHECKOUT" rev-parse HEAD)" >>"$RF_DRAINED_FILE"
+    RUN_STOP_REASON="queue-empty"
+    return 0
+  }
+  RUN_DIR="$BATS_TEST_TMPDIR/rf-run"
+  mkdir -p "$RUN_DIR"
+  RUNNER_INTERRUPTED=0
+  RUN_FEATURE_OUTCOMES=()
+  RUN_DISPATCHES=()
+  RUN_STOP_REASON=""
+  TARGET_FEATURE=""
+  RUN_MODE="drain"
+
+  drain_one_feature "remotefeat"
+
+  [ "${RUN_FEATURE_OUTCOMES[0]}" = "remotefeat|drained" ]
+  grep -qx "remotefeat $remote_tip" "$RF_DRAINED_FILE"
 }
 
 @test "drain_one_feature — records skip:fetch-failed when runner-checkout sync fails" {

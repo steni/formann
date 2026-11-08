@@ -200,7 +200,7 @@ Window-waits do not consume the transport-retry budget, and the transport attemp
 
 ## Default-branch resolution
 
-When a feature's branch doesn't exist on host yet, the runner lazy-initializes it from the repo's default branch — based on that branch's *current host tip*, fetched at sync time. The same resolution drives the lazy-init preserve-commits guard and the unborn-HEAD recovery. The default branch is resolved deliberately (`resolve_default_branch`), in precedence order:
+When a feature's branch exists on the Shared remote but not on host, the runner starts from the remote's branch (see *Publishing to the Shared remote*). When it doesn't exist anywhere yet, the runner lazy-initializes it from the repo's default branch — based on that branch's *current host tip*, fetched at sync time — and pushes it to the Shared remote at once. The same resolution drives the lazy-init preserve-commits guard and the unborn-HEAD recovery. The default branch is resolved deliberately (`resolve_default_branch`), in precedence order:
 
 1. `RUNNER_DEFAULT_BRANCH` — operator override.
 2. The host repo's own `refs/remotes/origin/HEAD` — when the host was cloned from a real upstream, this is the upstream's default branch.
@@ -226,6 +226,8 @@ The `propagation` column of `SUMMARY.md` and the end-of-run table, and the per-d
 | `published → <remote>/<branch>` | The Shared remote's branch is at the dispatch's commit. |
 | `parked → runner/<branch>` | The push was refused (the remote branch has commits the runner lacks) or failed (auth, network — git's stderr is in `runner.log`). The remote is untouched; the work is on the parking ref; the runner stops on this feature. Listed under `## Unpulled parked work`. |
 | `local-only (propagated → host)` / `local-only (parked → runner/<branch>)` | The host repo has no remote of that name: nothing is pushed, and the parenthesised host outcome is exactly the one-machine behaviour. |
+
+**Starting from the Shared remote.** Before every dispatch the host repo reads `<remote>/<branch>` and the runner-checkout is synced to the most advanced of the Shared remote's branch, the host branch and the parking ref that the others are ancestors of. A feature begun on another machine therefore continues from its published tip, even on a machine that never had the branch. When the remote branch and the parking ref have diverged, the runner builds on the parking ref and the publish parks the feature. A feature branch the runner creates from the default branch, because it exists nowhere yet, is pushed to the Shared remote before the first dispatch. A Shared remote the host cannot reach fails the sync (`skip:fetch-failed` in drain mode); with no remote of that name, nothing is read or pushed.
 
 To recover from `parked`, bring the two chains together by hand — `git pull runner <branch>`, merge or rebase onto `<remote>/<branch>`, push — and re-run.
 

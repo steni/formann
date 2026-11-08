@@ -426,6 +426,7 @@ The title goes in GitHub's native title field. The PRD content goes in the issue
 - If HEAD is not the project's main branch, warn the maintainer and confirm before branching.
 - If the working tree is dirty, ask the maintainer how to proceed before branching.
 - Create a git branch named with the feature slug from the current HEAD and switch to it.
+- Push the new branch to the **Shared remote** at once, with upstream tracking, so every machine sees the feature from the start (ADR-0011): `git push -u <shared-remote> <slug>`. The Shared remote is the remote named by `RUNNER_SHARED_REMOTE` when that is set, `origin` otherwise. When the repo has no remote of that name, skip the push (one-machine setup). A refused or failed push does not undo the feature: report git's error to the maintainer, who pushes the branch by hand.
 
 This step is binding-agnostic and follows the same convention as the local-markdown binding.
 
