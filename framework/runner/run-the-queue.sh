@@ -1563,6 +1563,41 @@ resolve_default_branch() {
   return 1
 }
 
+# Put the runner-checkout's `origin` back to the host repo (#4, upstream
+# jervell/formann#96). The checkout is mounted read-write into the sandbox, so a
+# dispatch that tried to push could rewrite `origin` (one set it to the GitHub
+# URL and pushed), remove it, or give it a separate push URL. Every sync below
+# fetches from `origin` and must fetch from host, so a rewritten remote halted
+# the next run with `preflight-abort: runner-checkout`. Run before every sync,
+# whatever the previous dispatch left; one runner.log line (stderr) per repair,
+# silence when `origin` is already right. Only `origin` is repaired: other
+# remotes a dispatch added are never fetched by the runner.
+reset_runner_checkout_origin() {
+  local current push_url
+  if ! current="$(git -C "$HOST_CHECKOUT" remote get-url origin 2>/dev/null)"; then
+    if ! git -C "$HOST_CHECKOUT" remote add origin "$HOST_REPO" >&2; then
+      echo "runner: reset_runner_checkout_origin: git remote add origin $HOST_REPO failed" >&2
+      return 1
+    fi
+    echo "runner: runner-checkout origin was '(missing)'; reset to $HOST_REPO" >&2
+  elif [ "$current" != "$HOST_REPO" ]; then
+    if ! git -C "$HOST_CHECKOUT" remote set-url origin "$HOST_REPO" >&2; then
+      echo "runner: reset_runner_checkout_origin: git remote set-url origin $HOST_REPO failed" >&2
+      return 1
+    fi
+    echo "runner: runner-checkout origin was '$current'; reset to $HOST_REPO" >&2
+  fi
+  push_url="$(git -C "$HOST_CHECKOUT" config --get-all remote.origin.pushurl 2>/dev/null | paste -sd ' ' -)"
+  if [ -n "$push_url" ]; then
+    if ! git -C "$HOST_CHECKOUT" config --unset-all remote.origin.pushurl >&2; then
+      echo "runner: reset_runner_checkout_origin: git config --unset-all remote.origin.pushurl failed" >&2
+      return 1
+    fi
+    echo "runner: runner-checkout origin push URL was '$push_url'; cleared" >&2
+  fi
+  return 0
+}
+
 # 2b. Runner-checkout is synced to the named branch's tip on host.
 #     Branch-parameterized: the runner-checkout is a single clone that
 #     gets branch-switched per drained feature inside the drain loop.
@@ -1579,6 +1614,11 @@ ensure_runner_checkout_on_branch() {
   local branch="$1"
   if [ -z "$branch" ]; then
     echo "runner: ensure_runner_checkout_on_branch: empty branch" >&2
+    return 1
+  fi
+
+  # Every git fetch below reads `origin`; repair it first (#4).
+  if ! reset_runner_checkout_origin; then
     return 1
   fi
 
@@ -2650,8 +2690,13 @@ RUNNER_DISPATCH_ENV=(
 # execution-context facts ONLY. No task imperatives ("commit", "set state"):
 # those differ per step and some steps forbid them (review must NOT change
 # state; gate transitions only on a clean verdict). Each step's own prompt owns
-# what it does; this only tells the agent the turn will not be resumed.
-RUNNER_DISPATCH_PREAMBLE="This is a one-shot headless dispatch: a single claude -p turn with no /loop or scheduler runtime. No scheduled wakeup, cross-turn timer or background-task notification will fire here — if you stop and wait to be resumed, nothing resumes you and the dispatch ends where it is, and whatever you had not finished is lost. Background Bash is disabled in this dispatch: builds and tests run in the foreground and you wait for them to finish (long commands may take a timeout of up to an hour). Carry out what this dispatch asks within this run; do not defer it behind a wakeup, a background task or a later check-in."
+# what it does; this only tells the agent the turn will not be resumed — and
+# that the runner, not the agent, publishes the commits (#4, upstream
+# jervell/formann#96): the sandbox cannot push, and an agent that rewrote the
+# runner-checkout's remote to do it broke the next sync. "Commit your work"
+# is conditional on there being work to commit — a step that must not commit
+# (review) has none, so the sentence does not contradict it.
+RUNNER_DISPATCH_PREAMBLE="This is a one-shot headless dispatch: a single claude -p turn with no /loop or scheduler runtime. No scheduled wakeup, cross-turn timer or background-task notification will fire here — if you stop and wait to be resumed, nothing resumes you and the dispatch ends where it is, and whatever you had not finished is lost. Background Bash is disabled in this dispatch: builds and tests run in the foreground and you wait for them to finish (long commands may take a timeout of up to an hour). Carry out what this dispatch asks within this run; do not defer it behind a wakeup, a background task or a later check-in. The runner publishes this dispatch's commits after the dispatch ends: commit your work and stop there — do not push, and do not add, remove or change git remotes."
 
 # Implement-dispatch wrapper: hands `claude -p "/implement <ref>"` to the
 # sandbox via the transport-retry layer, in streamed structured-event mode.

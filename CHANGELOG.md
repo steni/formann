@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pass count is read from the tracker through each binding's new `blocked-passes` script.
 
 ### Fixed
+- AFK runner puts the runner-checkout's `origin` back to the host repo before every sync and logs
+  the repair, so a dispatch that rewrote or removed the remote to push can no longer halt the next
+  run with `preflight-abort: runner-checkout`. Every dispatch is told that the runner publishes
+  its commits and that it must not push or change remotes.
 - AFK dispatches can no longer end their turn waiting on a background build: background Bash is disabled in the sandbox and foreground Bash may run for up to an hour.
 
 ## [0.6.0] - 2026-08-20

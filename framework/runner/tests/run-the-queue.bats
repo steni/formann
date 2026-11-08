@@ -673,6 +673,37 @@ EOF
   grep -q '^CLAUDE_CODE_OAUTH_TOKEN=oauth$' "$cap"
 }
 
+# Agents kept trying to push their own work (upstream jervell/formann#96): one
+# stalled asking the maintainer, another rewrote the runner-checkout's origin
+# and broke the next sync. The preamble — injected into /implement and every
+# walk step — tells them the runner publishes and they must not push or touch
+# remotes.
+@test "RUNNER_DISPATCH_PREAMBLE — says the runner publishes the commits and forbids push and remote changes" {
+  [[ "$RUNNER_DISPATCH_PREAMBLE" == *"The runner publishes this dispatch's commits after the dispatch ends"* ]]
+  [[ "$RUNNER_DISPATCH_PREAMBLE" == *"do not push,"* ]]
+  [[ "$RUNNER_DISPATCH_PREAMBLE" == *"do not add, remove or change git remotes"* ]]
+}
+
+@test "run_dispatch_container — the /implement prompt carries the no-push, no-remote-change instruction" {
+  local cap="$BATS_TEST_TMPDIR/claude-args"
+  run_sandbox_container() { shift; printf '%s\n' "$*" >"$cap"; return 0; }
+  HOST_CHECKOUT="$BATS_TEST_TMPDIR"
+  run_dispatch_container "#71" "$BATS_TEST_TMPDIR/base"
+  grep -q -- 'do not push,' "$cap"
+  grep -q -- 'do not add, remove or change git remotes' "$cap"
+}
+
+@test "run_item_container — every step prompt carries the no-push, no-remote-change instruction" {
+  local cap="$BATS_TEST_TMPDIR/claude-args"
+  local prompt="$BATS_TEST_TMPDIR/step.md"
+  printf 'Do the review step.\n' >"$prompt"
+  run_sandbox_container() { shift; printf '%s\n' "$*" >"$cap"; return 0; }
+  HOST_CHECKOUT="$BATS_TEST_TMPDIR"
+  run_item_container "#71" "$BATS_TEST_TMPDIR/base" "$prompt"
+  grep -q -- 'do not push,' "$cap"
+  grep -q -- 'do not add, remove or change git remotes' "$cap"
+}
+
 @test "RUNNER_DISPATCH_PREAMBLE — tells the agent background Bash is off and builds run in the foreground" {
   [[ "$RUNNER_DISPATCH_PREAMBLE" == *"Background Bash is disabled"* ]]
   [[ "$RUNNER_DISPATCH_PREAMBLE" == *"foreground"* ]]
@@ -5604,6 +5635,77 @@ setup_ensure_checkout_parking_test() {
   git -C "$HOST_CHECKOUT" checkout --quiet -B f origin/f
 }
 
+# === Runner-checkout origin reset (#4, upstream jervell/formann#96) ==========
+#
+# Inside the sandbox the runner-checkout's `origin` is a host path, so an
+# agent's `git push` fails; one agent rewrote `origin` to the GitHub URL to push,
+# and the next host-side sync then fetched from the wrong place and halted the
+# loop with `preflight-abort: runner-checkout`. Every sync now puts `origin`
+# back to HOST_REPO first, and logs a line when it had to.
+
+@test "ensure_runner_checkout_on_branch — origin rewritten to another URL (#96): resets it, logs the reset, syncs normally" {
+  setup_ensure_checkout_parking_test
+  git -C "$HOST_REPO" -c user.email=t@t -c user.name=t \
+    commit --allow-empty --quiet -m "host advance"
+  local host_tip
+  host_tip="$(git -C "$HOST_REPO" rev-parse refs/heads/f)"
+  # The #96 scenario: a dispatch rewrote origin to push to the hosted remote.
+  git -C "$HOST_CHECKOUT" remote set-url origin "https://github.com/example/consumer.git"
+
+  run ensure_runner_checkout_on_branch "f"
+
+  assert_success
+  assert_output --partial "runner: runner-checkout origin was 'https://github.com/example/consumer.git'; reset to $HOST_REPO"
+  [ "$(git -C "$HOST_CHECKOUT" remote get-url origin)" = "$HOST_REPO" ]
+  [ "$(git -C "$HOST_CHECKOUT" rev-parse HEAD)" = "$host_tip" ]
+}
+
+@test "ensure_runner_checkout_on_branch — origin removed by a dispatch: re-adds it and syncs normally" {
+  setup_ensure_checkout_parking_test
+  git -C "$HOST_CHECKOUT" remote remove origin
+
+  run ensure_runner_checkout_on_branch "f"
+
+  assert_success
+  assert_output --partial "runner: runner-checkout origin was '(missing)'; reset to $HOST_REPO"
+  [ "$(git -C "$HOST_CHECKOUT" remote get-url origin)" = "$HOST_REPO" ]
+  [ "$(git -C "$HOST_CHECKOUT" rev-parse HEAD)" = "$(git -C "$HOST_REPO" rev-parse refs/heads/f)" ]
+}
+
+@test "ensure_runner_checkout_on_branch — origin given a separate push URL: clears it" {
+  setup_ensure_checkout_parking_test
+  git -C "$HOST_CHECKOUT" remote set-url --push origin "git@github.com:example/consumer.git"
+
+  run ensure_runner_checkout_on_branch "f"
+
+  assert_success
+  assert_output --partial "runner: runner-checkout origin push URL was 'git@github.com:example/consumer.git'; cleared"
+  [ "$(git -C "$HOST_CHECKOUT" remote get-url --push origin)" = "$HOST_REPO" ]
+}
+
+@test "ensure_runner_checkout_on_branch — origin already the host repo: no reset line" {
+  setup_ensure_checkout_parking_test
+
+  run ensure_runner_checkout_on_branch "f"
+
+  assert_success
+  refute_output --partial "runner-checkout origin"
+  [ "$(git -C "$HOST_CHECKOUT" remote get-url origin)" = "$HOST_REPO" ]
+}
+
+@test "ensure_runner_checkout — rewritten origin (#96) no longer aborts the run with preflight-abort: runner-checkout" {
+  setup_ensure_checkout_test
+  RUN_MODE=single
+  git -C "$HOST_CHECKOUT" remote set-url origin "https://github.com/example/consumer.git"
+  fail_invariant() { echo "fail_invariant $*"; return 99; }
+
+  run ensure_runner_checkout
+
+  assert_success
+  refute_output --partial "fail_invariant"
+  [ "$(git -C "$HOST_CHECKOUT" remote get-url origin)" = "$HOST_REPO" ]
+}
+
 @test "ensure_runner_checkout_on_branch — parking-ref strictly ahead: syncs to parking-ref tip" {
   # Verify that when the parking ref is strictly ahead of host's branch, the
   # runner-checkout is synced to the parking-ref tip (not host's branch tip).
@@ -6009,8 +6111,24 @@ SHIM
   git -C "$HOST_CHECKOUT" symbolic-ref HEAD refs/heads/main
   git -C "$HOST_CHECKOUT" update-ref -d refs/heads/main 2>/dev/null || true
 
-  # Point origin at a nonexistent path so the recovery fetch fails.
-  git -C "$HOST_CHECKOUT" remote set-url origin "$BATS_TEST_TMPDIR/nonexistent"
+  # Make the recovery fetch fail. Rewriting origin's URL no longer works: the
+  # sync resets origin to HOST_REPO first (#4). A git shim fails every fetch
+  # in the runner-checkout instead.
+  local real_git fake_bin
+  real_git="$(command -v git)"
+  fake_bin="$BATS_TEST_TMPDIR/fake_bin"
+  mkdir -p "$fake_bin"
+  export SHIM_HOST_CHECKOUT="$HOST_CHECKOUT" SHIM_REAL_GIT="$real_git"
+  cat >"$fake_bin/git" <<'SHIM'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-C" ] && [ "${2:-}" = "$SHIM_HOST_CHECKOUT" ] && [ "${3:-}" = "fetch" ]; then
+  echo "fatal: could not read from remote repository (shim)" >&2
+  exit 128
+fi
+exec "$SHIM_REAL_GIT" "$@"
+SHIM
+  chmod +x "$fake_bin/git"
+  export PATH="$fake_bin:$PATH"
 
   run ensure_runner_checkout_on_branch "main"
   [ "$status" -ne 0 ]
