@@ -27,7 +27,10 @@ case "$1 $2" in
     printf '%s\n' "$*" >"$GH_LOG.list-args"
     printf '%s' "$GH_PARENTS"; exit 0 ;;
   "issue view")
-    printf '%s' "${GH_COMMENTS_JSON:-{\"comments\":[]\}}"; exit 0 ;;
+    # A plain-variable default: bash 3.2 keeps the backslash in an escaped
+    # `\}` inside ${…:-…}, which would hand jq `{"comments":[]\}`.
+    no_comments='{"comments":[]}'
+    printf '%s' "${GH_COMMENTS_JSON:-$no_comments}"; exit 0 ;;
   "issue comment")
     num="$3"; shift 3
     while [ "$#" -gt 0 ]; do
