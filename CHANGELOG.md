@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- AFK runner publishes every dispatch's commit to the Shared remote's feature branch (from the
+  host, fast-forward only) before the post-implement steps run. `RUNNER_SHARED_REMOTE` names the
+  remote (default `origin`); a refused push parks the work and stops the runner on that feature.
+  The `propagation` column reads `published`, `parked` or `local-only`.
 - AFK runner gives each consumer repo its own sandbox image and rebuilds it when
   the repo's `runner/` changes. `RUNNER_IMAGE_NAME` overrides the image name.
 - AFK runner passes the output of an optional, consumer-owned `runner/sandbox-env` into every

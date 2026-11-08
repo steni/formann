@@ -622,8 +622,9 @@ format_window_giveup_line() {
 # and a trailing `stop reason: <reason>` line. The `issue` column shows the
 # binding-native `ref`; `feature` and `nn` are ignored for this view. Column
 # widths size to the longest entry, bounded below by the header label widths.
-# The `propagation` column shows `propagated → host`, `parked → runner/<f>`,
-# or `-` when propagation was not reached.
+# The `propagation` column shows the `propagate_feature` indicator
+# (`published → …`, `parked → runner/<f>`, `local-only (…)`), or `-` when
+# propagation was not reached.
 format_end_of_run_table() {
   local stop_reason="$1"
   # `length()` returns bytes on byte-mode awk (BSD awk in non-UTF-8 locales,
@@ -687,7 +688,8 @@ format_end_of_run_table() {
 # `<NN>.summary.md` for each colon-separated suffix in `step_logs` (e.g.
 # `01-review`, `01-review-and-gate:02-fix:03-review-and-gate`);
 # `propagation` is the indicator string from `propagate_feature` —
-# `propagated → host`, `parked → runner/<branch>`, or empty). The
+# `published → <remote>/<branch>`, `parked → runner/<branch>`,
+# `local-only (…)`, or empty). The
 # `propagation` column shows the indicator verbatim, or `-` when empty.
 # An end-of-run "## Unpulled parked work" section follows the table whenever
 # any dispatch parked; it is omitted entirely when no dispatch parked.
@@ -743,15 +745,17 @@ format_summary_md() {
 #
 # Input lines (one record per line) — encounter order is preserved:
 #   F|<feature>|drained
+#   F|<feature>|parked        (drain stopped: the Shared remote refused a push)
 #   F|<feature>|skipped:<reason>
 #   F|<feature>|feature-snapshot-failed
 #   I|<feature>|<nn>|<ref>|<outcome>|<duration>|<review_present>|<attempt_count>|<propagation>
 #
-# `I` rows belong to the most recent preceding `F|<slug>|drained` section.
+# `I` rows belong to the most recent preceding `F|<slug>|drained` or
+# `F|<slug>|parked` section.
 # `step_logs` is a colon-separated list of walk-step log suffixes (e.g. `01-review`)
 # alongside `<ref>.summary.md`. `propagation` is the indicator string from
-# `propagate_feature` — `propagated → host`, `parked → runner/<branch>`,
-# or empty. Summary paths in multi-feature mode embed the feature segment of the
+# `propagate_feature` — `published → <remote>/<branch>`,
+# `parked → runner/<branch>`, `local-only (…)`, or empty. Summary paths in multi-feature mode embed the feature segment of the
 # ref (`<feature>/<NN>.summary.md`) so per-issue artifacts don't collide across
 # features that share `<NN>`. The `propagation` column shows the indicator
 # verbatim, or `-` when empty; an end-of-run "## Unpulled parked work"
@@ -799,6 +803,12 @@ format_multi_feature_summary_md() {
         in_drained = 1;
         in_table = 1;
       }
+      else if (outcome == "parked") {
+        printf "## %s — parked (Shared remote refused the fast-forward)\n\n", feature;
+        emit_table_header();
+        in_drained = 1;
+        in_table = 1;
+      }
       else if (outcome == "feature-snapshot-failed") {
         printf "## %s — feature-snapshot-failed\n\n", feature;
       }
@@ -841,7 +851,9 @@ format_multi_feature_summary_md() {
 # Pure aggregator for the parked-work ledger. Reads dispatch records
 # (`feature|nn|ref|label|duration|review_present|attempt_count|propagation`)
 # on stdin and emits the "## Unpulled parked work" SUMMARY.md section when
-# one or more dispatches have `propagation == parked`. Emits nothing when no
+# one or more dispatches left work only on the parking ref (`propagation`
+# contains `parked → runner/` — a refused Shared-remote push, or a refused
+# host fast-forward under `local-only`). Emits nothing when no
 # dispatch parked. Groups by feature; counts per-feature parked dispatches.
 # Called by `format_summary_md` and `format_multi_feature_summary_md` so the
 # end-of-run section's shape lives in exactly one place.
@@ -853,7 +865,7 @@ format_multi_feature_summary_md() {
 #   …one line per feature with at least one parked dispatch…
 format_parked_ledger() {
   awk -F'|' '
-    NF >= 8 && $8 ~ /^parked/ {
+    NF >= 8 && $8 ~ /parked → runner\// {
       if (!(($1) in parked)) { order[++n] = $1 }
       parked[$1]++
     }
@@ -965,7 +977,7 @@ RUN_PREFLIGHT_INVARIANT=""
 RUN_DISPATCHES=()
 # Per-feature outcome records for drain mode (bash 3.2 friendly array of
 # `feature|outcome` strings, in encounter order). `outcome` is one of
-# `drained`, `skip:<reason>`, `feature-snapshot-failed` (see the gate
+# `drained`, `parked`, `skip:<reason>`, `feature-snapshot-failed` (see the gate
 # evaluator). Single-feature / single-issue modes don't populate this.
 RUN_FEATURE_OUTCOMES=()
 # Per-issue artifact layout. `flat` (default — single-feature / single-issue
@@ -975,7 +987,8 @@ RUN_FEATURE_OUTCOMES=()
 RUN_LOG_LAYOUT="flat"
 RUNNER_TEE_PID=""
 RUNNER_LOG_FIFO=""
-RUNNER_LAST_PROPAGATION=""   # 'propagated → host' | 'parked → runner/<branch>' | '' (set by propagate_feature)
+RUNNER_LAST_PROPAGATION=""   # 'published → <remote>/<branch>' | 'parked → runner/<branch>' | 'local-only (<host indicator>)' | '' (set by propagate_feature)
+RUNNER_PUBLISH_PARKED=0      # 1 when propagate_feature's Shared-remote push was refused; stops the loop on the feature
 RUN_SWEPT_REFS=()     # parking refs deleted by sweep_stale_parking_refs; populated during pre-flight
 DISCOVERY_JSON=""     # populated by check_discovery pre-flight invariant
 RESOLVED_MANIFEST=""  # populated by check_manifest pre-flight invariant; tab-delimited label<TAB>path pairs
@@ -1079,7 +1092,7 @@ start_wake_assertion() {
 # `attempt_count` (default 1) is the data hook for the retry slice; the
 # formatters render `(N attempts)` only when N > 1, so it is silent here.
 # `propagation` is the value of $RUNNER_LAST_PROPAGATION at record time —
-# `propagated → host`, `parked → runner/<branch>`, or empty when propagation
+# the `propagate_feature` indicator (`published → …`, `parked → …`, `local-only (…)`), or empty when propagation
 # was not reached.
 record_dispatch() {
   local feature="$1" nn="$2" ref="$3" label="$4" duration="$5" review="${6:-}" \
@@ -1098,7 +1111,7 @@ print_dispatch_records() {
 }
 
 # Append a per-feature outcome record (drain mode). `outcome` is one of
-# `drained`, `skip:<reason>`, or `feature-snapshot-failed`.
+# `drained`, `parked`, `skip:<reason>`, or `feature-snapshot-failed`.
 record_feature_outcome() {
   local feature="$1" outcome="$2"
   RUN_FEATURE_OUTCOMES+=("$feature|$outcome")
@@ -1106,7 +1119,7 @@ record_feature_outcome() {
 
 # Emit the interleaved F/I record stream that `format_multi_feature_summary_md`
 # consumes. Walks per-feature outcomes in encounter order; for each drained
-# feature, appends the matching `RUN_DISPATCHES` rows (those whose ref's
+# (or parked) feature, appends the matching `RUN_DISPATCHES` rows (those whose ref's
 # feature segment equals the feature). Skipped / feature-snapshot-failed
 # features contribute only the F record.
 print_multi_feature_records() {
@@ -1116,7 +1129,8 @@ print_multi_feature_records() {
     feature="${rec%%|*}"
     outcome="${rec#*|}"
     printf 'F|%s|%s\n' "$feature" "$outcome"
-    if [ "$outcome" = "drained" ] && [ "${#RUN_DISPATCHES[@]}" -gt 0 ]; then
+    if { [ "$outcome" = "drained" ] || [ "$outcome" = "parked" ]; } \
+        && [ "${#RUN_DISPATCHES[@]}" -gt 0 ]; then
       local d_rec d_feature
       for d_rec in "${RUN_DISPATCHES[@]}"; do
         d_feature="${d_rec%%|*}"
@@ -2625,7 +2639,8 @@ Fix with: git remote remove runner
 
 # Publish the feature branch to the per-feature parking ref
 # (`refs/remotes/runner/<branch>` on host), then attempt a best-effort
-# host fast-forward (`refs/heads/<branch>`).  Does not run `symbolic-ref`
+# host fast-forward (`refs/heads/<branch>`), then fast-forward the Shared
+# remote's feature branch (ADR-0011).  Does not run `symbolic-ref`
 # before the fast-forward attempt; post-refusal classification reads it to
 # distinguish HEAD-on-target from non-ff refusal.
 #
@@ -2636,10 +2651,23 @@ Fix with: git remote remove runner
 #   --update-head-ok.  Git's own refusal (HEAD-on-target or non-ff) is the
 #   parked-only trigger — the runner does not model "am I on-branch?".
 #
+# Step 3 (publish): push the parking-ref tip to
+#   `<shared-remote>/<branch>` from the host repo, with the host's
+#   credentials — fast-forward only, never `--force`, never a `+` refspec.
+#   The Shared remote is named by $RUNNER_SHARED_REMOTE (default `origin`).
+#   A host repo with no remote of that name skips the step (`local-only`).
+#   A refused push (the remote branch has commits not in the dispatch's
+#   chain) or any other push error (auth, network — git's stderr goes to
+#   runner.log) leaves the work on the parking ref and sets
+#   RUNNER_PUBLISH_PARKED=1, which stops the loop on this feature.
+#
 # On return 0, RUNNER_LAST_PROPAGATION is set to the human-readable indicator
-# that ends up in the SUMMARY column and the per-dispatch progress line:
-#   'propagated → host'           — both steps succeeded (propagated-to-host)
-#   'parked → runner/<branch>'    — step 1 ok, step 2 refused (parked-only)
+# that ends up in the SUMMARY column and the per-dispatch progress line. Its
+# first word is the publish state:
+#   'published → <remote>/<branch>'       — step 3 pushed the commit
+#   'parked → runner/<branch>'            — step 3 refused or failed
+#   'local-only (propagated → host)'      — no Shared remote; step 2 ok
+#   'local-only (parked → runner/<branch>)' — no Shared remote; step 2 refused
 # and the same indicator is printed to stdout.
 #
 # On return 1 (error), RUNNER_LAST_PROPAGATION is cleared to ''.
@@ -2678,12 +2706,12 @@ MSG
   # Capture stderr so we can surface true errors (lock contention, FS
   # error, etc.) to runner.log without printing the noisy diagnostic on
   # every expected refusal.  `|| rc=$?` keeps set -e happy on non-zero.
+  local host_indicator
   local step2_stderr step2_rc=0
   step2_stderr="$(git -C "$HOST_REPO" fetch --quiet "$HOST_CHECKOUT" \
       "${branch}:${branch}" 2>&1)" || step2_rc=$?
   if [ "$step2_rc" -eq 0 ]; then
-    RUNNER_LAST_PROPAGATION="propagated → host"
-    printf '[%s] %s\n' "$(now_clock)" "$RUNNER_LAST_PROPAGATION"
+    host_indicator="propagated → host"
   else
     # Two refusal modes are expected and self-evidently safe:
     #   - HEAD-on-target: host has the target branch checked out.
@@ -2707,9 +2735,44 @@ MSG
       printf 'runner: unexpected step-2 fetch failure for branch %s:\n%s\n' \
         "$branch" "$step2_stderr" >&2
     fi
-    RUNNER_LAST_PROPAGATION="parked → runner/${branch}"
-    printf '[%s] %s (git pull runner %s)\n' "$(now_clock)" "$RUNNER_LAST_PROPAGATION" "$branch"
+    host_indicator="parked → runner/${branch}"
   fi
+
+  # Step 3: publish to the Shared remote — fast-forward only, from the host.
+  local shared_remote="${RUNNER_SHARED_REMOTE:-origin}"
+  RUNNER_PUBLISH_PARKED=0
+  if ! git -C "$HOST_REPO" remote get-url "$shared_remote" >/dev/null 2>&1; then
+    RUNNER_LAST_PROPAGATION="local-only (${host_indicator})"
+  else
+    local publish_sha publish_stderr publish_rc=0
+    publish_sha="$(git -C "$HOST_REPO" rev-parse --verify "${parking_ref}^{commit}")"
+    # No `+`, no `--force`: git refuses a non-fast-forward on its own, which
+    # is the divergence guard. GIT_TERMINAL_PROMPT=0 keeps a missing
+    # credential from hanging the run on an interactive prompt.
+    publish_stderr="$(GIT_TERMINAL_PROMPT=0 git -C "$HOST_REPO" push --quiet \
+        "$shared_remote" "${publish_sha}:refs/heads/${branch}" 2>&1)" || publish_rc=$?
+    if [ "$publish_rc" -eq 0 ]; then
+      RUNNER_LAST_PROPAGATION="published → ${shared_remote}/${branch}"
+    else
+      cat >&2 <<MSG
+runner: publish refused — could not fast-forward '${shared_remote}/${branch}' to ${publish_sha}.
+git said:
+${publish_stderr}
+The work is on the parking ref 'runner/${branch}'; the runner stops on this
+feature until you reconcile (e.g. git pull runner ${branch}, merge or rebase
+onto ${shared_remote}/${branch}, push).
+MSG
+      RUNNER_PUBLISH_PARKED=1
+      RUNNER_LAST_PROPAGATION="parked → runner/${branch}"
+    fi
+  fi
+
+  case "$RUNNER_LAST_PROPAGATION" in
+    *"parked → runner/"*)
+      printf '[%s] %s (git pull runner %s)\n' "$(now_clock)" "$RUNNER_LAST_PROPAGATION" "$branch" ;;
+    *)
+      printf '[%s] %s\n' "$(now_clock)" "$RUNNER_LAST_PROPAGATION" ;;
+  esac
 }
 
 # Sweep stale parking refs from the host repo. Called once per run, from
@@ -3151,6 +3214,13 @@ walk_post_implement_steps() {
             return 1
           fi
         fi
+        # The Shared remote refused this step's commit: stop the walk here
+        # (the issue stays at in-review) so run_loop stops on the feature.
+        if [ "$RUNNER_PUBLISH_PARKED" -eq 1 ]; then
+          record_dispatch "$feature" "$nn" "$ref" "left-for-human" \
+            "$iter_duration" "$step_logs" "$total_attempts"
+          return 0
+        fi
         ;;
     esac
   done <<< "$resolved_manifest"
@@ -3171,9 +3241,11 @@ walk_post_implement_steps() {
 # dispatch snapshot. Mutates only files under the run dir; classifier
 # verdict is derived from snapshots taken in the runner-checkout.
 #
-# Sets $RUNNER_LAST_PROPAGATION to `propagated → host` or
-# `parked → runner/<branch>` on the success path (empty on failure or
-# when no propagation occurred). Return code: 0 = success, 1 = failure.
+# Sets $RUNNER_LAST_PROPAGATION to the `propagate_feature` indicator
+# (`published → …`, `parked → runner/<branch>`, `local-only (…)`) on the
+# success path (empty on failure or when no propagation occurred). When the
+# Shared remote refuses the implement commit (RUNNER_PUBLISH_PARKED=1) the
+# post-implement walk is not started. Return code: 0 = success, 1 = failure.
 # On a parking-ref publish error, also sets
 # RUN_STOP_REASON="propagation-error" so run_loop breaks the loop; a
 # post-implement step that pushes the issue back to an eligible state sets
@@ -3406,6 +3478,15 @@ dispatch_one() {
     return 0
   fi
 
+  # The Shared remote refused the implement commit: its feature branch moved
+  # under us. The post-implement steps may rely on fetching the commit by ref
+  # from the Shared remote, so do not start them; the work stays on the
+  # parking ref and run_loop stops on this feature (RUNNER_PUBLISH_PARKED).
+  if [ "$RUNNER_PUBLISH_PARKED" -eq 1 ]; then
+    record_dispatch "$feature" "$nn" "$ref" "$impl_label" "$impl_duration" "" "$impl_attempts"
+    return 0
+  fi
+
   walk_post_implement_steps \
     "$feature" "$nn" "$ref" \
     "$run_dir" "$log_dir" "$log_basename" \
@@ -3558,6 +3639,7 @@ run_loop() {
     fi
 
     RUNNER_LAST_PROPAGATION=""
+    RUNNER_PUBLISH_PARKED=0
     local dispatch_rc=0
     dispatch_one "$TARGET_FEATURE" "$nn_sel" "$RUN_DIR" || dispatch_rc=$?
 
@@ -3582,6 +3664,16 @@ run_loop() {
         echo "[$(now_clock)] runner: runaway guard fired — halting loop"
         return 1 ;;
     esac
+
+    # Publish refused: the Shared remote's feature branch has commits the
+    # runner lacks. Stop this feature only — continuing would build on a
+    # chain the Shared remote will keep refusing. Drain mode moves on to
+    # the next feature.
+    if [ "$RUNNER_PUBLISH_PARKED" -eq 1 ]; then
+      echo "[$(now_clock)] runner: Shared remote refused '$TARGET_FEATURE' — work parked on runner/$TARGET_FEATURE; stopping this feature"
+      RUN_STOP_REASON="publish-parked"
+      return 0
+    fi
 
     # Make `set -e` happy — dispatch_rc is consumed, not propagated.
     : "$dispatch_rc"
@@ -3729,6 +3821,11 @@ drain_one_feature() {
       # the pre-loop `feature-snapshot-failed` gate (which catches the
       # crash before any per-issue work landed).
       record_feature_outcome "$feature" "feature-snapshot-failed"
+      ;;
+    publish-parked)
+      # The Shared remote refused a fast-forward inside this feature's loop.
+      # The feature stops; the drain continues with the next one.
+      record_feature_outcome "$feature" "parked"
       ;;
     fetch-failed)
       # Per-iteration `ensure_runner_checkout` failure inside the per-issue

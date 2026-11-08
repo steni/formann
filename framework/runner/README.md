@@ -31,7 +31,7 @@ at `.runner-state/runs/<YYYYMMDD-HHMMSS>/` containing:
 | `<NN>.summary.md` / `<feature>/<NN>.summary.md` | The implement dispatch's readable closing message, extracted from the terminal `result` event — the skim-the-outcome artifact. This is what the SUMMARY table links. |
 | `<NN>.exit` / `<feature>/<NN>.exit` | Per-issue implement-dispatch exit code (a bare integer). |
 | `<NN>-<step>-<label>.{stdout.jsonl,stderr.log,summary.md}` (narrowed) / `<feature>/…` (drain) | The same three per-dispatch artifacts for each post-implement walk step, e.g. `01-01-review.stdout.jsonl` for the default single `review` step. One set per step that ran; absent when the implement stage failed and the walk never started. |
-| `SUMMARY.md` | Markdown end-of-run summary. Narrowed modes: feature heading + flat per-issue table. Drain mode: `# AFK runner — multi-feature drain` heading + per-feature sections (`## <feature> — drained` with nested per-issue table, or `## <feature> — skipped: <reason>` / `## <feature> — feature-snapshot-failed` one-liner). Pre-flight aborts replace the table with a single line naming the failing invariant. |
+| `SUMMARY.md` | Markdown end-of-run summary. Narrowed modes: feature heading + flat per-issue table. Drain mode: `# AFK runner — multi-feature drain` heading + per-feature sections (`## <feature> — drained` or `## <feature> — parked (Shared remote refused the fast-forward)` with nested per-issue table, or `## <feature> — skipped: <reason>` / `## <feature> — feature-snapshot-failed` one-liner). Pre-flight aborts replace the table with a single line naming the failing invariant. |
 
 Stdout while a run is in flight uses per-stage progress lines. A typical
 iteration produces four (implement starting/outcome, review starting/outcome):
@@ -121,11 +121,13 @@ The trailing `stop reason:` line varies by mode.
 - `completed` — every feature in discovery output considered (the multi-feature analogue of single-feature mode's `queue-empty` at the run level).
 - `interrupted` — Ctrl-C during the outer loop.
 - `propagation-error` — parking-ref publish failed inside a feature loop; the entire drain halts (exit 1).
+- A feature whose Shared-remote push was refused is not a run-level stop: its section reads `## <feature> — parked (Shared remote refused the fast-forward)` and the drain continues with the next feature.
 - `preflight-abort: discovery` — `tracker-snapshot --list` exited non-zero or returned unparseable JSON.
 
 **Narrowed modes (`--feature`, `--issue`):**
 
 - `queue-empty` / `interrupted` / `snapshot-failed` / `propagation-error` — the per-issue loop's stop reasons (see "The dispatch loop" in `afk-runner.md`).
+- `publish-parked` (`--feature`) — the Shared remote refused a fast-forward; the work is on the parking ref and the loop stopped on the feature.
 - `feature-restricted (refused: <reason>)` (`--feature`) — `<reason>` is `unknown-feature` (slug not in discovery output).
 - `single-dispatch (success|failure)` (`--issue`); or `single-dispatch (refused: <reason>)` — `<reason>` is one of: HITL type, wrong status, unmet blockers, `unknown-feature`, `snapshot-failed`.
 
@@ -210,6 +212,26 @@ Two sources are explicitly forbidden: the host's currently-checked-out branch an
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `RUNNER_DEFAULT_BRANCH` | (empty) | Override the resolved default branch; empty means auto-resolve per the precedence above |
+
+## Publishing to the Shared remote
+
+After every dispatch that commits, the host side of the runner fast-forwards the commit onto the **Shared remote**'s feature branch — after the parking ref and the host fast-forward, before the first post-implement step starts (ADR-0011). The push runs in the host repo with the host's git credentials; nothing changes in the sandbox. It is fast-forward only: never `--force`, never a `+` refspec.
+
+The `propagation` column of `SUMMARY.md` and the end-of-run table, and the per-dispatch progress line, lead with the publish state:
+
+| Indicator | Meaning |
+|-----------|---------|
+| `published → <remote>/<branch>` | The Shared remote's branch is at the dispatch's commit. |
+| `parked → runner/<branch>` | The push was refused (the remote branch has commits the runner lacks) or failed (auth, network — git's stderr is in `runner.log`). The remote is untouched; the work is on the parking ref; the runner stops on this feature. Listed under `## Unpulled parked work`. |
+| `local-only (propagated → host)` / `local-only (parked → runner/<branch>)` | The host repo has no remote of that name: nothing is pushed, and the parenthesised host outcome is exactly the one-machine behaviour. |
+
+To recover from `parked`, bring the two chains together by hand — `git pull runner <branch>`, merge or rebase onto `<remote>/<branch>`, push — and re-run.
+
+**Knob:**
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `RUNNER_SHARED_REMOTE` | `origin` | Name of the host repo's git remote the runner publishes to. A name with no matching remote means `local-only`. |
 
 ## Resuming after a technical failure
 

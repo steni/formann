@@ -5383,7 +5383,7 @@ setup_propagate_test() {
   # Both host branch and parking ref advance to the runner-checkout tip.
   [ "$host_f_after" = "$checkout_tip" ]
   [ "$parking_after" = "$checkout_tip" ]
-  [ "$RUNNER_LAST_PROPAGATION" = "propagated → host" ]
+  [ "$RUNNER_LAST_PROPAGATION" = "local-only (propagated → host)" ]
   # host HEAD (master) must not have moved.
   [ "$(git -C "$HOST_REPO" symbolic-ref --short HEAD)" = "master" ]
 }
@@ -5410,7 +5410,7 @@ setup_propagate_test() {
   # Parking ref advanced; host branch ref is unchanged (HEAD-on-target).
   [ "$parking_after" = "$checkout_tip" ]
   [ "$host_f_after" = "$host_f_before" ]
-  [ "$RUNNER_LAST_PROPAGATION" = "parked → runner/f" ]
+  [ "$RUNNER_LAST_PROPAGATION" = "local-only (parked → runner/f)" ]
   # HEAD-on-target is an expected refusal; no unexpected-error diagnostic.
   ! grep -q 'unexpected step-2' "$err_file" || { cat "$err_file"; false; }
 }
@@ -5442,7 +5442,7 @@ setup_propagate_test() {
   # divergent tip (non-ff refusal).
   [ "$parking_after" = "$checkout_tip" ]
   [ "$host_f_after" = "$host_f_before" ]
-  [ "$RUNNER_LAST_PROPAGATION" = "parked → runner/f" ]
+  [ "$RUNNER_LAST_PROPAGATION" = "local-only (parked → runner/f)" ]
   # Non-ff is an expected refusal; no unexpected-error diagnostic.
   ! grep -q 'unexpected step-2' "$err_file" || { cat "$err_file"; false; }
 }
@@ -5462,7 +5462,7 @@ setup_propagate_test() {
   d1_tip="$(git -C "$HOST_CHECKOUT" rev-parse HEAD)"
 
   propagate_feature "f"
-  [ "$RUNNER_LAST_PROPAGATION" = "parked → runner/f" ]
+  [ "$RUNNER_LAST_PROPAGATION" = "local-only (parked → runner/f)" ]
   [ "$(git -C "$HOST_REPO" rev-parse refs/remotes/runner/f)" = "$d1_tip" ]
 
   # Set up the diverged-tip scenario: reset the runner-checkout back to
@@ -5485,7 +5485,7 @@ setup_propagate_test() {
   propagate_feature "f"
 
   # The parking ref moves to d2_tip and the dispatch is parked, not errored.
-  [ "$RUNNER_LAST_PROPAGATION" = "parked → runner/f" ]
+  [ "$RUNNER_LAST_PROPAGATION" = "local-only (parked → runner/f)" ]
   [ "$(git -C "$HOST_REPO" rev-parse refs/remotes/runner/f)" = "$d2_tip" ]
 }
 
@@ -7920,4 +7920,337 @@ _setup_sweep_test_with_checkout() {
   # Warning logged.
   grep -q "keeping refs/remotes/runner/foo.*refs/heads/foo" "$sw_log"
   [ "${#RUN_SWEPT_REFS[@]}" -eq 0 ]
+}
+
+# === Publisher step 3: the Shared remote (ADR-0011) ========================
+#
+# propagate_feature's third step fast-forwards the dispatch's commit onto
+# `<shared-remote>/<branch>` from the host repo — never a force push. These
+# tests run against a real host repo, a runner-checkout cloned from it, and a
+# bare repo standing in for the Shared remote.
+
+# Builds on setup_propagate_test: adds a bare repo at $SHARED_BARE, registers
+# it in the host repo as remote $1 (default `origin`), and seeds its `f`
+# branch with the host's `f` tip. Host HEAD moves to `master` so the step-2
+# host fast-forward is not the variable under test.
+setup_shared_remote_test() {
+  local remote_name="${1:-origin}"
+  setup_propagate_test
+  SHARED_BARE="$BATS_TEST_TMPDIR/shared-${remote_name}.git"
+  git init --quiet --bare --initial-branch=f "$SHARED_BARE"
+  git -C "$HOST_REPO" remote add "$remote_name" "$SHARED_BARE"
+  git -C "$HOST_REPO" push --quiet "$remote_name" f
+  git -C "$HOST_REPO" checkout --quiet -b master
+  unset RUNNER_SHARED_REMOTE
+}
+
+shared_tip() { git -C "$SHARED_BARE" rev-parse --verify "refs/heads/$1" 2>/dev/null || true; }
+
+# Makes the Shared remote's `f` diverge from the runner-checkout: a commit the
+# runner lacks lands on the remote (pushed from a scratch clone, as another
+# machine would). Prints the diverging commit's SHA.
+diverge_shared_remote() {
+  local other="$BATS_TEST_TMPDIR/other-machine"
+  git clone --quiet "$SHARED_BARE" "$other" >&2
+  git -C "$other" -c user.email=o@o -c user.name=o \
+    commit --allow-empty --quiet -m "someone else's work"
+  git -C "$other" push --quiet origin f >&2
+  git -C "$other" rev-parse HEAD
+}
+
+@test "publish — published: the Shared remote's branch is fast-forwarded to the dispatch's commit" {
+  setup_shared_remote_test
+  git -C "$HOST_CHECKOUT" -c user.email=t@t -c user.name=t \
+    commit --allow-empty --quiet -m "tracker: f/01 → in-review"
+  local checkout_tip
+  checkout_tip="$(git -C "$HOST_CHECKOUT" rev-parse HEAD)"
+
+  propagate_feature "f" >"$BATS_TEST_TMPDIR/out" 2>&1
+
+  [ "$(git -C "$HOST_REPO" ls-remote origin refs/heads/f | cut -f1)" = "$checkout_tip" ]
+  [ "$RUNNER_LAST_PROPAGATION" = "published → origin/f" ]
+  [ "$RUNNER_PUBLISH_PARKED" = "0" ]
+  # Parking ref and host branch still advance as before.
+  [ "$(git -C "$HOST_REPO" rev-parse refs/remotes/runner/f)" = "$checkout_tip" ]
+  [ "$(git -C "$HOST_REPO" rev-parse refs/heads/f)" = "$checkout_tip" ]
+  # The progress line carries the publish state.
+  grep -q "published → origin/f" "$BATS_TEST_TMPDIR/out"
+}
+
+@test "publish — published even when the host fast-forward is refused (HEAD on the branch)" {
+  setup_shared_remote_test
+  git -C "$HOST_REPO" checkout --quiet f
+  git -C "$HOST_CHECKOUT" -c user.email=t@t -c user.name=t \
+    commit --allow-empty --quiet -m "tracker: f/01 → in-review"
+  local checkout_tip
+  checkout_tip="$(git -C "$HOST_CHECKOUT" rev-parse HEAD)"
+
+  propagate_feature "f" >/dev/null 2>&1
+
+  [ "$(shared_tip f)" = "$checkout_tip" ]
+  [ "$RUNNER_LAST_PROPAGATION" = "published → origin/f" ]
+}
+
+@test "publish — parked on divergence: remote unchanged, work on the parking ref, no force push" {
+  setup_shared_remote_test
+  local theirs
+  theirs="$(diverge_shared_remote)"
+  git -C "$HOST_CHECKOUT" -c user.email=t@t -c user.name=t \
+    commit --allow-empty --quiet -m "tracker: f/01 → in-review"
+  local checkout_tip
+  checkout_tip="$(git -C "$HOST_CHECKOUT" rev-parse HEAD)"
+
+  local rc=0
+  propagate_feature "f" >"$BATS_TEST_TMPDIR/out" 2>"$BATS_TEST_TMPDIR/err" || rc=$?
+
+  # Not an error: the work is safe on the parking ref.
+  [ "$rc" -eq 0 ]
+  [ "$RUNNER_LAST_PROPAGATION" = "parked → runner/f" ]
+  [ "$RUNNER_PUBLISH_PARKED" = "1" ]
+  [ "$(git -C "$HOST_REPO" rev-parse refs/remotes/runner/f)" = "$checkout_tip" ]
+  # No force push: the remote branch still points at the other machine's
+  # commit, which stays reachable, and the runner's commit is not on it.
+  [ "$(shared_tip f)" = "$theirs" ]
+  git -C "$SHARED_BARE" merge-base --is-ancestor "$theirs" refs/heads/f
+  ! git -C "$SHARED_BARE" cat-file -e "$checkout_tip^{commit}" 2>/dev/null
+  grep -q "publish refused" "$BATS_TEST_TMPDIR/err"
+  grep -q "parked → runner/f (git pull runner f)" "$BATS_TEST_TMPDIR/out"
+}
+
+@test "publish — other push errors (unreachable remote) classify as parked with git's stderr" {
+  setup_shared_remote_test
+  git -C "$HOST_REPO" remote set-url origin "$BATS_TEST_TMPDIR/no-such-remote.git"
+  git -C "$HOST_CHECKOUT" -c user.email=t@t -c user.name=t \
+    commit --allow-empty --quiet -m "tracker: f/01 → in-review"
+
+  local rc=0
+  propagate_feature "f" >/dev/null 2>"$BATS_TEST_TMPDIR/err" || rc=$?
+
+  [ "$rc" -eq 0 ]
+  [ "$RUNNER_LAST_PROPAGATION" = "parked → runner/f" ]
+  [ "$RUNNER_PUBLISH_PARKED" = "1" ]
+  grep -q "publish refused" "$BATS_TEST_TMPDIR/err"
+  # git's own diagnostic reaches runner.log.
+  grep -qi "does not appear to be a git repository\|not found\|fatal" "$BATS_TEST_TMPDIR/err" || {
+    cat "$BATS_TEST_TMPDIR/err"; false; }
+}
+
+@test "publish — local-only: no Shared remote, behaviour as before plus local-only" {
+  setup_propagate_test
+  git -C "$HOST_REPO" checkout --quiet -b master
+  git -C "$HOST_CHECKOUT" -c user.email=t@t -c user.name=t \
+    commit --allow-empty --quiet -m "tracker: f/01 → in-review"
+  local checkout_tip
+  checkout_tip="$(git -C "$HOST_CHECKOUT" rev-parse HEAD)"
+
+  propagate_feature "f" >/dev/null 2>"$BATS_TEST_TMPDIR/err"
+
+  [ "$RUNNER_LAST_PROPAGATION" = "local-only (propagated → host)" ]
+  [ "$RUNNER_PUBLISH_PARKED" = "0" ]
+  [ "$(git -C "$HOST_REPO" rev-parse refs/heads/f)" = "$checkout_tip" ]
+  [ "$(git -C "$HOST_REPO" rev-parse refs/remotes/runner/f)" = "$checkout_tip" ]
+  [ ! -s "$BATS_TEST_TMPDIR/err" ]
+}
+
+@test "publish — RUNNER_SHARED_REMOTE=upstream pushes to upstream, not origin" {
+  setup_shared_remote_test upstream
+  local upstream_bare="$SHARED_BARE"
+  # An `origin` also exists; it must not be touched.
+  local origin_bare="$BATS_TEST_TMPDIR/origin.git"
+  git init --quiet --bare --initial-branch=f "$origin_bare"
+  git -C "$HOST_REPO" remote add origin "$origin_bare"
+  git -C "$HOST_REPO" push --quiet origin f
+  local origin_before
+  origin_before="$(git -C "$origin_bare" rev-parse refs/heads/f)"
+  git -C "$HOST_CHECKOUT" -c user.email=t@t -c user.name=t \
+    commit --allow-empty --quiet -m "tracker: f/01 → in-review"
+  local checkout_tip
+  checkout_tip="$(git -C "$HOST_CHECKOUT" rev-parse HEAD)"
+
+  RUNNER_SHARED_REMOTE=upstream
+  propagate_feature "f" >/dev/null 2>&1
+
+  [ "$(git -C "$upstream_bare" rev-parse refs/heads/f)" = "$checkout_tip" ]
+  [ "$(git -C "$origin_bare" rev-parse refs/heads/f)" = "$origin_before" ]
+  [ "$RUNNER_LAST_PROPAGATION" = "published → upstream/f" ]
+}
+
+@test "publish — RUNNER_SHARED_REMOTE naming a missing remote is local-only" {
+  setup_shared_remote_test
+  local before
+  before="$(shared_tip f)"
+  git -C "$HOST_CHECKOUT" -c user.email=t@t -c user.name=t \
+    commit --allow-empty --quiet -m "tracker: f/01 → in-review"
+
+  RUNNER_SHARED_REMOTE=upstream
+  propagate_feature "f" >/dev/null 2>&1
+
+  [ "$RUNNER_LAST_PROPAGATION" = "local-only (propagated → host)" ]
+  [ "$(shared_tip f)" = "$before" ]
+}
+
+@test "dispatch_one — Shared remote holds the implement commit before the first post-implement step starts" {
+  setup_dispatch_one_test
+  install_afk_snapshots done
+  setup_shared_remote_test
+
+  local seen_file="$BATS_TEST_TMPDIR/seen-at-review-start"
+  local impl_tip_file="$BATS_TEST_TMPDIR/impl-tip"
+  run_item_container() {
+    # Record what the Shared remote serves as the step starts, and the
+    # runner-checkout tip (the implement commit) at that moment.
+    git -C "$HOST_REPO" ls-remote origin refs/heads/f | cut -f1 >"$seen_file"
+    git -C "$HOST_CHECKOUT" rev-parse HEAD >"$impl_tip_file"
+    git -C "$HOST_CHECKOUT" -c user.email=t@t -c user.name=t \
+      commit --allow-empty --quiet -m "tracker: review f/01 → done"
+    return 0
+  }
+
+  RUN_DISPATCHES=()
+  dispatch_one "f" "01" "$TEST_RUN_DIR" >/dev/null 2>&1
+
+  [ -s "$seen_file" ]
+  [ "$(cat "$seen_file")" = "$(cat "$impl_tip_file")" ]
+  # The review step's own commit is published too.
+  [ "$(shared_tip f)" = "$(git -C "$HOST_CHECKOUT" rev-parse HEAD)" ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|done|"*"|published → origin/f" ]]
+}
+
+@test "dispatch_one — diverged Shared remote: implement parked, walk not started, remote unchanged" {
+  setup_dispatch_one_test
+  install_afk_snapshots done
+  setup_shared_remote_test
+  local theirs
+  theirs="$(diverge_shared_remote)"
+
+  local walk_file="$BATS_TEST_TMPDIR/walk-started"
+  : >"$walk_file"
+  run_item_container() { echo started >>"$walk_file"; return 0; }
+
+  RUN_DISPATCHES=()
+  RUN_STOP_REASON=""
+  local rc=0
+  dispatch_one "f" "01" "$TEST_RUN_DIR" >/dev/null 2>&1 || rc=$?
+
+  [ "$rc" -eq 0 ]
+  [ "$RUNNER_PUBLISH_PARKED" = "1" ]
+  [ ! -s "$walk_file" ]
+  [ "$(shared_tip f)" = "$theirs" ]
+  [ "$(git -C "$HOST_REPO" rev-parse refs/remotes/runner/f)" = "$(git -C "$HOST_CHECKOUT" rev-parse HEAD)" ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|in-review|"*"|parked → runner/f" ]]
+}
+
+@test "dispatch_one — Shared remote refuses a walk step's commit: walk stops, left-for-human" {
+  setup_dispatch_one_test
+  install_afk_snapshots in-review
+  setup_shared_remote_test
+  # Two-step manifest; the remote diverges while step 1 runs.
+  RESOLVED_MANIFEST="$(printf 'review\t%s\nfix\t%s\n' "$HERE/review-and-gate.md" "$HERE/review-and-gate.md")"
+  local steps_file="$BATS_TEST_TMPDIR/steps"
+  : >"$steps_file"
+  run_item_container() {
+    echo step >>"$steps_file"
+    diverge_shared_remote >/dev/null
+    git -C "$HOST_CHECKOUT" -c user.email=t@t -c user.name=t \
+      commit --allow-empty --quiet -m "tracker: review f/01 comment"
+    return 0
+  }
+
+  RUN_DISPATCHES=()
+  local rc=0
+  dispatch_one "f" "01" "$TEST_RUN_DIR" >/dev/null 2>&1 || rc=$?
+
+  [ "$rc" -eq 0 ]
+  [ "$RUNNER_PUBLISH_PARKED" = "1" ]
+  [ "$(wc -l <"$steps_file" | tr -d ' ')" = "1" ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|left-for-human|"*"|parked → runner/f" ]]
+}
+
+@test "run_loop — a parked publish stops the loop on the feature with publish-parked" {
+  setup_loop_test
+  plant_queue 01 02
+
+  dispatch_one() {
+    local feature="$1" nn="$2"
+    echo "$feature/$nn" >>"$TEST_DISPATCHED_FILE"
+    local rest
+    rest="$(tail -n +2 "$TEST_QUEUE_FILE" 2>/dev/null || true)"
+    printf '%s\n' "$rest" >"$TEST_QUEUE_FILE"
+    RUNNER_PUBLISH_PARKED=1
+    RUNNER_LAST_PROPAGATION="parked → runner/$feature"
+    return 0
+  }
+
+  RUN_STOP_REASON=""
+  local rc=0
+  run_loop >"$BATS_TEST_TMPDIR/out" 2>&1 || rc=$?
+
+  [ "$rc" -eq 0 ]
+  [ "$RUN_STOP_REASON" = "publish-parked" ]
+  [ "$(dispatched_count)" = "1" ]
+  grep -q "Shared remote refused" "$BATS_TEST_TMPDIR/out"
+}
+
+@test "run_drain — a parked feature stops; the drain continues with the next feature" {
+  setup_drain_test
+  DISCOVERY_JSON='["alpha","beta"]'
+  git -C "$HOST_REPO" branch alpha
+  git -C "$HOST_REPO" branch beta
+
+  run_loop() {
+    echo "$TARGET_FEATURE" >>"$DRAIN_DRAINED_FILE"
+    if [ "$TARGET_FEATURE" = "alpha" ]; then
+      RUN_STOP_REASON="publish-parked"
+      return 0
+    fi
+    RUN_STOP_REASON="queue-empty"
+    return 0
+  }
+
+  local rc=0
+  run_drain >/dev/null 2>&1 || rc=$?
+
+  [ "$rc" -eq 0 ]
+  [ "$RUN_STOP_REASON" = "completed" ]
+  [ "$(drained_features_count)" = "2" ]
+  [ "$(drain_outcome_nth 0)" = "alpha|parked" ]
+  [ "$(drain_outcome_nth 1)" = "beta|drained" ]
+}
+
+@test "format_multi_feature_summary_md — parked feature renders its table and the parked ledger" {
+  input='F|alpha|parked
+I|alpha|01|alpha/01|in-review|42||1|parked → runner/alpha
+F|beta|drained
+I|beta|01|beta/01|done|10|01-review|1|published → origin/beta'
+  result="$(printf '%s\n' "$input" | format_multi_feature_summary_md "ts" "10:00" "10:05" "ended" "completed")"
+
+  echo "$result" | grep -qF '## alpha — parked (Shared remote refused the fast-forward)'
+  echo "$result" | grep -qF '| alpha/01 | in-review | 42s | parked → runner/alpha |'
+  echo "$result" | grep -qF '| beta/01 | done | 10s | published → origin/beta |'
+  echo "$result" | grep -qF -- '- **alpha** (1 dispatch): `git pull runner alpha`'
+  ! echo "$result" | grep -qF -- '- **beta**'
+}
+
+@test "format_parked_ledger — local-only parked counts; published and local-only propagated do not" {
+  input='f|01|f/01|done|10|y|1|local-only (parked → runner/f)
+g|01|g/01|done|10|y|1|published → origin/g
+h|01|h/01|done|10|y|1|local-only (propagated → host)'
+  result="$(printf '%s\n' "$input" | format_parked_ledger)"
+  echo "$result" | grep -qF -- '- **f** (1 dispatch): `git pull runner f`'
+  ! echo "$result" | grep -qF -- '**g**'
+  ! echo "$result" | grep -qF -- '**h**'
+}
+
+@test "format_end_of_run_table — publish-state indicators render in the propagation column" {
+  input='f|01|f/01|done|10|y|1|published → origin/f
+f|02|f/02|in-review|10|y|1|local-only (propagated → host)'
+  result="$(printf '%s\n' "$input" | format_end_of_run_table "completed")"
+  echo "$result" | grep -qF 'published → origin/f'
+  echo "$result" | grep -qF 'local-only (propagated → host)'
+}
+
+@test "publish — no force push anywhere in propagate_feature's Shared-remote step" {
+  body="$(declare -f propagate_feature)"
+  ! grep -qE 'push[^|]*(--force|-f |\+\$|"\+)' <<<"$body"
+  grep -q 'push --quiet' <<<"$body"
 }
