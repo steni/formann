@@ -50,13 +50,17 @@
 #   - `runaway-halt (<ref>)`  — post-implement step pushed issue back to eligible.
 #   - `preflight-abort: discovery` — `tracker-snapshot --list` failed.
 #   A feature another runner holds a Claim on (claim.sh) is skipped with a
-#   `held-by <machine>` row; not a stop.
+#   `held-by <machine>` row; not a stop. A feature whose claim another runner
+#   took over mid-drain stops after the dispatch in flight with a
+#   `taken-over-by <machine>` row; not a stop either.
 #
 # Stop reasons (narrowed modes):
 #   - `queue-empty` / `interrupted` / `snapshot-failed` / `propagation-error`.
 #   - `runaway-halt (<ref>)`  — post-implement step pushed issue back to eligible.
 #   - `held-by <machine>` / `claim-failed` (--feature) — the feature's Claim
 #     is another runner's, or could not be taken.
+#   - `taken-over-by <machine>` (--feature) — a heartbeat found the claim
+#     taken over; the loop stopped after the dispatch in flight.
 #   - `feature-restricted (refused: <reason>)` (--feature).
 #   - `single-dispatch (success|failure|refused: <reason>)` (--issue).
 #
@@ -966,6 +970,12 @@ format_multi_feature_summary_md() {
         in_drained = 1;
         in_table = 1;
       }
+      else if (substr(outcome, 1, 14) == "taken-over-by ") {
+        printf "## %s — %s (stopped after its current dispatch)\n\n", feature, outcome;
+        emit_table_header();
+        in_drained = 1;
+        in_table = 1;
+      }
       else if (substr(outcome, 1, 8) == "held-by ") {
         printf "## %s — %s\n\n", feature, outcome;
       }
@@ -1213,6 +1223,7 @@ RUNNER_TEE_PID=""
 RUNNER_LOG_FIFO=""
 RUNNER_LAST_PROPAGATION=""   # 'published → <remote>/<branch>' | 'parked → runner/<branch>' | 'local-only (<host indicator>)' | '' (set by propagate_feature)
 RUNNER_PUBLISH_PARKED=0      # 1 when propagate_feature's Shared-remote push was refused; stops the loop on the feature
+RUNNER_CLAIM_LOST=""          # 'taken-over-by <machine>' once a heartbeat found the claim taken over (heartbeat_claim); stops the loop on the feature after the dispatch in flight
 RUN_SWEPT_REFS=()     # parking refs deleted by sweep_stale_parking_refs; populated during pre-flight
 DISCOVERY_JSON=""     # populated by check_discovery pre-flight invariant
 RESOLVED_MANIFEST=""  # populated by check_manifest pre-flight invariant; tab-delimited label<TAB>path pairs
@@ -1361,7 +1372,8 @@ print_multi_feature_records() {
     feature="${rec%%|*}"
     outcome="${rec#*|}"
     printf 'F|%s|%s\n' "$feature" "$outcome"
-    if { [ "$outcome" = "drained" ] || [ "$outcome" = "parked" ]; } \
+    if { [ "$outcome" = "drained" ] || [ "$outcome" = "parked" ] \
+          || [ "${outcome#taken-over-by }" != "$outcome" ]; } \
         && [ "${#RUN_DISPATCHES[@]}" -gt 0 ]; then
       local d_rec d_feature
       for d_rec in "${RUN_DISPATCHES[@]}"; do
@@ -3417,6 +3429,10 @@ walk_post_implement_steps() {
     item_start_clock="$(now_clock)"
     format_progress_start "$item_start_clock" "$ref" "$item_label"
 
+    # Between dispatches: refresh the claim. A lost claim doesn't stop the
+    # walk in flight; run_loop stops the feature once it returns.
+    heartbeat_claim
+
     # Capture HEAD before dispatch to detect a commit delta.
     local pre_item_head
     pre_item_head="$(git -C "$HOST_CHECKOUT" rev-parse HEAD 2>/dev/null || true)"
@@ -4156,6 +4172,15 @@ run_loop() {
       return 0
     fi
 
+    # Between dispatches: refresh the claim. A claim another runner took
+    # over means no further issue on this feature.
+    heartbeat_claim
+    if [ -n "$RUNNER_CLAIM_LOST" ]; then
+      echo "[$(now_clock)] runner: '$TARGET_FEATURE' was $RUNNER_CLAIM_LOST; taking no further issue on it"
+      RUN_STOP_REASON="$RUNNER_CLAIM_LOST"
+      return 0
+    fi
+
     # Re-sync the runner-checkout to host's tip before each dispatch,
     # so any stray uncommitted dirt from a failed prior dispatch never
     # leaks into the next container. In drain mode the wrapper soft-fails
@@ -4209,6 +4234,14 @@ run_loop() {
       return 0
     fi
 
+    # Claim lost during the dispatch's walk (a heartbeat between its steps
+    # was refused): the dispatch has finished; take no further issue.
+    if [ -n "$RUNNER_CLAIM_LOST" ]; then
+      echo "[$(now_clock)] runner: '$TARGET_FEATURE' was $RUNNER_CLAIM_LOST during $ref; stopping this feature"
+      RUN_STOP_REASON="$RUNNER_CLAIM_LOST"
+      return 0
+    fi
+
     # Make `set -e` happy — dispatch_rc is consumed, not propagated.
     : "$dispatch_rc"
   done
@@ -4235,8 +4268,7 @@ run_claimed_loop() {
       return 0
       ;;
   esac
-  echo "[$(now_clock)] runner: claimed $TARGET_FEATURE on $(claim_shared_remote) ($(claim_ref "$TARGET_FEATURE"))"
-  post_claim_note "$TARGET_FEATURE"
+  announce_claim "$TARGET_FEATURE"
   local rc=0
   run_loop || rc=$?
   claim_release_held
@@ -4353,8 +4385,7 @@ drain_one_feature() {
         return 0
         ;;
     esac
-    echo "[$(now_clock)] runner: claimed $feature on $(claim_shared_remote) ($(claim_ref "$feature"))"
-    post_claim_note "$feature"
+    announce_claim "$feature"
   fi
 
   drain_claimed_feature "$feature"
@@ -4419,6 +4450,12 @@ drain_claimed_feature() {
       # The feature stops; the drain continues with the next one.
       record_feature_outcome "$feature" "parked"
       ;;
+    taken-over-by\ *)
+      # Another runner took the claim over while this one drained: the
+      # dispatch in flight finished, no further issue was taken, and the
+      # claim (no longer ours) is not released. The drain moves on.
+      record_feature_outcome "$feature" "$inner_reason"
+      ;;
     fetch-failed)
       # Per-iteration `ensure_runner_checkout` failure inside the per-issue
       # loop (the wrapper soft-fails in drain mode rather than aborting the
@@ -4432,6 +4469,48 @@ drain_claimed_feature() {
   esac
 }
 
+# Log a claim just taken (CLAIM_RESULT `taken` or `taken-over-from
+# <machine>`) and announce it with the tracker Note. Clears any lost-claim
+# state from an earlier feature or pass.
+announce_claim() {
+  local feature="$1"
+  RUNNER_CLAIM_LOST=""
+  case "$CLAIM_RESULT" in
+    taken-over-from\ *)
+      echo "[$(now_clock)] runner: took over the stale claim on $feature (${CLAIM_RESULT#taken-over-from }'s heartbeat is older than $(claim_stale_after)s) on $(claim_shared_remote) ($(claim_ref "$feature"))"
+      ;;
+    *)
+      echo "[$(now_clock)] runner: claimed $feature on $(claim_shared_remote) ($(claim_ref "$feature"))"
+      ;;
+  esac
+  post_claim_note "$feature" "$CLAIM_RESULT"
+}
+
+# Refresh the held claim's heartbeat, between dispatches (before each
+# /implement dispatch and before each post-implement step). No claim held
+# (no Shared remote, --issue, or already lost): nothing to do.
+#   ok        → the claim's heartbeat is fresh.
+#   lost-to X → another runner took it over: RUNNER_CLAIM_LOST becomes
+#               `taken-over-by X`; the claim is not ours to release.
+#   error     → remote unreachable: logged, tried again at the next point;
+#               the drain goes on.
+heartbeat_claim() {
+  [ -n "${CLAIM_HELD_FEATURE:-}" ] || return 0
+  local feature="$CLAIM_HELD_FEATURE"
+  claim heartbeat "$feature" >/dev/null || true
+  case "$CLAIM_RESULT" in
+    ok) ;;
+    lost-to\ *)
+      RUNNER_CLAIM_LOST="taken-over-by ${CLAIM_RESULT#lost-to }"
+      echo "[$(now_clock)] runner: lost the claim on $feature — $RUNNER_CLAIM_LOST; finishing the dispatch in flight, then stopping this feature"
+      ;;
+    *)
+      echo "[$(now_clock)] runner: could not refresh the claim on $feature (see above); trying again at the next heartbeat"
+      ;;
+  esac
+  return 0
+}
+
 # Announce a taken claim on the tracker: a `Note` on the feature's parent,
 # through the binding's `comment-on-feature` script on the role surface
 # (the "Comment with `<kind>`" verb). Information only — the claim ref is
@@ -4441,7 +4520,7 @@ drain_claimed_feature() {
 # into the runner-checkout; that commit is propagated at once, so the
 # per-dispatch re-sync doesn't wipe it.
 post_claim_note() {
-  local feature="$1"
+  local feature="$1" how="${2:-taken}"
   local script="$HOST_REPO/docs/formann/issue-tracker/comment-on-feature"
   if [ ! -x "$script" ]; then
     echo "[$(now_clock)] runner: no comment-on-feature script on the role surface; claim Note not posted"
@@ -4449,11 +4528,15 @@ post_claim_note() {
   fi
   local head_before head_after machine body
   head_before="$(git -C "$HOST_CHECKOUT" rev-parse --verify --quiet HEAD 2>/dev/null || true)"
+  local verb="Claimed"
+  case "$how" in
+    taken-over-from\ *) verb="Taken over from \`${how#taken-over-from }\` (its claim was stale)" ;;
+  esac
   machine="$(claim_machine)"
   body="$(cat <<NOTE
 > *This was generated by the AFK runner.*
 
-Claimed by the runner on \`${machine}\` (run \`${RUN_TS:-unknown}\`, Formann \`${RUNNER_FORMANN_SHA:-unknown}\`). The claim is the ref \`$(claim_ref "$feature")\` on the Shared remote; this comment is information, never the lock. It is released when the drain ends.
+${verb} by the runner on \`${machine}\` (run \`${RUN_TS:-unknown}\`, Formann \`${RUNNER_FORMANN_SHA:-unknown}\`). The claim is the ref \`$(claim_ref "$feature")\` on the Shared remote; this comment is information, never the lock. It is released when the drain ends.
 NOTE
 )"
   if ! ( cd "$HOST_REPO" && printf '%s\n' "$body" \

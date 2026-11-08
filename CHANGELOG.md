@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- AFK runner heart-beats its Claim between dispatches (before each `/implement` and each
+  post-implement step). A claim without a heartbeat for thirty minutes (`RUNNER_CLAIM_STALE_AFTER`,
+  default 1800 s, judged by each reader's own clock) is stale and is taken over with a lease push on
+  its sha, so a crashed runner no longer holds a feature forever. A runner whose claim was taken over
+  finishes its current dispatch, stops on the feature, and reports `taken-over-by <machine>`.
 - AFK runner takes a Claim on each feature it drains — the ref `refs/formann/claims/<feature>`
   on the Shared remote, taken with a lease push that expects it absent — so two runners on two
   machines never drain the same feature. A feature another runner holds is skipped (`held-by

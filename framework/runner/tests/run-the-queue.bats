@@ -9874,3 +9874,228 @@ DRIVER
   grep -qF '1 pass(es) in total; 1 found nothing to do.' "$run_dir/SUMMARY.md"
   grep -qF 'stop reason: interrupted' "$BATS_TEST_TMPDIR/out"
 }
+
+# === Claim heartbeat and takeover in the drain loop (#8) ===================
+
+# Another runner (machine $2), judging the claim on feature $1 stale by its
+# own clock, takes it over. Uses $SHARED_CLAIMS as the Shared remote.
+take_over_by_other() {
+  local other="$BATS_TEST_TMPDIR/taker-$2"
+  [ -d "$other" ] || { git init --quiet "$other"; git -C "$other" remote add origin "$SHARED_CLAIMS"; }
+  (
+    HOST_REPO="$other"; RUNNER_MACHINE="$2"
+    claim_now_epoch() { echo $(( $(date +%s) + 7200 )); }
+    claim take "$1" >/dev/null
+    [ "$CLAIM_RESULT" = "taken-over-from m1" ] || { echo "takeover failed: $CLAIM_RESULT" >&2; exit 1; }
+  )
+}
+
+claims_remote_field() {
+  claim_field "$(git -C "$SHARED_CLAIMS" log -1 --format=%B "refs/formann/claims/$1")" "$2"
+}
+
+# The loop harness plus a bare Shared remote as the host's origin, and this
+# runner (m1) holding the claim on `f` with a heartbeat from long ago — as if
+# the previous dispatch had run for hours.
+setup_heartbeat_loop_test() {
+  setup_loop_test
+  unset RUNNER_SHARED_REMOTE RUNNER_CLAIM_STALE_AFTER
+  SHARED_CLAIMS="$BATS_TEST_TMPDIR/claims.git"
+  git init --quiet --bare --initial-branch=main "$SHARED_CLAIMS"
+  git -C "$HOST_REPO" remote add origin "$SHARED_CLAIMS"
+  RUNNER_MACHINE="m1"
+  RUN_TS="20261108-120000"
+  RUNNER_CLAIM_LOST=""
+  local tree sha
+  tree="$(git -C "$HOST_REPO" mktree </dev/null)"
+  sha="$(claim_message m1 "$RUN_TS" unknown 2000-01-01T00:00:00Z \
+    | git -C "$HOST_REPO" -c user.email=t@t -c user.name=t commit-tree "$tree")"
+  git -C "$HOST_REPO" push --quiet origin "$sha:refs/formann/claims/f"
+  CLAIM_HELD_FEATURE="f"
+  CLAIM_HELD_SHA="$sha"
+  HEARTBEATS_FILE="$BATS_TEST_TMPDIR/heartbeats"
+  : >"$HEARTBEATS_FILE"
+  # Each dispatch records the claim on the Shared remote as it starts:
+  # its sha, holder, and heartbeat age by this clock.
+  dispatch_one() {
+    local feature="$1" nn="$2"
+    echo "$feature/$nn" >>"$TEST_DISPATCHED_FILE"
+    local rest
+    rest="$(tail -n +2 "$TEST_QUEUE_FILE" 2>/dev/null || true)"
+    printf '%s\n' "$rest" >"$TEST_QUEUE_FILE"
+    [ -s "$TEST_QUEUE_FILE" ] || : >"$TEST_QUEUE_FILE"
+    local hb
+    hb="$(claims_remote_field f heartbeat)"
+    printf '%s %s %s\n' "$(git -C "$SHARED_CLAIMS" rev-parse refs/formann/claims/f)" \
+      "$(claims_remote_field f machine)" \
+      "$(( $(date +%s) - $(claim_iso_to_epoch "$hb") ))" >>"$HEARTBEATS_FILE"
+    [ -n "${HB_TAKEOVER_AT:-}" ] && [ "$(dispatched_count)" = "$HB_TAKEOVER_AT" ] \
+      && take_over_by_other f m2
+    return 0
+  }
+}
+
+@test "run_loop — claims (#8): a drain over several dispatches heart-beats before each, so the claim is never thirty minutes old" {
+  setup_heartbeat_loop_test
+  plant_queue 01 02 03
+
+  run_loop >"$BATS_TEST_TMPDIR/out" 2>&1
+
+  [ "$RUN_STOP_REASON" = "queue-empty" ]
+  [ "$(dispatched_count)" = "3" ]
+  [ "$(wc -l <"$HEARTBEATS_FILE" | tr -d ' ')" = "3" ]
+  local sha machine age
+  while read -r sha machine age; do
+    [ "$machine" = "m1" ]
+    # A fresh heartbeat at every dispatch (the planted one was from 2000).
+    # Two heartbeats in the same second are the same commit, so the age —
+    # not the sha — is what shows the refresh.
+    [ "$age" -le 5 ] || fail "heartbeat $age s old at a dispatch"
+  done <"$HEARTBEATS_FILE"
+  [ "$CLAIM_HELD_SHA" = "$(git -C "$SHARED_CLAIMS" rev-parse refs/formann/claims/f)" ]
+  [ "$(claim_verdict "$(git -C "$SHARED_CLAIMS" log -1 --format=%B refs/formann/claims/f)" "$(date +%s)" 1800)" = "held" ]
+}
+
+@test "run_loop — claims (#8): a claim taken over mid-dispatch stops the feature after that dispatch: taken-over-by <machine>, the claim not released" {
+  setup_heartbeat_loop_test
+  plant_queue 01 02 03
+  HB_TAKEOVER_AT=1
+
+  run_loop >"$BATS_TEST_TMPDIR/out" 2>&1
+
+  [ "$RUN_STOP_REASON" = "taken-over-by m2" ]
+  # The dispatch in flight finished; no further issue was taken.
+  [ "$(dispatched_count)" = "1" ]
+  [ "$(claims_remote_field f machine)" = "m2" ]
+  [ -z "$CLAIM_HELD_FEATURE" ]
+  claim_release_held >/dev/null
+  [ "$(claims_remote_field f machine)" = "m2" ]
+  grep -q "taken-over-by m2" "$BATS_TEST_TMPDIR/out"
+}
+
+@test "run_loop — claims (#8): a heartbeat that fails for a network reason doesn't stop the drain" {
+  setup_heartbeat_loop_test
+  plant_queue 01 02
+  git -C "$HOST_REPO" remote set-url origin "$BATS_TEST_TMPDIR/missing.git"
+  dispatch_one() {
+    echo "$1/$2" >>"$TEST_DISPATCHED_FILE"
+    local rest
+    rest="$(tail -n +2 "$TEST_QUEUE_FILE" 2>/dev/null || true)"
+    printf '%s\n' "$rest" >"$TEST_QUEUE_FILE"
+    [ -s "$TEST_QUEUE_FILE" ] || : >"$TEST_QUEUE_FILE"
+    return 0
+  }
+
+  run_loop >"$BATS_TEST_TMPDIR/out" 2>&1
+
+  [ "$RUN_STOP_REASON" = "queue-empty" ]
+  [ "$(dispatched_count)" = "2" ]
+  [ "$CLAIM_HELD_FEATURE" = "f" ]
+  grep -q "trying again at the next heartbeat" "$BATS_TEST_TMPDIR/out"
+}
+
+@test "dispatch_one — claims (#8): a heartbeat before every post-implement step; a takeover mid-walk lets the walk finish and marks the claim lost" {
+  setup_dispatch_one_test
+  install_afk_snapshots in-review
+  setup_shared_remote_test
+  SHARED_CLAIMS="$SHARED_BARE"
+  RUNNER_MACHINE="m1"
+  RUNNER_CLAIM_LOST=""
+  # This runner holds the claim on f, last heart-beat long ago.
+  local tree taken_sha
+  tree="$(git -C "$HOST_REPO" mktree </dev/null)"
+  taken_sha="$(claim_message m1 r0 unknown 2000-01-01T00:00:00Z \
+    | git -C "$HOST_REPO" -c user.email=t@t -c user.name=t commit-tree "$tree")"
+  git -C "$HOST_REPO" push --quiet origin "$taken_sha:refs/formann/claims/f"
+  CLAIM_HELD_FEATURE="f"; CLAIM_HELD_SHA="$taken_sha"
+  RESOLVED_MANIFEST="$(printf 'review\t%s\nfix\t%s\n' "$HERE/review-and-gate.md" "$HERE/review-and-gate.md")"
+  local steps_file="$BATS_TEST_TMPDIR/steps"
+  : >"$steps_file"
+  run_item_container() {
+    printf '%s\n' "$(git -C "$SHARED_CLAIMS" rev-parse refs/formann/claims/f)" >>"$steps_file"
+    # During the first step another runner takes the claim over.
+    [ "$(wc -l <"$steps_file" | tr -d ' ')" = "1" ] && take_over_by_other f m2
+    return 0
+  }
+
+  RUN_DISPATCHES=()
+  dispatch_one "f" "01" "$TEST_RUN_DIR" >/dev/null 2>&1 || true
+
+  # Both steps ran: the dispatch in flight finishes.
+  [ "$(wc -l <"$steps_file" | tr -d ' ')" = "2" ]
+  # The first step started on a fresh heartbeat (not the old claim).
+  [ "$(sed -n 1p "$steps_file")" != "$taken_sha" ]
+  # The heartbeat before the second step found the claim taken over.
+  [ "$RUNNER_CLAIM_LOST" = "taken-over-by m2" ]
+  [ "$(claims_remote_field f machine)" = "m2" ]
+  [ -z "$CLAIM_HELD_FEATURE" ]
+}
+
+@test "drain_one_feature — claims (#8): a stale claim is taken over: logged, noted as a takeover, drained, released" {
+  setup_claim_drain_test
+  local other="$BATS_TEST_TMPDIR/dead-m2" tree sha
+  git init --quiet "$other"
+  tree="$(git -C "$other" mktree </dev/null)"
+  sha="$(claim_message m2 r0 unknown 2000-01-01T00:00:00Z \
+    | git -C "$other" -c user.email=t@t -c user.name=t commit-tree "$tree")"
+  git -C "$other" push --quiet "$SHARED" "$sha:refs/formann/claims/alpha"
+
+  drain_one_feature alpha >"$BATS_TEST_TMPDIR/out" 2>&1
+
+  [ "$(drain_outcome_nth 0)" = "alpha|drained" ]
+  [ "$(cat "$CLAIM_SEEN_FILE")" = "alpha m1" ]
+  grep -q "took over the stale claim on alpha (m2" "$BATS_TEST_TMPDIR/out"
+  grep -q 'Taken over from `m2`' "$NOTES_FILE"
+  ! git -C "$SHARED" rev-parse --verify --quiet refs/formann/claims/alpha
+}
+
+@test "run_drain — claims (#8): a feature taken over mid-drain reads taken-over-by <machine> with its dispatches; the claim is left to its new holder; the drain moves on" {
+  setup_claim_drain_test
+  DISCOVERY_JSON='["alpha","beta"]'
+  SHARED_CLAIMS="$SHARED"
+  run_loop() {
+    echo "$TARGET_FEATURE" >>"$DRAIN_DRAINED_FILE"
+    if [ "$TARGET_FEATURE" = "alpha" ]; then
+      record_dispatch alpha 01 "alpha/01" "in-review" 60 "" 1 "published → origin/alpha"
+      take_over_by_other alpha m2
+      heartbeat_claim
+      RUN_STOP_REASON="$RUNNER_CLAIM_LOST"
+      return 0
+    fi
+    RUN_STOP_REASON="queue-empty"
+    return 0
+  }
+
+  run_drain >"$BATS_TEST_TMPDIR/out" 2>&1
+
+  [ "$RUN_STOP_REASON" = "completed" ]
+  [ "$(drain_outcome_nth 0)" = "alpha|taken-over-by m2" ]
+  [ "$(drain_outcome_nth 1)" = "beta|drained" ]
+  [ "$(claims_remote_field alpha machine)" = "m2" ]
+  ! git -C "$SHARED" rev-parse --verify --quiet refs/formann/claims/beta
+
+  local summary
+  summary="$(print_multi_feature_records | format_multi_feature_summary_md \
+    "$RUN_TS" "12:00:00" "12:01:00" "ended" "completed")"
+  [[ "$summary" == *"## alpha — taken-over-by m2 (stopped after its current dispatch)"* ]]
+  [[ "$summary" == *"| alpha/01 | in-review |"* ]]
+  [[ "$summary" == *"## beta — drained"* ]]
+}
+
+@test "run_claimed_loop — claims (#8): loop mode reports stop reason taken-over-by <machine>" {
+  setup_claim_drain_test
+  RUN_MODE="loop"
+  SHARED_CLAIMS="$SHARED"
+  TARGET_FEATURE="alpha"
+  run_loop() {
+    take_over_by_other alpha m2
+    heartbeat_claim
+    RUN_STOP_REASON="$RUNNER_CLAIM_LOST"
+    return 0
+  }
+
+  run_claimed_loop >"$BATS_TEST_TMPDIR/out" 2>&1
+
+  [ "$RUN_STOP_REASON" = "taken-over-by m2" ]
+  [ "$(claims_remote_field alpha machine)" = "m2" ]
+}

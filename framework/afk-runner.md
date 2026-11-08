@@ -389,7 +389,7 @@ The runner stops on one of these run-level reasons. Pre-flight-phase stops and l
 - **`interrupted`** — Ctrl-C during the outer loop. The in-flight container, if any, receives SIGTERM; next feature is not started. Exit 0.
 - **`propagation-error`** — a parking-ref publish failed inside a feature's dispatch loop. The entire drain halts; no subsequent feature is considered. Exit 1.
 - A Shared-remote push refused inside a feature's loop is **not** a run-level stop: that feature's section reads `parked` and the drain moves on to the next feature.
-- A feature another runner holds a **Claim** on is skipped before its first dispatch — its section reads `held-by <machine>` — and the drain moves on to the next feature. See *Claims across machines* in the runner README.
+- A feature another runner holds a **Claim** on is skipped before its first dispatch — its section reads `held-by <machine>` — and the drain moves on to the next feature. A stale claim (no heartbeat for thirty minutes) is taken over instead. A feature whose claim another runner took over mid-drain stops after the dispatch in flight — its section reads `taken-over-by <machine>` — and the drain moves on. See *Claims across machines* in the runner README.
 - **`discovery-failed`** — `tracker-snapshot --list` exited non-zero or returned unparseable JSON. Surfaces as `preflight-abort: discovery` in the existing pre-flight stop family. Exit 2.
 
 ### Narrowed modes (`--feature`, `--issue`)
@@ -400,6 +400,7 @@ The runner stops on one of these run-level reasons. Pre-flight-phase stops and l
 - **`propagation-error`** — a parking-ref publish failed during a dispatch. The loop halts. Exit 1.
 - **`publish-parked`** — the Shared remote refused a fast-forward (its feature branch has commits the runner lacks), or the push failed. The work is on the parking ref; the loop stops on this feature. Exit 0.
 - **`held-by <machine>`** (`--feature`) — another runner holds the feature's Claim; nothing is dispatched. `claim-failed` when the claim couldn't be taken. Exit 0.
+- **`taken-over-by <machine>`** (`--feature`) — a heartbeat found the feature's Claim taken over by another runner; the loop stopped after the dispatch in flight, leaving the claim to its new holder. Exit 0.
 
 Single-dispatch mode (`--issue <ref>`) reports `single-dispatch (success|failure)`, or `single-dispatch (refused: <reason>)` when the named ref fails the eligibility gate (HITL type, wrong status, unmet blockers, missing from the feature snapshot, `unknown-feature`, or `snapshot-failed` if `tracker-snapshot` itself exited non-zero).
 
