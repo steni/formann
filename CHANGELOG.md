@@ -24,7 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A post-implement step that can't reach a dependency outside the run (a consumer's service, a
   preview environment) can end Blocked: it posts a `Blocked` comment and ends with
   `BLOCKED: <dependency>`. The runner leaves the issue's state alone, writes no abort flag, shows
-  `blocked (<dependency>)` and moves on; the third Blocked pass leaves the issue for a human. The
+  `blocked (<dependency>)` and moves on. The next run re-runs the walk from the blocked step,
+  without re-running `/implement`, and the third Blocked pass leaves the issue for a human. The
   pass count is read from the tracker through each binding's new `blocked-passes` script.
 
 ### Fixed

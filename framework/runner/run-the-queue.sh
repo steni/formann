@@ -1098,6 +1098,69 @@ write_abort_flag() {
     "$flag_type" "$dispatch" "$at" "$exit_code" "$rel_log" >"$abort_feature_dir/$nn"
 }
 
+# === Blocked-step markers ==================================================
+#
+# A step that ends Blocked (below the pass limit) leaves a marker at
+# `<host>/.runner-state/blocked/<feature>/<nn>` naming the step. Run
+# selection reads it to re-run the walk from that step on a later run without
+# re-running /implement. The marker only decides *what* to retry; the pass
+# count always comes from the tracker (read_blocked_passes), so a runner on
+# another machine continues the same count. Not an abort flag: it never stops
+# an issue from being dispatched.
+#
+# File shape (one `key: value` per line):
+#   step: <manifest item label>
+#   dependency: <dependency>
+#   at: <UTC timestamp>
+#
+# All three helpers are no-ops (empty read) when HOST_BLOCKED_DIR is unset.
+
+# Args: $1=feature  $2=nn  $3=step label  $4=dependency
+write_blocked_marker() {
+  local feature="$1" nn="$2" step="$3" dep="$4"
+  [ -n "${HOST_BLOCKED_DIR:-}" ] || return 0
+  mkdir -p "$HOST_BLOCKED_DIR/$feature"
+  printf 'step: %s\ndependency: %s\nat: %s\n' \
+    "$step" "$dep" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >"$HOST_BLOCKED_DIR/$feature/$nn"
+}
+
+# Args: $1=feature  $2=nn
+clear_blocked_marker() {
+  local feature="$1" nn="$2"
+  [ -n "${HOST_BLOCKED_DIR:-}" ] || return 0
+  rm -f "$HOST_BLOCKED_DIR/$feature/$nn"
+}
+
+# Print the step label a marker names, or nothing when there is no marker.
+# Args: $1=feature  $2=nn
+blocked_marker_step() {
+  local feature="$1" nn="$2"
+  [ -n "${HOST_BLOCKED_DIR:-}" ] || return 0
+  local f="$HOST_BLOCKED_DIR/$feature/$nn"
+  [ -f "$f" ] || return 0
+  sed -n 's/^step: //p' "$f" | head -n 1
+}
+
+# Issues whose walk ended Blocked during this run (`<feature>/<nn>`, one per
+# line). A Blocked issue is retried on the next run, never twice in one run —
+# until the idle loop (#6) exists, the next pass is the next run.
+RUN_BLOCKED_THIS_RUN=""
+
+# Print the step to retry for an issue, or nothing when it is not a Blocked
+# retry. A retry is an AFK issue at in-review with a Blocked marker that did
+# not end Blocked earlier in this run. The caller checks abort flags.
+#
+# Args: $1=feature  $2=nn  $3=status  $4=type
+blocked_retry_step() {
+  local feature="$1" nn="$2" status="$3" type="$4"
+  [ "$status" = "in-review" ] || return 0
+  [ "$type" = "AFK" ] || return 0
+  if printf '%s\n' "$RUN_BLOCKED_THIS_RUN" | grep -Fxq -- "$feature/$nn"; then
+    return 0
+  fi
+  blocked_marker_step "$feature" "$nn"
+}
+
 # === Per-run state =========================================================
 #
 # Globals describing the in-flight run. Set early (so even pre-flight
@@ -1500,6 +1563,7 @@ resolve_host_repo() {
   HOST_CHECKOUT="$HOST_REPO/$RUNNER_CHECKOUT_PATH"
   HOST_RUNS="$HOST_REPO/$RUNNER_RUNS_PATH"
   HOST_ABORT_DIR="$HOST_REPO/$RUNNER_ABORT_PATH"
+  HOST_BLOCKED_DIR="$HOST_REPO/$RUNNER_BLOCKED_PATH"
 }
 
 # === Pre-flight ============================================================
@@ -3232,6 +3296,15 @@ capture_dispatch_core_files() {
 #   $9  = impl_duration (seconds, accumulated into iter_duration)
 #   $10 = impl_attempts
 #   $11 = resolved_manifest (tab-delimited label<TAB>path, one per line)
+#   $12 = start_label (optional) — re-run the walk from this manifest item,
+#         skipping the items before it (a Blocked retry). Skipped items keep
+#         their manifest position in the step-log names. Empty = from the
+#         first item.
+#
+# Blocked markers: a `blocked` outcome writes the issue's Blocked marker
+# naming the step (write_blocked_marker); any other classified outcome, and
+# an exhausted manifest, clears it. Issues that end Blocked are added to
+# RUN_BLOCKED_THIS_RUN so the same run does not retry them.
 #
 # Side effects: record_dispatch called exactly once; write_abort_flag on
 # gate-failed/review-aborted; RUN_STOP_REASON set on propagation-error or
@@ -3247,6 +3320,7 @@ walk_post_implement_steps() {
   local post_implement_json="$7"
   local impl_label="$8" impl_duration="$9" impl_attempts="${10}"
   local resolved_manifest="${11}"
+  local start_label="${12:-}"
 
   local total_item_seconds=0
   local total_attempts="$impl_attempts"
@@ -3263,11 +3337,20 @@ walk_post_implement_steps() {
     total_items=$(( total_items + 1 ))
   done <<< "$resolved_manifest"
 
+  local skipping=0
+  [ -n "$start_label" ] && skipping=1
+
   while IFS=$'\t' read -r item_label item_path; do
     [ -z "$item_label" ] && continue
 
-    any_item_ran=1
     step_idx=$(( step_idx + 1 ))
+    if [ "$skipping" -eq 1 ]; then
+      if [ "$item_label" != "$start_label" ]; then
+        continue
+      fi
+      skipping=0
+    fi
+    any_item_ran=1
     local step_suffix
     step_suffix="$(printf '%02d' "$step_idx")-$item_label"
     if [ -z "$step_logs" ]; then
@@ -3376,12 +3459,19 @@ walk_post_implement_steps() {
     item_action="$(classify_item_action "$post_item_status" "$item_rc" \
       "$item_blocked" "$item_blocked_passes")"
 
+    # Only a `blocked` outcome keeps (rewrites) the marker; every other
+    # outcome means the step got past its dependency or the issue moved on.
+    if [ "$item_action" != "blocked" ]; then
+      clear_blocked_marker "$feature" "$nn"
+    fi
+
     case "$item_action" in
       blocked|left-for-human)
         # A dependency outside the run was unreachable. The issue keeps its
         # state and gets no abort flag; the walk stops here for this issue
-        # and the run moves on. Below the pass limit a later pass re-runs the
-        # walk; at the limit the issue is left for a human, the Blocked
+        # and the run moves on. Below the pass limit the Blocked marker names
+        # this step, and a later run re-runs the walk from it
+        # (retry_blocked_walk); at the limit the issue is left for a human, the Blocked
         # comments on its timeline being the reason. The step's commit (its
         # Blocked comment, under local-markdown) is propagated either way.
         local blocked_progress_label blocked_combined_label
@@ -3402,6 +3492,11 @@ walk_post_implement_steps() {
             RUN_STOP_REASON="propagation-error"
             return 1
           fi
+        fi
+        if [ "$item_action" = "blocked" ]; then
+          write_blocked_marker "$feature" "$nn" "$item_label" "$item_blocked_dep"
+          RUN_BLOCKED_THIS_RUN="${RUN_BLOCKED_THIS_RUN:+$RUN_BLOCKED_THIS_RUN
+}$feature/$nn"
         fi
         record_dispatch "$feature" "$nn" "$ref" "$blocked_combined_label" \
           "$iter_duration" "$step_logs" "$total_attempts"
@@ -3514,6 +3609,7 @@ walk_post_implement_steps() {
   # intentionally left at in-review for the maintainer; "left-for-human"
   # is the correct combined outcome for both cases (no abort flag).
   # step_logs is empty when no items ran (implement-only); non-empty otherwise.
+  clear_blocked_marker "$feature" "$nn"
   record_dispatch "$feature" "$nn" "$ref" "left-for-human" \
     "$(( impl_duration + total_item_seconds ))" "$step_logs" "$total_attempts"
   return 0
@@ -3574,6 +3670,11 @@ dispatch_one() {
   fi
 
   # === Implement stage =====================================================
+  # A fresh implement starts a fresh walk (and posts a new Implementation
+  # comment, which resets the Blocked count), so any Blocked marker left
+  # from an earlier walk is obsolete.
+  clear_blocked_marker "$feature" "$nn"
+
   local started_at start_clock
   started_at=$(date +%s)
   start_clock="$(now_clock)"
@@ -3779,6 +3880,66 @@ dispatch_one() {
     "$RESOLVED_MANIFEST"
 }
 
+# Re-run the post-implement walk of an issue whose walk ended Blocked on an
+# earlier run, starting from the blocked step. /implement is NOT re-run: its
+# new Implementation comment would reset the Blocked count. The step posts a
+# fresh Blocked comment if the dependency is still down, and the walk reads
+# the count from the tracker as on any pass — so the third pass, on whichever
+# machine runs it, leaves the issue for a human.
+#
+# A marker naming a step no longer in the manifest re-runs the whole walk.
+# Writes `<NN>.summary.md` (a note that this run retried the walk) so the
+# SUMMARY.md row's implement link resolves.
+#
+# Return code and stop-reason side effects mirror dispatch_one's walk.
+#
+# Args: $1=feature  $2=nn  $3=run_dir  $4=step label (from the marker)
+retry_blocked_walk() {
+  local feature="$1" nn="$2" run_dir="$3" step="$4"
+
+  local log_dir log_basename
+  if [ "$RUN_LOG_LAYOUT" = "nested" ]; then
+    log_dir="$run_dir/$feature"
+  else
+    log_dir="$run_dir"
+  fi
+  log_basename="$nn"
+  mkdir -p "$log_dir"
+
+  local pre_json ref
+  if ! pre_json="$(take_snapshot "$feature")"; then
+    echo "runner: retry_blocked_walk: tracker-snapshot failed for feature '$feature' issue '$nn'" >&2
+    RUN_STOP_REASON="snapshot-failed-mid-dispatch:pre"
+    record_dispatch "$feature" "$nn" "(unresolved)" "FAIL" 0
+    return 1
+  fi
+  if ! ref="$(binding_native_ref "$feature" "$nn" "$pre_json")"; then
+    RUN_STOP_REASON="snapshot-failed-mid-dispatch:pre"
+    record_dispatch "$feature" "$nn" "(unresolved)" "FAIL" 0
+    return 1
+  fi
+
+  local start_label="$step" label _path found=0
+  while IFS=$'\t' read -r label _path; do
+    [ "$label" = "$step" ] && { found=1; break; }
+  done <<< "$RESOLVED_MANIFEST"
+  if [ "$found" -eq 0 ]; then
+    echo "runner: retry_blocked_walk: blocked step '$step' is not in the manifest; re-running the whole walk for $ref" >&2
+    start_label=""
+  fi
+
+  echo "[$(now_clock)] $ref retrying Blocked walk from ${start_label:-the first step}"
+  printf 'Blocked retry: this run re-ran the post-implement walk from `%s`; /implement was not re-run.\n' \
+    "${start_label:-the first step}" >"$log_dir/$log_basename.summary.md"
+
+  walk_post_implement_steps \
+    "$feature" "$nn" "$ref" \
+    "$run_dir" "$log_dir" "$log_basename" \
+    "$pre_json" \
+    "in-review" 0 1 \
+    "$RESOLVED_MANIFEST" "$start_label"
+}
+
 # === Run entry points ======================================================
 
 # Single-dispatch entry — refuses any ref the loop's eligibility filter
@@ -3792,12 +3953,14 @@ dispatch_one() {
 # named ref before calling dispatch_one. On refusal, prints a diagnostic
 # naming the reason (HITL type, wrong status, blockers unmet, ref
 # missing from feature), sets RUN_STOP_REASON, and returns 2 — the same
-# exit code argparse uses for input-validation rejections.
+# exit code argparse uses for input-validation rejections. A named ref that
+# is a Blocked retry (blocked_retry_step) is accepted and re-runs its walk
+# from the blocked step via retry_blocked_walk.
 run_single() {
   # Feature-level refusal (unknown-feature) was already enforced by
   # `check_feature_eligibility` in preflight; only the per-ref eligibility
   # gate (HITL, wrong status, blockers, missing) is left to resolve here.
-  local snap entry reason detail
+  local snap entry reason detail retry_step=""
   if ! snap="$(take_snapshot "$ISSUE_FEATURE")"; then
     echo "runner: single-dispatch refused: tracker-snapshot failed for feature '$ISSUE_FEATURE'" >&2
     RUN_STOP_REASON="single-dispatch (refused: snapshot-failed)"
@@ -3816,7 +3979,12 @@ run_single() {
     entry_type="$(jq -r '.type // empty' <<<"$entry")"
     entry_status="$(jq -r '.status // empty' <<<"$entry")"
     entry_eligible="$(jq -r '.eligible // false' <<<"$entry")"
+    retry_step="$(blocked_retry_step "$ISSUE_FEATURE" "$ISSUE_NN" "$entry_status" "$entry_type")"
     if [ "$entry_eligible" = "true" ]; then
+      reason=""
+      retry_step=""
+    elif [ -n "$retry_step" ]; then
+      # A Blocked retry: re-run the walk from the blocked step.
       reason=""
     elif [ "$entry_type" != "AFK" ]; then
       reason="HITL"
@@ -3842,7 +4010,11 @@ run_single() {
   fi
 
   local rc=0
-  dispatch_one "$ISSUE_FEATURE" "$ISSUE_NN" "$RUN_DIR" || rc=$?
+  if [ -n "$retry_step" ]; then
+    retry_blocked_walk "$ISSUE_FEATURE" "$ISSUE_NN" "$RUN_DIR" "$retry_step" || rc=$?
+  else
+    dispatch_one "$ISSUE_FEATURE" "$ISSUE_NN" "$RUN_DIR" || rc=$?
+  fi
   if [ "$rc" -eq 0 ]; then
     RUN_STOP_REASON="single-dispatch (success)"
   else
@@ -3854,7 +4026,9 @@ run_single() {
 # Loop entry — drains $TARGET_FEATURE's eligible queue sequentially.
 # Eligibility is recomputed every iteration by re-snapshotting the
 # runner-checkout's HEAD, so an issue unblocked mid-run by an earlier
-# success becomes selectable without restarting the runner. Stop
+# success becomes selectable without restarting the runner. A Blocked retry
+# from an earlier run is selectable alongside eligible issues, in source
+# order, and re-runs its walk from the blocked step (retry_blocked_walk). Stop
 # conditions: queue empty, Ctrl-C. Per-issue failures log + continue
 # (no runner-side comment posted on the issue — the failed `/implement`
 # posts its own). RUN_DIR was created in main().
@@ -3890,11 +4064,28 @@ run_loop() {
     # skip line with the rm recipe for each aborted one). The abort flag path
     # uses `nn` from the snapshot — never derived from the binding-native ref —
     # so local-markdown and github-issues flags share the same layout.
-    local ref="" nn_sel=""
+    #
+    # A Blocked retry (an AFK issue at in-review whose walk ended Blocked on
+    # an earlier run — see blocked_retry_step) is selectable in the same
+    # source-order pass; it re-runs the walk from the blocked step instead of
+    # dispatching /implement. A marker on an issue no longer at in-review is
+    # obsolete and is cleared.
+    local ref="" nn_sel="" retry_step=""
     local abort_feature_dir="$HOST_ABORT_DIR/$TARGET_FEATURE"
-    local candidate_ref candidate_nn abort_flag
-    while IFS=$'\t' read -r candidate_ref candidate_nn; do
+    local candidate_ref candidate_nn candidate_eligible candidate_status candidate_type
+    local abort_flag candidate_retry
+    while IFS=$'\t' read -r candidate_ref candidate_nn candidate_eligible candidate_status candidate_type; do
       [ -z "$candidate_ref" ] && continue
+      candidate_retry=""
+      if [ "$candidate_eligible" != "true" ]; then
+        if [ "$candidate_status" != "in-review" ] \
+            && [ -n "$(blocked_marker_step "$TARGET_FEATURE" "$candidate_nn")" ]; then
+          clear_blocked_marker "$TARGET_FEATURE" "$candidate_nn"
+        fi
+        candidate_retry="$(blocked_retry_step "$TARGET_FEATURE" "$candidate_nn" \
+          "$candidate_status" "$candidate_type")"
+        [ -n "$candidate_retry" ] || continue
+      fi
       abort_flag="$abort_feature_dir/$candidate_nn"
       if [ -f "$abort_flag" ]; then
         echo "[$(now_clock)] runner: skipping aborted $candidate_ref — rm $abort_flag to resume"
@@ -3902,8 +4093,10 @@ run_loop() {
       fi
       ref="$candidate_ref"
       nn_sel="$candidate_nn"
+      retry_step="$candidate_retry"
       break
-    done < <(jq -r '.issues[] | select(.eligible == true) | "\(.ref)\t\(.nn)"' <<<"$snap")
+    done < <(jq -r '.issues[]
+      | "\(.ref)\t\(.nn)\t\(.eligible == true)\t\(if (.status // "") == "" then "-" else .status end)\t\(if (.type // "") == "" then "-" else .type end)"' <<<"$snap")
 
     if [ -z "$ref" ]; then
       echo "[$(now_clock)] runner: queue empty — no eligible issues remain in '$TARGET_FEATURE'"
@@ -3925,7 +4118,11 @@ run_loop() {
     RUNNER_LAST_PROPAGATION=""
     RUNNER_PUBLISH_PARKED=0
     local dispatch_rc=0
-    dispatch_one "$TARGET_FEATURE" "$nn_sel" "$RUN_DIR" || dispatch_rc=$?
+    if [ -n "$retry_step" ]; then
+      retry_blocked_walk "$TARGET_FEATURE" "$nn_sel" "$RUN_DIR" "$retry_step" || dispatch_rc=$?
+    else
+      dispatch_one "$TARGET_FEATURE" "$nn_sel" "$RUN_DIR" || dispatch_rc=$?
+    fi
 
     # If Ctrl-C arrived during the dispatch, exit immediately.
     if [ "$RUNNER_INTERRUPTED" -eq 1 ]; then
@@ -4125,20 +4322,26 @@ drain_one_feature() {
 }
 
 # Per-feature queue-shape probe. Returns 0 if the snapshot has at least
-# one eligible ref without an abort flag, 1 otherwise. Mirrors the
-# selection logic in `run_loop`'s top-of-iteration block. Uses `nn` from
-# the snapshot for abort flag lookup — binding-agnostic.
+# one eligible ref, or one Blocked retry (blocked_retry_step), without an
+# abort flag; 1 otherwise. Mirrors the selection logic in `run_loop`'s
+# top-of-iteration block. Uses `nn` from the snapshot for abort flag
+# lookup — binding-agnostic.
 feature_has_dispatchable_ref() {
   local feature="$1" snap="$2"
   local abort_dir="$HOST_ABORT_DIR/$feature"
-  local candidate_ref candidate_nn
-  while IFS=$'\t' read -r candidate_ref candidate_nn; do
+  local candidate_ref candidate_nn candidate_eligible candidate_status candidate_type
+  while IFS=$'\t' read -r candidate_ref candidate_nn candidate_eligible candidate_status candidate_type; do
     [ -z "$candidate_ref" ] && continue
+    if [ "$candidate_eligible" != "true" ] \
+        && [ -z "$(blocked_retry_step "$feature" "$candidate_nn" "$candidate_status" "$candidate_type")" ]; then
+      continue
+    fi
     if [ -f "$abort_dir/$candidate_nn" ]; then
       continue
     fi
     return 0
-  done < <(jq -r '.issues[] | select(.eligible == true) | "\(.ref)\t\(.nn)"' <<<"$snap")
+  done < <(jq -r '.issues[]
+    | "\(.ref)\t\(.nn)\t\(.eligible == true)\t\(if (.status // "") == "" then "-" else .status end)\t\(if (.type // "") == "" then "-" else .type end)"' <<<"$snap")
   return 1
 }
 

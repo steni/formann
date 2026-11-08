@@ -192,6 +192,9 @@ Wraps the per-issue loop and walks every feature in the discovery output.
 │         │ yes → log "skipping aborted <ref> — rm <path> to resume"       │
 │         │       continue to next eligible ref                            │
 │         │ no  → ref = this ref; break                                    │
+│     (an AFK in-review ref with .runner-state/blocked/<feature>/<NN>,     │
+│      not Blocked earlier this run, is selectable too: a Blocked retry;   │
+│      a marker on a ref no longer in-review is cleared)                   │
 │     [ref still empty after all eligible refs checked?]                   │
 │         │ yes ──► RUN_STOP_REASON = "queue-empty"; stop                  │
 │         │ no                                                             │
@@ -206,6 +209,8 @@ Wraps the per-issue loop and walks every feature in the discovery output.
 │         │                                + clean -fd; HEAD must match)   │
 │         ▼                                                                │
 │   dispatch_one(ref)  ───► see "dispatch_one" below                       │
+│     (Blocked retry: retry_blocked_walk(ref, step) instead — the walk     │
+│      from the marker's step; no /implement)                              │
 │         │  (returns 0/1; sets RUN_STOP_REASON on halt-class errors)      │
 │         ▼                                                                │
 │   [RUNNER_INTERRUPTED?] ──yes──► RUN_STOP_REASON = "interrupted"; stop   │
@@ -383,11 +388,13 @@ the classifier runs.
    │        │                                                                  │
    │        ├─ blocked (passes < 3) ─► propagate (when commits; park error ─► │
    │        │                   gate-failed, propagation-error, ret 1);        │
-   │        │                   record blocked (<dep>); ret 0                  │
-   │        │                   (no abort flag, no state change; run moves on) │
+   │        │                   write Blocked marker (step); record blocked    │
+   │        │                   (<dep>); ret 0 (no abort flag, no state change;│
+   │        │                   run moves on; next run retries from the step)  │
    │        │                                                                  │
-   │        ├─ left-for-human (blocked, passes ≥ 3) ─► same, but record        │
-   │        │                   left-for-human (blocked: <dep>); ret 0         │
+   │        ├─ left-for-human (blocked, passes ≥ 3) ─► same, but clear the     │
+   │        │                   marker and record left-for-human (blocked:     │
+   │        │                   <dep>); ret 0                                  │
    │        │                                                                  │
    │        ├─ terminate-run ─► propagate (when commits); RUN_STOP_REASON =    │
    │        │                   runaway-halt(<ref>); record halt → runaway;    │

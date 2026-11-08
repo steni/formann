@@ -134,7 +134,7 @@ The runner consumes the issue tracker through a single binding-supplied executab
 
 The runner uses snapshots for two purposes:
 
-- **Selection** — at the start of each iteration the loop iterates the snapshot's `eligible: true` refs in source order and picks the first one that doesn't have an abort flag (see "Abort flags" below). Recomputed every iteration so an issue unblocked mid-run by an earlier success becomes selectable without restarting. The pure-logic `next_eligible_ref` helper exposes the "first eligible ref" half of this selection for the bats suite (`first(.issues[] | select(.eligible == true) | .ref)`); the runtime path uses the same `select(.eligible == true)` predicate but streams the matching refs (drops the `first(...)` wrapper) so it can iterate and skip flagged refs in turn.
+- **Selection** — at the start of each iteration the loop iterates the snapshot's `eligible: true` refs in source order and picks the first one that doesn't have an abort flag (see "Abort flags" below). Recomputed every iteration so an issue unblocked mid-run by an earlier success becomes selectable without restarting. The pure-logic `next_eligible_ref` helper exposes the "first eligible ref" half of this selection for the bats suite (`first(.issues[] | select(.eligible == true) | .ref)`); the runtime path uses the same `select(.eligible == true)` predicate but streams the matching refs (drops the `first(...)` wrapper) so it can iterate and skip flagged refs in turn. A **Blocked retry** — an AFK issue at `in-review` with a Blocked marker (see "Blocked steps" below) that has not already ended Blocked in this run — is selectable in the same source-order pass, and re-runs its walk from the blocked step instead of dispatching `/implement`. Drain mode's per-feature queue check counts Blocked retries the same way, and single-dispatch accepts a named ref that is a Blocked retry.
 - **Outcome classification** — pre-dispatch and post-dispatch snapshots feed the classifier (`classify_outcome` for implement, `classify_item_action` for each post-implement step). The two classifiers treat the dispatch exit code differently:
   - **Implement** — status delta is the source of truth; the exit code is captured to `<NN>.exit` but never reaches the *outcome* classifier (`classify_outcome`). `/implement` has no "non-zero on failure" contract and claude may exit 0 from a session that didn't ship, so the committed `tracker:` flip is the only trustworthy signal. (The exit code does feed the separate *transport-crash* classifier's Rung-2 safety net — a death with no recoverable `result` event — which decides retry-vs-fail, not success-vs-failure.)
   - **Post-implement step** — the post-item status and exit code together drive the per-item action. A step prompt is expected to "exit non-zero if you can't classify; don't record a half-baked result" (the review-and-gate prompt contracts exactly this), so a nonzero exit short-circuits to `fail` regardless of the status delta. See the truth tables below.
@@ -325,7 +325,11 @@ A step that cannot reach something it needs from outside the run — a consumer'
 
 The runner reads that line from the step's terminal `result` event (`blocked_dependency`; it must be the last non-blank line). It then reads the issue's **Blocked pass count** from the tracker through the binding's `blocked-passes` script on the role surface (`read_blocked_passes`): the number of `Blocked` comments since the issue's latest `Implementation` comment. A rework posts a new Implementation comment, so it resets the count. Because the count lives on the tracker, a runner on another machine continues it. If the count can't be read the runner logs it and treats the pass as below the limit.
 
-Below three passes the issue keeps its state (`in-review`), no abort flag is written, the walk stops for that issue, and the run moves on to the next eligible issue; the progress line and `SUMMARY.md` show `blocked (<dependency>)`. The next run re-runs the walk. At the third pass the issue is left for a human — `left-for-human (blocked: <dependency>)`, no abort flag — with the Blocked comments on its timeline as the reason.
+Below three passes the issue keeps its state (`in-review`), no abort flag is written, the walk stops for that issue, and the run moves on to the next eligible issue; the progress line and `SUMMARY.md` show `blocked (<dependency>)`. The next run re-runs the walk from the blocked step.
+
+**Retrying.** The walk leaves a **Blocked marker** at `.runner-state/blocked/<feature>/<NN>` (`step:`, `dependency:`, `at:` lines) naming the step. On a later run, selection picks the issue up while it is still an AFK issue at `in-review` (see "Selection" above) and `retry_blocked_walk` re-runs the walk from that step; earlier steps and `/implement` are not re-run, because `/implement`'s new Implementation comment would reset the count. The progress line reads `<ref> retrying Blocked walk from <step>`, and the run's `<NN>.summary.md` says that `/implement` was not re-run. A Blocked issue is retried once per run, never twice in the same run; until the idle loop exists, the next pass is the next run. A marker naming a step no longer in the manifest re-runs the whole walk. Any outcome other than `blocked`, and a fresh `/implement`, clears the marker, and selection clears a marker whose issue is no longer at `in-review`. The marker only decides *what* to retry, never the count: the count is always read from the tracker, so a retry continues the passes another runner made. It is not an abort flag and never stops an issue from being dispatched.
+
+At the third pass the issue is left for a human — `left-for-human (blocked: <dependency>)`, no abort flag — with the Blocked comments on its timeline as the reason.
 
 ### Combined per-iteration outcome
 
@@ -340,7 +344,7 @@ Below three passes the issue keeps its state (`in-review`), no abort flag is wri
 | `in-review`        | AFK iteration interrupted between implement-finish and the start of the post-implement walk — implement landed `in-review`, the interrupt pre-empted the first step, and the iteration is recorded at its implement outcome. |
 | `FAIL`             | Implement-stage failure (classifier verdict, container error, or parking-ref publish failure). Runner writes an abort flag where applicable and continues. |
 | `halt → runaway`   | A post-implement step drove the issue back to `ready-for-agent` (a misconfigured manifest). The runner halts the entire run immediately. No abort flag — the issue is eligible, not stuck. |
-| `blocked (<dependency>)` | AFK iteration; a post-implement step ended `BLOCKED: <dependency>` below three Blocked passes. The issue keeps its state, no abort flag, and the run moves on; a later run re-runs the walk. |
+| `blocked (<dependency>)` | AFK iteration (or a Blocked retry); a post-implement step ended `BLOCKED: <dependency>` below three Blocked passes. The issue keeps its state, no abort flag, and the run moves on; a later run re-runs the walk from the blocked step. |
 | `left-for-human (blocked: <dependency>)` | AFK iteration; the third Blocked pass. Left for the maintainer with the Blocked comments as the reason. No abort flag. |
 
 ## Pre-flight invariants
@@ -524,6 +528,7 @@ framework/
 ├── lock                                      ← pidfile lock
 ├── checkout/                                 ← separate clone of the host repo
 ├── aborted/<feature>/                        ← runner-private abort flags (one per stuck issue)
+├── blocked/<feature>/                        ← Blocked markers (which step to retry; never the count)
 ├── runs/<ts>/                                ← per-run logs and SUMMARY.md
 └── smoke-runs/                               ← ephemeral smoke-walk artifacts
 ```

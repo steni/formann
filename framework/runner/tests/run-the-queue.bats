@@ -2159,6 +2159,8 @@ setup_dispatch_one_test() {
   HOST_RUNS="$TEST_RUN_DIR"
   HOST_REPO="$BATS_TEST_TMPDIR"
   HOST_ABORT_DIR="$BATS_TEST_TMPDIR/aborted"
+  HOST_BLOCKED_DIR="$BATS_TEST_TMPDIR/blocked"
+  RUN_BLOCKED_THIS_RUN=""
   # Set the resolved manifest to the default one-item entry so the walk runs.
   RESOLVED_MANIFEST="$(printf 'review\t%s\n' "$HERE/review-and-gate.md")"
 }
@@ -9025,6 +9027,304 @@ setup_blocked_walk() {
   [ "${#RUN_DISPATCHES[@]}" -eq 2 ]
   [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|blocked (preview-daemon)|"* ]]
   [[ "${RUN_DISPATCHES[1]}" == "f|02|f/02|done|"* ]]
+}
+
+# --- Blocked retries (#3 rework) ---------------------------------------------
+#
+# A walk that ends Blocked leaves a marker under .runner-state/blocked naming
+# the step; the next run re-runs the walk from that step without re-running
+# /implement. The marker decides only what to retry; the count is the tracker's.
+
+@test "Blocked marker — write, read the step, clear" {
+  HOST_BLOCKED_DIR="$BATS_TEST_TMPDIR/blocked"
+  [ -z "$(blocked_marker_step f 01)" ]
+  write_blocked_marker f 01 gate preview-daemon
+  [ "$(blocked_marker_step f 01)" = "gate" ]
+  grep -qx 'dependency: preview-daemon' "$HOST_BLOCKED_DIR/f/01"
+  clear_blocked_marker f 01
+  [ ! -e "$HOST_BLOCKED_DIR/f/01" ]
+  [ -z "$(blocked_marker_step f 01)" ]
+}
+
+@test "Blocked marker — helpers are no-ops without HOST_BLOCKED_DIR" {
+  unset HOST_BLOCKED_DIR
+  local dir="$BATS_TEST_TMPDIR/empty"
+  mkdir -p "$dir"
+  cd "$dir"
+  write_blocked_marker f 01 gate dep
+  clear_blocked_marker f 01
+  [ -z "$(blocked_marker_step f 01)" ]
+  [ -z "$(ls -A "$dir")" ]
+}
+
+@test "blocked_retry_step — only an AFK in-review issue with a marker, not already Blocked this run" {
+  HOST_BLOCKED_DIR="$BATS_TEST_TMPDIR/blocked"
+  RUN_BLOCKED_THIS_RUN=""
+  [ -z "$(blocked_retry_step f 01 in-review AFK)" ]
+  write_blocked_marker f 01 gate dep
+  [ "$(blocked_retry_step f 01 in-review AFK)" = "gate" ]
+  [ -z "$(blocked_retry_step f 01 ready-for-agent AFK)" ]
+  [ -z "$(blocked_retry_step f 01 done AFK)" ]
+  [ -z "$(blocked_retry_step f 01 in-review HITL)" ]
+  RUN_BLOCKED_THIS_RUN=$'g/01\nf/01'
+  [ -z "$(blocked_retry_step f 01 in-review AFK)" ]
+  RUN_BLOCKED_THIS_RUN="f/011"
+  [ "$(blocked_retry_step f 01 in-review AFK)" = "gate" ]
+}
+
+@test "walk_post_implement_steps — a blocked step writes the marker naming it; the run will not retry it" {
+  setup_blocked_walk
+  walk_post_implement_steps "f" "01" "f/01" \
+    "$TEST_RUN_DIR" "$TEST_RUN_DIR" "01" "$BLOCKED_POST_IMPL" \
+    "in-review" 10 1 "$BLOCKED_MANIFEST" >/dev/null
+  [ "$(blocked_marker_step f 01)" = "review" ]
+  grep -qx 'dependency: preview-daemon' "$HOST_BLOCKED_DIR/f/01"
+  [ "$RUN_BLOCKED_THIS_RUN" = "f/01" ]
+}
+
+@test "walk_post_implement_steps — the third Blocked pass and a clean pass both clear the marker" {
+  setup_blocked_walk
+  write_blocked_marker f 01 review preview-daemon
+  TEST_BLOCKED_PASSES=3
+  walk_post_implement_steps "f" "01" "f/01" \
+    "$TEST_RUN_DIR" "$TEST_RUN_DIR" "01" "$BLOCKED_POST_IMPL" \
+    "in-review" 10 1 "$BLOCKED_MANIFEST" "review" >/dev/null
+  [ ! -e "$HOST_BLOCKED_DIR/f/01" ]
+
+  write_blocked_marker f 01 review preview-daemon
+  run_item_container() { emit_result_text "$2" 'verdict: clean'; return 0; }
+  RUN_DISPATCHES=()
+  walk_post_implement_steps "f" "01" "f/01" \
+    "$TEST_RUN_DIR" "$TEST_RUN_DIR" "01" "$BLOCKED_POST_IMPL" \
+    "in-review" 10 1 "$BLOCKED_MANIFEST" "review" >/dev/null
+  [ ! -e "$HOST_BLOCKED_DIR/f/01" ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|left-for-human|"*"|01-review:02-gate|"* ]]
+}
+
+@test "walk_post_implement_steps — a start label skips the earlier steps and keeps manifest positions in the logs" {
+  setup_blocked_walk
+  walk_post_implement_steps "f" "01" "f/01" \
+    "$TEST_RUN_DIR" "$TEST_RUN_DIR" "01" "$BLOCKED_POST_IMPL" \
+    "in-review" 0 1 "$BLOCKED_MANIFEST" "gate" >/dev/null
+  [ "$(cat "$TEST_ITEM_CALLS")" = "$HERE/gate.md" ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|blocked (preview-daemon)|"*"|02-gate|"* ]]
+  [ "$(blocked_marker_step f 01)" = "gate" ]
+}
+
+@test "retry_blocked_walk — a step missing from the manifest re-runs the whole walk" {
+  setup_blocked_walk
+  RESOLVED_MANIFEST="$BLOCKED_MANIFEST"
+  retry_blocked_walk f 01 "$TEST_RUN_DIR" "gone" >/dev/null 2>"$BATS_TEST_TMPDIR/err"
+  [ "$(head -n 1 "$TEST_ITEM_CALLS")" = "$HERE/review-and-gate.md" ]
+  grep -q "blocked step 'gone' is not in the manifest" "$BATS_TEST_TMPDIR/err"
+  grep -q '/implement was not re-run' "$TEST_RUN_DIR/01.summary.md"
+}
+
+@test "feature_has_dispatchable_ref — a Blocked retry counts as dispatchable work" {
+  HOST_ABORT_DIR="$BATS_TEST_TMPDIR/aborted"
+  HOST_BLOCKED_DIR="$BATS_TEST_TMPDIR/blocked"
+  RUN_BLOCKED_THIS_RUN=""
+  local snap='{"feature":"f","issues":[{"ref":"f/01","nn":"01","status":"in-review","category":"enhancement","type":"AFK","blocked_by":[],"eligible":false}]}'
+  ! feature_has_dispatchable_ref f "$snap"
+  write_blocked_marker f 01 gate dep
+  feature_has_dispatchable_ref f "$snap"
+  mkdir -p "$HOST_ABORT_DIR/f"
+  : >"$HOST_ABORT_DIR/f/01"
+  ! feature_has_dispatchable_ref f "$snap"
+}
+
+@test "run_single — a Blocked retry is accepted and re-runs the walk from the blocked step" {
+  setup_blocked_walk
+  RESOLVED_MANIFEST="$BLOCKED_MANIFEST"
+  RUN_DIR="$TEST_RUN_DIR"
+  ISSUE_FEATURE=f
+  ISSUE_NN=01
+  ARG_ISSUE_REF=f/01
+  run_dispatch_container() { echo implement >>"$TEST_ITEM_CALLS"; return 0; }
+  write_blocked_marker f 01 gate preview-daemon
+  run_single >/dev/null
+  [ "$(cat "$TEST_ITEM_CALLS")" = "$HERE/gate.md" ]
+  [ "$RUN_STOP_REASON" = "single-dispatch (success)" ]
+}
+
+@test "run_loop — a marker on an issue no longer at in-review is cleared, not retried" {
+  setup_dispatch_one_test
+  ensure_runner_checkout() { :; }
+  take_snapshot() {
+    printf '{"feature":"f","issues":[{"ref":"f/01","nn":"01","status":"done","category":"enhancement","type":"AFK","blocked_by":[],"eligible":false}]}'
+  }
+  run_item_container() { echo called >>"$BATS_TEST_TMPDIR/calls"; return 0; }
+  write_blocked_marker f 01 review dep
+  RUN_DIR="$TEST_RUN_DIR"
+  RUN_DISPATCHES=()
+  run_loop >/dev/null
+  [ "$RUN_STOP_REASON" = "queue-empty" ]
+  [ ! -e "$HOST_BLOCKED_DIR/f/01" ]
+  [ ! -e "$BATS_TEST_TMPDIR/calls" ]
+}
+
+# Real local-markdown tracker for the multi-run tests: the binding's own
+# tracker-snapshot and blocked-passes on the role surface, reading committed
+# issue files in a real runner-checkout. read_blocked_passes and take_snapshot
+# are the runner's real functions. Only containers and publishing are mocked;
+# the mocked containers write their comments into the issue file and commit,
+# as /implement and a Blocked step do under local-markdown.
+setup_real_tracker_runs() {
+  setup_dispatch_one_test
+  # Restore the runner's real take_snapshot / read_blocked_passes / container
+  # functions that the dispatch fixture mocked.
+  source "$RUNNER_SCRIPT"
+  RUNNER_DISABLE_LIVENESS=1
+  TARGET_FEATURE="f"
+  HOST_REPO="$BATS_TEST_TMPDIR/host"
+  mkdir -p "$HOST_REPO/docs/formann/issue-tracker"
+  local s
+  for s in tracker-snapshot blocked-passes; do
+    cp "$(dirname "$RUNNER_SCRIPT")/../bindings/issue-tracker/local-markdown/$s" "$HOST_REPO/docs/formann/issue-tracker/$s"
+    chmod +x "$HOST_REPO/docs/formann/issue-tracker/$s"
+  done
+  ISSUE_FILE="$HOST_CHECKOUT/.features/f/issues/01-thing.md"
+  mkdir -p "$(dirname "$ISSUE_FILE")"
+  cat >"$ISSUE_FILE" <<'EOF'
+---
+status: ready-for-agent
+category: enhancement
+type: AFK
+---
+
+# Thing
+
+## What to build
+
+A thing.
+
+## Blocked by
+
+None — can start immediately.
+
+## Comments
+EOF
+  tracker_commit "tracker: f/01 created"
+
+  ensure_runner_checkout() { :; }
+  propagate_feature() { return 0; }
+  RESOLVED_MANIFEST="$(printf 'review\t%s\ngate\t%s\n' "$HERE/review.md" "$HERE/gate.md")"
+  TEST_CALLS="$BATS_TEST_TMPDIR/calls"
+  : >"$TEST_CALLS"
+  run_dispatch_container() {
+    echo implement >>"$TEST_CALLS"
+    set_issue_status in-review
+    printf '\n### Implementation%s — 2026-11-08\n\n> *This was generated by AI during implementation.*\n\nDone.\n' \
+      "$(heading_suffix Implementation)" >>"$ISSUE_FILE"
+    tracker_commit "tracker: f/01 Implementation"
+    emit_result_text "$2" 'Shipped for review.'
+  }
+  run_item_container() {
+    local label
+    label="$(basename "$3" .md)"
+    echo "$label" >>"$TEST_CALLS"
+    if [ "$label" = "gate" ]; then
+      printf '\n### Blocked%s — 2026-11-08\n\n> *This was generated by AI during gate.*\n\n`preview-daemon` unreachable: connection refused.\n' \
+        "$(heading_suffix Blocked)" >>"$ISSUE_FILE"
+      tracker_commit "tracker: f/01 Blocked"
+      emit_result_text "$2" $'Posted a Blocked comment.\nBLOCKED: preview-daemon'
+    else
+      emit_result_text "$2" 'verdict: clean'
+    fi
+  }
+}
+
+tracker_commit() {
+  git -C "$HOST_CHECKOUT" add -A
+  git -C "$HOST_CHECKOUT" -c user.email=t@t -c user.name=t commit --quiet -m "$1"
+}
+
+set_issue_status() {
+  sed -i.bak "s/^status: .*/status: $1/" "$ISSUE_FILE"
+  rm -f "$ISSUE_FILE.bak"
+}
+
+# Same-day collision suffix for a comment kind: "" or " (n)".
+heading_suffix() {
+  local n
+  n="$(grep -cE "^### $1( \([0-9]+\))? — 2026-11-08$" "$ISSUE_FILE" || true)"
+  [ "$n" -eq 0 ] || printf ' (%d)' "$((n + 1))"
+}
+
+# One run of the loop: fresh per-run state; .runner-state persists.
+one_run() {
+  RUN_DIR="$BATS_TEST_TMPDIR/runs/$1"
+  mkdir -p "$RUN_DIR"
+  RUN_DISPATCHES=()
+  RUN_STOP_REASON=""
+  RUN_BLOCKED_THIS_RUN=""
+  : >"$TEST_CALLS"
+  run_loop >"$RUN_DIR/progress"
+}
+
+@test "run_loop — over several runs a Blocked step is retried, its tracker count going 1 → 3, ending left-for-human (blocked: <dep>)" {
+  setup_real_tracker_runs
+
+  # Run 1: implement, review (clean), gate ends Blocked — pass 1.
+  one_run 1
+  [ "$RUN_STOP_REASON" = "queue-empty" ]
+  [ "$(cat "$TEST_CALLS")" = "$(printf 'implement\nreview\ngate')" ]
+  [ "${#RUN_DISPATCHES[@]}" -eq 1 ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|blocked (preview-daemon)|"* ]]
+  [ "$(read_blocked_passes f/01)" = "1" ]
+  [ "$(blocked_marker_step f 01)" = "gate" ]
+  grep -qx 'status: in-review' "$ISSUE_FILE"
+  [ ! -e "$HOST_ABORT_DIR/f/01" ]
+
+  # Run 2: no implement, no review — only the blocked gate step — pass 2.
+  one_run 2
+  [ "$RUN_STOP_REASON" = "queue-empty" ]
+  [ "$(cat "$TEST_CALLS")" = "gate" ]
+  [ "${#RUN_DISPATCHES[@]}" -eq 1 ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|blocked (preview-daemon)|"*"|02-gate|"* ]]
+  [ "$(read_blocked_passes f/01)" = "2" ]
+  grep -qF 'f/01 retrying Blocked walk from gate' "$RUN_DIR/progress"
+
+  # Run 3: the third Blocked pass leaves the issue for a human.
+  one_run 3
+  [ "$(cat "$TEST_CALLS")" = "gate" ]
+  [ "${#RUN_DISPATCHES[@]}" -eq 1 ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|left-for-human (blocked: preview-daemon)|"* ]]
+  grep -qF 'f/01 gate → left-for-human (blocked: preview-daemon, 3 passes)' "$RUN_DIR/progress"
+  [ ! -e "$HOST_BLOCKED_DIR/f/01" ]
+  [ ! -e "$HOST_ABORT_DIR/f/01" ]
+  grep -qx 'status: in-review' "$ISSUE_FILE"
+  [ "$(grep -c '^### Blocked' "$ISSUE_FILE")" -eq 3 ]
+
+  # Run 4: nothing left for the runner.
+  one_run 4
+  [ "$RUN_STOP_REASON" = "queue-empty" ]
+  [ ! -s "$TEST_CALLS" ]
+  [ "${#RUN_DISPATCHES[@]}" -eq 0 ]
+
+  # Rework: the maintainer sends it back; the new Implementation comment
+  # resets the count, so the next Blocked pass is pass 1 again.
+  set_issue_status ready-for-agent
+  tracker_commit "tracker: f/01 rework"
+  one_run 5
+  [ "$(cat "$TEST_CALLS")" = "$(printf 'implement\nreview\ngate')" ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|blocked (preview-daemon)|"* ]]
+  [ "$(read_blocked_passes f/01)" = "1" ]
+}
+
+@test "run_loop — Blocked passes made by another runner count: the next retry here continues the tracker's count" {
+  # Two Blocked passes are already on the tracker (from another machine).
+  # The local marker only says which step to retry; the count is read from
+  # the tracker, so this retry is pass 3 and leaves the issue for a human.
+  setup_real_tracker_runs
+  set_issue_status in-review
+  printf '\n### Implementation — 2026-11-08\n\nDone.\n\n### Blocked — 2026-11-08\n\nDown.\n\n### Blocked (2) — 2026-11-08\n\nDown.\n' >>"$ISSUE_FILE"
+  tracker_commit "tracker: f/01 two Blocked passes elsewhere"
+  write_blocked_marker f 01 gate preview-daemon
+
+  one_run 1
+  [ "$(cat "$TEST_CALLS")" = "gate" ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|left-for-human (blocked: preview-daemon)|"* ]]
 }
 
 @test "format_summary_md — a Blocked row shows blocked (<dependency>)" {

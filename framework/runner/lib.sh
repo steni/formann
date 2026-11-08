@@ -125,6 +125,7 @@ RUNNER_LOCK_PATH="$RUNNER_STATE_DIR/lock"
 RUNNER_CHECKOUT_PATH="$RUNNER_STATE_DIR/checkout"
 RUNNER_RUNS_PATH="$RUNNER_STATE_DIR/runs"
 RUNNER_ABORT_PATH="$RUNNER_STATE_DIR/aborted"
+RUNNER_BLOCKED_PATH="$RUNNER_STATE_DIR/blocked"
 
 # Path inside the container where the runner-checkout mounts. The
 # entrypoint runs from this directory; `claude -p "/implement <ref>"`
