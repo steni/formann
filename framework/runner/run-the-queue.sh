@@ -1444,6 +1444,9 @@ finalize_run() {
   # own reap, make sure no renderer outlives the run and no painted line
   # survives. No-op in the normal flow.
   stop_liveness_renderer
+  # Likewise the claim refresher — before the claim release below, so the
+  # release leases on the sha it last wrote.
+  stop_claim_refresher
 
   if [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ]; then
     local end_clock
@@ -2141,6 +2144,36 @@ check_retry_knobs() {
   esac
 }
 
+# 0b. Claim heartbeat knob sanity. RUNNER_CLAIM_HEARTBEAT_SECONDS (unset:
+#     stale-after / 3) is the claim refresher's sleep between heartbeats
+#     during a dispatch: 0 would heartbeat in a tight loop, a non-number
+#     would make every `sleep` fail at once (the same tight loop), and a
+#     value not below the stale-after time would let a live claim go stale
+#     between two heartbeats. Refuse up front.
+check_claim_knobs() {
+  local hb="${RUNNER_CLAIM_HEARTBEAT_SECONDS:-}"
+  [ -n "$hb" ] || return 0
+  case "$hb" in
+    *[!0-9]*) fail_invariant "claim-knobs" \
+      "RUNNER_CLAIM_HEARTBEAT_SECONDS must be a whole number of seconds > 0, got '$hb'";;
+  esac
+  if [ "$((10#$hb))" -eq 0 ]; then
+    fail_invariant "claim-knobs" \
+      "RUNNER_CLAIM_HEARTBEAT_SECONDS must be a whole number of seconds > 0, got '$hb'"
+  fi
+  local stale
+  stale="$(claim_stale_after)"
+  case "$stale" in
+    ''|*[!0-9]*) ;;
+    *)
+      if [ "$((10#$hb))" -ge "$((10#$stale))" ]; then
+        fail_invariant "claim-knobs" \
+          "RUNNER_CLAIM_HEARTBEAT_SECONDS ($hb) must be below RUNNER_CLAIM_STALE_AFTER ($stale), or a live claim goes stale between heartbeats"
+      fi
+      ;;
+  esac
+}
+
 # 3. Docker daemon responds.
 check_docker_daemon() {
   if ! docker info >/dev/null 2>&1; then
@@ -2241,6 +2274,7 @@ retrieve_oauth_token() {
 preflight() {
   acquire_lock
   check_retry_knobs                      # invariant 0: env knob sanity
+  check_claim_knobs                      # invariant 0b: claim heartbeat knob
   check_discovery                        # invariant 1: tracker-snapshot --list
   ensure_runner_remote                   # invariant 1b: runner remote
   if ! ensure_runner_checkout_exists >&2; then  # invariant 2a (clone-existence)
@@ -2324,6 +2358,11 @@ handle_signal() {
   if [ -n "${LIVENESS_PID:-}" ]; then
     kill -TERM "$LIVENESS_PID" 2>/dev/null || true
   fi
+  # Stop the claim refresher; stop_claim_refresher reaps it once the
+  # dispatch has wound down.
+  if [ -n "${CLAIM_REFRESHER_PID:-}" ]; then
+    kill -TERM "$CLAIM_REFRESHER_PID" 2>/dev/null || true
+  fi
   if [ -n "$IN_FLIGHT_CID_FILE" ] && [ -s "$IN_FLIGHT_CID_FILE" ]; then
     local cid
     cid="$(cat "$IN_FLIGHT_CID_FILE" 2>/dev/null || true)"
@@ -2381,6 +2420,72 @@ stop_liveness_renderer() {
   kill -TERM "$LIVENESS_PID" 2>/dev/null || true
   wait "$LIVENESS_PID" 2>/dev/null || true
   LIVENESS_PID=""
+}
+
+# === Claim refresher spawn/reap ============================================
+#
+# Between dispatches heartbeat_claim refreshes the held claim; while one runs
+# (a sandbox container, its window/transport retry waits, a post-drain step)
+# a companion process does, every claim_heartbeat_seconds — claim_refresh_loop
+# in claim.sh. Armed and disarmed around the dispatch by with_claim_refresher,
+# like the liveness renderer around a container. Reaped on every way out:
+# the dispatch returning, handle_signal (Ctrl-C / SIGTERM), and finalize_run.
+
+CLAIM_REFRESHER_PID=""
+CLAIM_REFRESHER_STATE=""
+
+# Spawn the companion when a claim is held; a no-op otherwise (no Shared
+# remote, --issue, claim already lost) or when one is already running.
+start_claim_refresher() {
+  [ -n "${CLAIM_HELD_FEATURE:-}" ] || return 0
+  [ -z "$CLAIM_REFRESHER_PID" ] || return 0
+  CLAIM_REFRESHER_STATE="$(mktemp "${TMPDIR:-/tmp}/formann-claim-refresh.XXXXXX")" || {
+    CLAIM_REFRESHER_STATE=""
+    echo "[$(now_clock)] runner: could not start the claim heartbeat for the dispatch; the claim is refreshed between dispatches only"
+    return 0
+  }
+  claim_refresh_loop "$CLAIM_HELD_FEATURE" "$(claim_heartbeat_seconds)" \
+    "$CLAIM_REFRESHER_STATE" "$$" </dev/null &
+  CLAIM_REFRESHER_PID=$!
+}
+
+# Reap the companion, then adopt what it recorded: the claim sha it last
+# wrote (so the next between-dispatch heartbeat leases on it), or the
+# takeover it saw — the same lost-claim state heartbeat_claim sets, so the
+# loop stops on the feature after this dispatch.
+stop_claim_refresher() {
+  if [ -n "$CLAIM_REFRESHER_PID" ]; then
+    kill -TERM "$CLAIM_REFRESHER_PID" 2>/dev/null || true
+    wait "$CLAIM_REFRESHER_PID" 2>/dev/null || true
+    CLAIM_REFRESHER_PID=""
+  fi
+  [ -n "$CLAIM_REFRESHER_STATE" ] || return 0
+  local state=""
+  [ -s "$CLAIM_REFRESHER_STATE" ] && state="$(head -n 1 "$CLAIM_REFRESHER_STATE")"
+  rm -f "$CLAIM_REFRESHER_STATE" "$CLAIM_REFRESHER_STATE.tmp"
+  CLAIM_REFRESHER_STATE=""
+  case "$state" in
+    held\ *)
+      [ -n "${CLAIM_HELD_FEATURE:-}" ] && CLAIM_HELD_SHA="${state#held }"
+      ;;
+    lost-to\ *)
+      CLAIM_HELD_FEATURE=""
+      CLAIM_HELD_SHA=""
+      RUNNER_CLAIM_LOST="taken-over-by ${state#lost-to }"
+      ;;
+  esac
+  return 0
+}
+
+# Run "$@" (a dispatch) with the claim refresher armed around it; returns
+# its exit status. Runs in the current shell, so the dispatch's globals stay
+# visible to the caller.
+with_claim_refresher() {
+  local rc=0
+  start_claim_refresher
+  "$@" || rc=$?
+  stop_claim_refresher
+  return "$rc"
 }
 
 # Pre-flight-aware INT/TERM handler. Installed before `preflight` so a
@@ -3002,7 +3107,7 @@ run_dispatch_container() {
   local ref="$1" log_base="$2"
   local model_args=()
   [ -n "${ARG_MODEL:-}" ] && model_args=(--model "$ARG_MODEL")
-  with_window_retry "$log_base" run_sandbox_container \
+  with_claim_refresher with_window_retry "$log_base" run_sandbox_container \
     claude -p "/implement $ref" --output-format stream-json --verbose --dangerously-skip-permissions \
     --append-system-prompt "$RUNNER_DISPATCH_PREAMBLE" \
     --disallowed-tools "${RUNNER_DISALLOWED_DISPATCH_TOOLS[@]}" \
@@ -3019,7 +3124,7 @@ run_item_container() {
   prompt_text="$(cat "$prompt_path")"$'\n'"$ref"
   local model_args=()
   [ -n "${ARG_MODEL:-}" ] && model_args=(--model "$ARG_MODEL")
-  with_window_retry "$log_base" run_sandbox_container \
+  with_claim_refresher with_window_retry "$log_base" run_sandbox_container \
     claude -p "$prompt_text" --output-format stream-json --verbose --dangerously-skip-permissions \
     --append-system-prompt "$RUNNER_DISPATCH_PREAMBLE" \
     --disallowed-tools "${RUNNER_DISALLOWED_DISPATCH_TOOLS[@]}" \

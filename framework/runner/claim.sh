@@ -89,6 +89,80 @@ claim_stale_after() {
   printf '%s\n' "${RUNNER_CLAIM_STALE_AFTER:-1800}"
 }
 
+# Seconds between heartbeats while a dispatch runs (claim_refresh_loop).
+# RUNNER_CLAIM_HEARTBEAT_SECONDS, default stale-after / 3 rounded down (600
+# at the default stale-after), never below 1. Pre-flight refuses a set value
+# that isn't a whole number above 0 (check_claim_knobs).
+claim_heartbeat_seconds() {
+  if [ -n "${RUNNER_CLAIM_HEARTBEAT_SECONDS:-}" ]; then
+    printf '%s\n' "$RUNNER_CLAIM_HEARTBEAT_SECONDS"
+    return 0
+  fi
+  local stale h
+  stale="$(claim_stale_after)"
+  case "$stale" in ''|*[!0-9]*) stale=1800 ;; esac
+  h=$(( stale / 3 ))
+  [ "$h" -ge 1 ] || h=1
+  printf '%s\n' "$h"
+}
+
+# The heartbeat companion of one dispatch: run in the background (by
+# start_claim_refresher) for as long as a sandbox container runs under a
+# held claim. Every <interval> seconds it refreshes the claim with `claim
+# heartbeat`, and leaves the result in <state-file> for the runner to adopt
+# once the dispatch is over — the companion is a subshell, so the held sha
+# it advances is not the runner's own shell state:
+#   `held <sha>`        the claim is ours, last written as <sha>
+#   `lost-to <machine>` another runner took it over; the companion stops
+#                       refreshing (the dispatch itself is never touched)
+# A refresh that fails for a network reason is logged, once, and tried again
+# at the next interval.
+#
+# It stops on TERM or INT — a signal that lands during a refresh lets that
+# refresh finish and record its result first — and on its own when <parent>
+# (the runner's pid) is gone, so a runner killed outright leaves no
+# companion heart-beating for it: the claim goes stale within stale-after
+# plus one interval.
+#
+# Args: $1 feature, $2 interval (seconds), $3 state file, $4 parent pid.
+claim_refresh_loop() {
+  local feature="$1" interval="$2" state="$3" parent="${4:-}"
+  set +e
+  trap - EXIT
+  CLAIM_REFRESH_STOP=0
+  CLAIM_REFRESH_SLEEPER=""
+  trap 'CLAIM_REFRESH_STOP=1; [ -n "$CLAIM_REFRESH_SLEEPER" ] && kill "$CLAIM_REFRESH_SLEEPER" 2>/dev/null' TERM INT HUP
+  while [ "$CLAIM_REFRESH_STOP" -eq 0 ]; do
+    sleep "$interval" &
+    CLAIM_REFRESH_SLEEPER=$!
+    wait "$CLAIM_REFRESH_SLEEPER" 2>/dev/null
+    kill "$CLAIM_REFRESH_SLEEPER" 2>/dev/null
+    wait "$CLAIM_REFRESH_SLEEPER" 2>/dev/null
+    CLAIM_REFRESH_SLEEPER=""
+    [ "$CLAIM_REFRESH_STOP" -eq 0 ] || break
+    if [ -n "$parent" ] && ! kill -0 "$parent" 2>/dev/null; then
+      # The runner is gone: nobody will adopt the state.
+      rm -f "$state" "$state.tmp"
+      break
+    fi
+    claim heartbeat "$feature" >/dev/null
+    case "$CLAIM_RESULT" in
+      ok)
+        printf 'held %s\n' "$CLAIM_HELD_SHA" >"$state.tmp" && mv -f "$state.tmp" "$state"
+        ;;
+      lost-to\ *)
+        printf '%s\n' "$CLAIM_RESULT" >"$state.tmp" && mv -f "$state.tmp" "$state"
+        echo "[$(date +%H:%M:%S)] runner: lost the claim on $feature during the dispatch — taken over by ${CLAIM_RESULT#lost-to }; finishing the dispatch in flight, then stopping this feature"
+        break
+        ;;
+      *)
+        echo "[$(date +%H:%M:%S)] runner: could not refresh the claim on $feature during the dispatch (see above); trying again in ${interval}s"
+        ;;
+    esac
+  done
+  return 0
+}
+
 # This reader's clock (epoch seconds). Each reader judges staleness by its
 # own clock; tests redefine this.
 claim_now_epoch() {

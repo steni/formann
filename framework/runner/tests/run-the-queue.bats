@@ -10099,3 +10099,418 @@ setup_heartbeat_loop_test() {
   [ "$RUN_STOP_REASON" = "taken-over-by m2" ]
   [ "$(claims_remote_field alpha machine)" = "m2" ]
 }
+
+# === Claim refresher: heartbeat during a dispatch (#13) =====================
+#
+# A dispatch longer than the stale-after time used to leave its own claim
+# looking stale while the runner was still busy with it. A companion process
+# now heart-beats the claim while the container runs. These tests run a fake
+# container (a docker shim that lives for $FAKE_CONTAINER_SECONDS) under a
+# short stale-after and heartbeat interval, and look at the claim the way
+# another runner would: its verdict by claim_verdict on the Shared remote.
+
+# A docker shim standing in for the sandbox container: `docker run` records
+# its pid (as the cid, and in $FAKE_CONTAINER_PID_FILE), lives for
+# $FAKE_CONTAINER_SECONDS, then emits a clean result; `docker kill
+# --signal=SIG<X> <cid>` delivers SIG<X> to that pid.
+_install_fake_container() {
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  cat >"$BATS_TEST_TMPDIR/bin/docker" <<'DOCKEREOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  kill)
+    sig="${2#--signal=}"
+    kill "-${sig#SIG}" "$3" 2>/dev/null
+    exit 0
+    ;;
+esac
+while [ $# -gt 0 ]; do
+  [ "$1" = "--cidfile" ] && echo "$$" >"$2"
+  shift
+done
+echo "$$" >"$FAKE_CONTAINER_PID_FILE"
+trap 'exit 143' TERM
+end=$(( $(date +%s) + FAKE_CONTAINER_SECONDS ))
+while [ "$(date +%s)" -lt "$end" ]; do sleep 0.2; done
+printf '{"type":"result","subtype":"success","is_error":false,"result":"x","uuid":"u"}\n'
+exit 0
+DOCKEREOF
+  chmod +x "$BATS_TEST_TMPDIR/bin/docker"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+  export FAKE_CONTAINER_PID_FILE="$BATS_TEST_TMPDIR/container.pid"
+}
+
+# Host repo whose origin is a bare Shared remote, the runtime globals
+# run_sandbox_container reads, the fake container, and this runner (m1)
+# holding a freshly taken claim on `f`. Short knobs: a claim is stale 4s
+# after its last heartbeat; the refresher heart-beats every second.
+setup_refresher_test() {
+  unset RUNNER_SHARED_REMOTE RUNNER_FORMANN_SHA
+  export RUNNER_CLAIM_STALE_AFTER=4 RUNNER_CLAIM_HEARTBEAT_SECONDS=1
+  export FAKE_CONTAINER_SECONDS=9
+  SHARED_CLAIMS="$BATS_TEST_TMPDIR/claims.git"
+  git init --quiet --bare --initial-branch=main "$SHARED_CLAIMS"
+  HOST_REPO="$BATS_TEST_TMPDIR/repo"
+  git init --quiet --initial-branch=main "$HOST_REPO"
+  git -C "$HOST_REPO" -c user.email=t@t -c user.name=t commit --allow-empty --quiet -m init
+  git -C "$HOST_REPO" remote add origin "$SHARED_CLAIMS"
+  mkdir -p "$HOST_REPO/docs/formann/issue-tracker"
+  HOST_CHECKOUT="$HOST_REPO"
+  HOST_RUNNER_STATE="$BATS_TEST_TMPDIR"
+  NET_NAME=none
+  RUNNER_CONTAINER_REPO_PATH=/repo
+  RUNNER_CONTAINER_M2_PATH=/m2
+  MVN_VOLUME=vol
+  IMAGE_NAME=img
+  TOKEN=oauth
+  RUNNER_GIT_USER_NAME=Arne
+  RUNNER_GIT_USER_EMAIL=a@b.c
+  RUNNER_INTERRUPTED=0
+  RUNNER_KILL_GRACE_SECONDS=2
+  IN_FLIGHT_CID_FILE=""
+  RUNNER_DISABLE_TRANSPORT_RETRY=1
+  RUNNER_MACHINE="m1"
+  RUN_TS="20261108-120000"
+  RUNNER_CLAIM_LOST=""
+  CLAIM_HELD_FEATURE=""
+  CLAIM_HELD_SHA=""
+  CLAIM_REFRESHER_PID=""
+  CLAIM_REFRESHER_STATE=""
+  _install_fake_container
+  claim take f >/dev/null
+  [ "$CLAIM_RESULT" = "taken" ]
+  TAKEN_SHA="$CLAIM_HELD_SHA"
+}
+
+# The claim on `f` as another runner sees it now: free | held | stale.
+remote_claim_verdict() {
+  local msg=""
+  if git -C "$SHARED_CLAIMS" rev-parse --verify --quiet refs/formann/claims/f >/dev/null; then
+    msg="$(git -C "$SHARED_CLAIMS" log -1 --format=%B refs/formann/claims/f)"
+  fi
+  claim_verdict "$msg" "$(date +%s)" "$RUNNER_CLAIM_STALE_AFTER"
+}
+
+# Is pid $1 a live process? A zombie is not: an orphan that exited stays a
+# zombie until an init reaps it, and a container's pid 1 may never do.
+pid_alive() {
+  [ -n "$1" ] && kill -0 "$1" 2>/dev/null || return 1
+  if [ -r "/proc/$1/stat" ]; then
+    [ "$(sed 's/.*) //' "/proc/$1/stat" | cut -d' ' -f1)" != "Z" ]
+    return
+  fi
+  case "$(ps -o stat= -p "$1" 2>/dev/null)" in Z*) return 1 ;; esac
+  return 0
+}
+
+# Wait up to $2 seconds (in 0.1s steps) for pid $1 to be gone.
+wait_pid_gone() {
+  local i=0
+  while [ "$i" -lt $(( $2 * 10 )) ]; do
+    pid_alive "$1" || return 0
+    sleep 0.1
+    i=$(( i + 1 ))
+  done
+  ! pid_alive "$1"
+}
+
+@test "claim_heartbeat_seconds — default is stale-after / 3, rounded down; the knob overrides it" {
+  unset RUNNER_CLAIM_HEARTBEAT_SECONDS RUNNER_CLAIM_STALE_AFTER
+  [ "$(claim_heartbeat_seconds)" = "600" ]
+  RUNNER_CLAIM_STALE_AFTER=100
+  [ "$(claim_heartbeat_seconds)" = "33" ]
+  RUNNER_CLAIM_STALE_AFTER=2
+  [ "$(claim_heartbeat_seconds)" = "1" ]
+  RUNNER_CLAIM_HEARTBEAT_SECONDS=45
+  [ "$(claim_heartbeat_seconds)" = "45" ]
+}
+
+@test "check_claim_knobs (#13) — refuses a non-numeric RUNNER_CLAIM_HEARTBEAT_SECONDS" {
+  unset RUNNER_CLAIM_STALE_AFTER
+  RUNNER_CLAIM_HEARTBEAT_SECONDS="ten minutes"
+  trap - EXIT
+  run check_claim_knobs
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"runner: claim-knobs:"* ]]
+  [[ "$output" == *"RUNNER_CLAIM_HEARTBEAT_SECONDS"* ]]
+  [[ "$output" == *"ten minutes"* ]]
+  RUNNER_CLAIM_HEARTBEAT_SECONDS="-5"
+  run check_claim_knobs
+  [ "$status" -eq 2 ]
+}
+
+@test "check_claim_knobs (#13) — refuses a zero RUNNER_CLAIM_HEARTBEAT_SECONDS" {
+  unset RUNNER_CLAIM_STALE_AFTER
+  trap - EXIT
+  local v
+  for v in 0 00; do
+    RUNNER_CLAIM_HEARTBEAT_SECONDS="$v"
+    run check_claim_knobs
+    [ "$status" -eq 2 ] || fail "accepted '$v'"
+    [[ "$output" == *"runner: claim-knobs:"* ]]
+  done
+}
+
+@test "check_claim_knobs (#13) — refuses a heartbeat interval not below the stale-after time" {
+  RUNNER_CLAIM_STALE_AFTER=600
+  RUNNER_CLAIM_HEARTBEAT_SECONDS=600
+  trap - EXIT
+  run check_claim_knobs
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"must be below RUNNER_CLAIM_STALE_AFTER"* ]]
+}
+
+@test "check_claim_knobs (#13) — unset or a whole number below stale-after passes" {
+  unset RUNNER_CLAIM_HEARTBEAT_SECONDS RUNNER_CLAIM_STALE_AFTER
+  check_claim_knobs
+  RUNNER_CLAIM_HEARTBEAT_SECONDS=300
+  check_claim_knobs
+}
+
+@test "preflight (#13) — runs the claim knob check" {
+  declare -f preflight | grep -q 'check_claim_knobs'
+}
+
+@test "run_dispatch_container (#13) — a container outliving stale-after leaves the claim held at every point; the refresher is reaped and its sha adopted" {
+  setup_refresher_test
+  local samples="$BATS_TEST_TMPDIR/verdicts" stop="$BATS_TEST_TMPDIR/stop-observer"
+  : >"$samples"
+  # Another runner's view of the claim, sampled every half second.
+  ( while [ ! -f "$stop" ]; do remote_claim_verdict >>"$samples"; sleep 0.5; done ) &
+  local observer=$!
+
+  local started=$(( $(date +%s) ))
+  run_dispatch_container "f/01" "$BATS_TEST_TMPDIR/dispatch" >"$BATS_TEST_TMPDIR/out" 2>&1
+  local took=$(( $(date +%s) - started ))
+  : >"$stop"
+  wait "$observer"
+
+  # The dispatch outlived stale-after by a wide margin...
+  [ "$took" -ge $(( RUNNER_CLAIM_STALE_AFTER * 2 )) ] || fail "dispatch took only ${took}s"
+  # ...and the claim was held at every sample.
+  [ "$(wc -l <"$samples" | tr -d ' ')" -ge 10 ] || fail "too few samples: $(cat "$samples")"
+  [ "$(sort -u "$samples")" = "held" ] || fail "verdicts: $(sort "$samples" | uniq -c)"
+  # The refresher is gone and the runner adopted the sha it last wrote.
+  [ -z "$CLAIM_REFRESHER_PID" ]
+  [ "$CLAIM_HELD_FEATURE" = "f" ]
+  [ "$CLAIM_HELD_SHA" != "$TAKEN_SHA" ]
+  [ "$CLAIM_HELD_SHA" = "$(git -C "$SHARED_CLAIMS" rev-parse refs/formann/claims/f)" ]
+  # So the next between-dispatch heartbeat is ours, not a false takeover.
+  heartbeat_claim >>"$BATS_TEST_TMPDIR/out" 2>&1
+  [ "$CLAIM_RESULT" = "ok" ]
+  [ -z "$RUNNER_CLAIM_LOST" ]
+}
+
+@test "run_item_container (#13) — a post-implement step container is covered too" {
+  setup_refresher_test
+  export FAKE_CONTAINER_SECONDS=7
+  printf 'review\n' >"$BATS_TEST_TMPDIR/step.md"
+  local samples="$BATS_TEST_TMPDIR/verdicts" stop="$BATS_TEST_TMPDIR/stop-observer"
+  : >"$samples"
+  ( while [ ! -f "$stop" ]; do remote_claim_verdict >>"$samples"; sleep 0.5; done ) &
+  local observer=$!
+
+  run_item_container "f/01" "$BATS_TEST_TMPDIR/item" "$BATS_TEST_TMPDIR/step.md" >"$BATS_TEST_TMPDIR/out" 2>&1
+  : >"$stop"
+  wait "$observer"
+
+  [ "$(sort -u "$samples")" = "held" ] || fail "verdicts: $(sort "$samples" | uniq -c)"
+  [ -z "$CLAIM_REFRESHER_PID" ]
+}
+
+@test "run_dispatch_container (#13) — without the refresher the same container would leave the claim stale (control)" {
+  setup_refresher_test
+  export FAKE_CONTAINER_SECONDS=7
+  start_claim_refresher() { :; }
+  run_dispatch_container "f/01" "$BATS_TEST_TMPDIR/dispatch" >/dev/null 2>&1
+  [ "$(remote_claim_verdict)" = "stale" ]
+}
+
+@test "with_claim_refresher (#13) — no claim held: no refresher starts" {
+  setup_refresher_test
+  claim release f >/dev/null
+  [ -z "$CLAIM_HELD_FEATURE" ]
+  local marker="$BATS_TEST_TMPDIR/refresher-started"
+  claim_refresh_loop() { : >"$marker"; }
+  with_claim_refresher true
+  [ -z "$CLAIM_REFRESHER_PID" ]
+  [ ! -e "$marker" ]
+}
+
+@test "with_claim_refresher (#13) — a refresh the remote can't take is logged per failure; the dispatch goes on and the claim is still held" {
+  setup_refresher_test
+  git -C "$HOST_REPO" remote set-url origin "$BATS_TEST_TMPDIR/missing.git"
+  fake_dispatch() { sleep 3; return 7; }
+
+  local rc=0
+  with_claim_refresher fake_dispatch >"$BATS_TEST_TMPDIR/out" 2>&1 || rc=$?
+
+  [ "$rc" -eq 7 ]
+  local n
+  n="$(grep -c 'could not refresh the claim on f during the dispatch' "$BATS_TEST_TMPDIR/out")"
+  [ "$n" -ge 2 ] || fail "expected a log line per failed refresh, got $n: $(cat "$BATS_TEST_TMPDIR/out")"
+  [ "$CLAIM_HELD_FEATURE" = "f" ]
+  [ "$CLAIM_HELD_SHA" = "$TAKEN_SHA" ]
+  [ -z "$RUNNER_CLAIM_LOST" ]
+}
+
+# Another runner (m2) takes the claim on `f` over mid-dispatch. The take
+# lease can lose a race against the refresher's heartbeat, so retry.
+take_over_f_by_m2() {
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    take_over_by_other f m2 2>/dev/null && return 0
+    sleep 0.3
+  done
+  return 1
+}
+
+@test "run_loop (#13) — a takeover seen by the refresher mid-dispatch sets taken-over-by; the dispatch finishes and the loop stops on the feature" {
+  setup_heartbeat_loop_test
+  export RUNNER_CLAIM_HEARTBEAT_SECONDS=1
+  plant_queue 01 02 03
+  local finished="$BATS_TEST_TMPDIR/finished"
+  : >"$finished"
+  fake_container() {
+    sleep 1.5
+    take_over_f_by_m2 || { echo "takeover never landed" >&2; return 1; }
+    sleep 2.5
+    echo "$1" >>"$finished"
+  }
+  dispatch_one() {
+    echo "$1/$2" >>"$TEST_DISPATCHED_FILE"
+    local rest
+    rest="$(tail -n +2 "$TEST_QUEUE_FILE" 2>/dev/null || true)"
+    printf '%s\n' "$rest" >"$TEST_QUEUE_FILE"
+    [ -s "$TEST_QUEUE_FILE" ] || : >"$TEST_QUEUE_FILE"
+    with_claim_refresher fake_container "$1/$2"
+  }
+
+  run_loop >"$BATS_TEST_TMPDIR/out" 2>&1
+
+  [ "$RUN_STOP_REASON" = "taken-over-by m2" ]
+  # The dispatch in flight ran to its end (never killed); no further issue.
+  [ "$(cat "$finished")" = "f/01" ]
+  [ "$(dispatched_count)" = "1" ]
+  # The refresher saw it, stopped refreshing, and the claim is m2's.
+  grep -q 'lost the claim on f during the dispatch' "$BATS_TEST_TMPDIR/out"
+  [ "$(claims_remote_field f machine)" = "m2" ]
+  [ -z "$CLAIM_HELD_FEATURE" ]
+  [ -z "$CLAIM_REFRESHER_PID" ]
+  # Not released: the claim is left to its new holder.
+  claim_release_held >/dev/null
+  [ "$(claims_remote_field f machine)" = "m2" ]
+}
+
+# A runner process in the middle of a dispatch under its claim on `f`: the
+# real run_dispatch_container against the fake container, the drain's own
+# INT/TERM handler and EXIT trap. Records the refresher's pid in
+# $BATS_TEST_TMPDIR/refresher.pid. Prints the runner's pid once both the
+# container and the refresher run.
+start_dispatching_runner() {
+  export FAKE_CONTAINER_SECONDS="$1"
+  cat >"$BATS_TEST_TMPDIR/runner.sh" <<SCRIPT
+source "$RUNNER_SCRIPT"
+HOST_REPO="$HOST_REPO"; HOST_CHECKOUT="$HOST_CHECKOUT"; HOST_RUNNER_STATE="$HOST_RUNNER_STATE"
+NET_NAME=none; RUNNER_CONTAINER_REPO_PATH=/repo; RUNNER_CONTAINER_M2_PATH=/m2
+MVN_VOLUME=vol; IMAGE_NAME=img; TOKEN=oauth; RUNNER_GIT_USER_NAME=Arne; RUNNER_GIT_USER_EMAIL=a@b.c
+RUNNER_KILL_GRACE_SECONDS=2; RUNNER_DISABLE_TRANSPORT_RETRY=1; RUNNER_DISABLE_LIVENESS=1
+RUNNER_MACHINE=m1; RUN_TS=r1; RUN_DIR=""; RUN_MODE=drain; LOCK_HELD=0
+eval "orig_\$(declare -f claim_refresh_loop)"
+claim_refresh_loop() { sh -c 'echo \$PPID' >"$BATS_TEST_TMPDIR/refresher.pid"; orig_claim_refresh_loop "\$@"; }
+trap finalize_run EXIT
+trap handle_signal INT TERM
+claim take f >/dev/null
+rc=0
+run_dispatch_container f/01 "$BATS_TEST_TMPDIR/dispatch" || rc=\$?
+echo "dispatch returned \$rc"
+SCRIPT
+  rm -f "$FAKE_CONTAINER_PID_FILE" "$BATS_TEST_TMPDIR/refresher.pid"
+  # Job control on, so SIGINT reaches the runner as from a terminal (see
+  # claim_interrupt_runner).
+  set -m
+  bash "$BATS_TEST_TMPDIR/runner.sh" >"$BATS_TEST_TMPDIR/runner.out" 2>&1 &
+  RUNNER_PID=$!
+  set +m
+  local i
+  for i in $(seq 1 100); do
+    [ -s "$FAKE_CONTAINER_PID_FILE" ] && [ -s "$BATS_TEST_TMPDIR/refresher.pid" ] && break
+    sleep 0.1
+  done
+  [ -s "$FAKE_CONTAINER_PID_FILE" ] && [ -s "$BATS_TEST_TMPDIR/refresher.pid" ] \
+    || fail "runner never reached the dispatch: $(cat "$BATS_TEST_TMPDIR/runner.out")"
+  REFRESHER_PID="$(cat "$BATS_TEST_TMPDIR/refresher.pid")"
+  CONTAINER_PID="$(cat "$FAKE_CONTAINER_PID_FILE")"
+  pid_alive "$REFRESHER_PID" || fail "no refresher running"
+}
+
+# The runner-process tests drive their own claim; drop the in-process one.
+setup_refresher_process_test() {
+  setup_refresher_test
+  claim release f >/dev/null
+}
+
+teardown_dispatching_runner() {
+  kill -KILL "${CONTAINER_PID:-}" "${REFRESHER_PID:-}" "${RUNNER_PID:-}" 2>/dev/null || true
+}
+
+@test "claim refresher (#13) — a normal exit of the container leaves no refresher behind" {
+  setup_refresher_process_test
+  start_dispatching_runner 3
+  wait "$RUNNER_PID" || true
+  grep -q 'dispatch returned 0' "$BATS_TEST_TMPDIR/runner.out" || fail "$(cat "$BATS_TEST_TMPDIR/runner.out")"
+  wait_pid_gone "$REFRESHER_PID" 1 || { teardown_dispatching_runner; fail "refresher survived a normal exit"; }
+}
+
+@test "claim refresher (#13) — SIGTERM to the runner mid-dispatch: no refresher left behind, claim released" {
+  setup_refresher_process_test
+  start_dispatching_runner 60
+  kill -TERM "$RUNNER_PID"
+  wait "$RUNNER_PID" || true
+  wait_pid_gone "$REFRESHER_PID" 1 || { teardown_dispatching_runner; fail "refresher survived SIGTERM"; }
+  wait_pid_gone "$CONTAINER_PID" 1 || { teardown_dispatching_runner; fail "container survived SIGTERM"; }
+  [ "$(remote_claim_verdict)" = "free" ]
+}
+
+@test "claim refresher (#13) — SIGINT (Ctrl-C) to the runner mid-dispatch: no refresher left behind, claim released" {
+  setup_refresher_process_test
+  start_dispatching_runner 60
+  kill -INT "$RUNNER_PID"
+  wait "$RUNNER_PID" || true
+  wait_pid_gone "$REFRESHER_PID" 1 || { teardown_dispatching_runner; fail "refresher survived SIGINT"; }
+  wait_pid_gone "$CONTAINER_PID" 1 || { teardown_dispatching_runner; fail "container survived SIGINT"; }
+  [ "$(remote_claim_verdict)" = "free" ]
+}
+
+@test "claim refresher (#13) — the container killed mid-dispatch: the dispatch returns and no refresher is left behind" {
+  setup_refresher_process_test
+  start_dispatching_runner 60
+  kill -KILL "$CONTAINER_PID"
+  wait "$RUNNER_PID" || true
+  grep -q 'dispatch returned' "$BATS_TEST_TMPDIR/runner.out" || fail "$(cat "$BATS_TEST_TMPDIR/runner.out")"
+  wait_pid_gone "$REFRESHER_PID" 1 || { teardown_dispatching_runner; fail "refresher survived the container's death"; }
+}
+
+@test "claim refresher (#13) — a runner killed outright mid-dispatch stops refreshing: stale within stale-after plus one interval" {
+  setup_refresher_process_test
+  start_dispatching_runner 60
+  [ "$(remote_claim_verdict)" = "held" ]
+  local killed_at
+  kill -KILL "$RUNNER_PID"
+  killed_at="$(date +%s)"
+  wait "$RUNNER_PID" 2>/dev/null || true
+  # The refresher notices its runner is gone within one interval.
+  wait_pid_gone "$REFRESHER_PID" $(( RUNNER_CLAIM_HEARTBEAT_SECONDS + 2 )) \
+    || { teardown_dispatching_runner; fail "refresher outlived its runner"; }
+  # And the claim goes stale within stale-after plus one interval (plus the
+  # one-second resolution of the heartbeat stamp and of this clock).
+  local bound=$(( RUNNER_CLAIM_STALE_AFTER + RUNNER_CLAIM_HEARTBEAT_SECONDS + 2 ))
+  local verdict=""
+  while [ $(( $(date +%s) - killed_at )) -le "$bound" ]; do
+    verdict="$(remote_claim_verdict)"
+    [ "$verdict" = "stale" ] && break
+    sleep 0.2
+  done
+  teardown_dispatching_runner
+  [ "$verdict" = "stale" ] || fail "claim still $verdict ${bound}s after the kill"
+}

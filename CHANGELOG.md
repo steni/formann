@@ -58,6 +58,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   has launchd and systemd recipes for running it as a service.
 
 ### Fixed
+- AFK runner keeps its Claim fresh while a dispatch runs, not only between dispatches: a companion
+  process heart-beats it every `RUNNER_CLAIM_HEARTBEAT_SECONDS` (default a third of the stale-after
+  time, 600 s) for the life of each `/implement` or post-implement container and each post-drain
+  step, so a dispatch longer than thirty minutes is no longer taken over by another runner while it
+  is still being worked. The companion is stopped on every way out of the dispatch, and stops on its
+  own when its runner is killed outright; a takeover it sees stops the feature after the dispatch in
+  flight. Pre-flight (`claim-knobs`) refuses a heartbeat interval that is not a whole number above 0
+  or not below the stale-after time.
 - AFK runner puts the runner-checkout's `origin` back to the host repo before every sync and logs
   the repair, so a dispatch that rewrote or removed the remote to push can no longer halt the next
   run with `preflight-abort: runner-checkout`. Every dispatch is told that the runner publishes

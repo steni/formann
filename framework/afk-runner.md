@@ -372,6 +372,8 @@ Fail-fast checks run before the loop starts. A failure prints `runner: <invarian
 
 | #  | Invariant          | Check                                                                                           |
 | -- | ------------------ | ----------------------------------------------------------------------------------------------- |
+| 0  | `retry-knobs`      | The numeric retry knobs (`RUNNER_TRANSPORT_RETRY_MAX_ATTEMPTS`, `RUNNER_WINDOW_RETRY_FALLBACK_WAIT`, `RUNNER_WINDOW_RETRY_MAX_WAITS`) are whole numbers. |
+| 0b | `claim-knobs`      | `RUNNER_CLAIM_HEARTBEAT_SECONDS`, when set, is a whole number above 0 and below `RUNNER_CLAIM_STALE_AFTER`. |
 | 1  | `discovery`        | `tracker-snapshot --list` exits 0 and returns a parseable JSON array of feature slugs. Persisted to `<run-dir>/discovery.json` for forensics. |
 | 1b | `runner-remote`    | Host's `runner` git remote points at the runner-checkout — registered if absent; aborts if it already exists with a conflicting URL. |
 | 2a | `runner-checkout`  | Runner-checkout clone exists or can be cloned. Runs unconditionally (all modes), before the drain/narrowed split. |
@@ -401,7 +403,7 @@ The runner stops on one of these run-level reasons. Pre-flight-phase stops and l
 - **`interrupted`** — Ctrl-C during the outer loop. The in-flight container, if any, receives SIGTERM; next feature is not started. Exit 0.
 - **`propagation-error`** — a parking-ref publish failed inside a feature's dispatch loop. The entire drain halts; no subsequent feature is considered. Exit 1.
 - A Shared-remote push refused inside a feature's loop is **not** a run-level stop: that feature's section reads `parked` and the drain moves on to the next feature.
-- A feature another runner holds a **Claim** on is skipped before its first dispatch — its section reads `held-by <machine>` — and the drain moves on to the next feature. A stale claim (no heartbeat for thirty minutes) is taken over instead. A feature whose claim another runner took over mid-drain stops after the dispatch in flight — its section reads `taken-over-by <machine>` — and the drain moves on. See *Claims across machines* in the runner README.
+- A feature another runner holds a **Claim** on is skipped before its first dispatch — its section reads `held-by <machine>` — and the drain moves on to the next feature. A stale claim (no heartbeat for `RUNNER_CLAIM_STALE_AFTER` seconds, default thirty minutes) is taken over instead. The holder heart-beats between dispatches and, through a companion process, every `RUNNER_CLAIM_HEARTBEAT_SECONDS` (default a third of stale-after) while a dispatch runs, so a long dispatch never makes a live claim look stale. A feature whose claim another runner took over mid-drain stops after the dispatch in flight — its section reads `taken-over-by <machine>` — and the drain moves on. See *Claims across machines* in the runner README.
 - **`discovery-failed`** — `tracker-snapshot --list` exited non-zero or returned unparseable JSON. Surfaces as `preflight-abort: discovery` in the existing pre-flight stop family. Exit 2.
 
 ### Narrowed modes (`--feature`, `--issue`)

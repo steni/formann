@@ -267,7 +267,7 @@ run_post_drain_phase() {
     log_base="$log_dir/$suffix"
     format_progress_start "$(now_clock)" "$feature" "post-drain:$label"
     started=$(date +%s)
-    run_post_drain_step "$feature" "$label" "$path" "$log_base" || rc=$?
+    with_claim_refresher run_post_drain_step "$feature" "$label" "$path" "$log_base" || rc=$?
     duration=$(( $(date +%s) - started ))
     local rel_log="${POST_DRAIN_STEP_LOG#$run_dir/}"
 
