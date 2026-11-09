@@ -285,10 +285,11 @@ remote_claim_field() {
   CLAIM_HELD_SHA="$(remote_claim_sha alpha)"
   before_sha="$CLAIM_HELD_SHA"
 
-  run claim heartbeat alpha
-  assert_success
-  assert_output "ok"
-  claim heartbeat alpha >/dev/null
+  # One call, in this shell: `run` would heartbeat in a subshell and leave
+  # CLAIM_HELD_SHA behind, so a second heartbeat would lease on a stale sha
+  # and pass only when both landed in the same second (identical commits).
+  claim heartbeat alpha >"$BATS_TEST_TMPDIR/heartbeat.out"
+  [ "$(cat "$BATS_TEST_TMPDIR/heartbeat.out")" = "ok" ]
   [ "$CLAIM_RESULT" = "ok" ]
   [ "$CLAIM_HELD_SHA" = "$(remote_claim_sha alpha)" ]
   [ "$CLAIM_HELD_SHA" != "$before_sha" ]
