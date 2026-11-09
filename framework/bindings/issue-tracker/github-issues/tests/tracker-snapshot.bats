@@ -22,7 +22,8 @@ setup() {
 #!/usr/bin/env bash
 if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
   # Count calls (this call not yet recorded)
-  prior_count=$(wc -l <"${CALL_LOG}" 2>/dev/null | tr -d ' ')
+  # Count logged calls, not log lines: a query spans several lines.
+  prior_count=$(grep -c '^graphql call' "${CALL_LOG}" 2>/dev/null)
   call_num=$((prior_count + 1))
   echo "graphql call $call_num: $*" >>"${CALL_LOG}"
 
@@ -390,4 +391,212 @@ _parse_origin_and_call() {
   run cat "$CALL_LOG"
   assert_output --partial "owner=some-owner"
   assert_output --partial "name=some-repo"
+}
+
+# ════════════════════════════════════════════════════════════════════════════════
+# --any-eligible
+#
+# One question for the whole tracker: is any issue in any active feature
+# eligible?  Answered by one GraphQL query over the open ready-for-agent issues
+# (plus pages), never by a snapshot per feature.
+# ════════════════════════════════════════════════════════════════════════════════
+
+# Write an --any-eligible response page holding the given issue nodes (a JSON
+# array) to $FIXTURE_RESPONSES_DIR/graphql-response[-N].json.
+# Args: $1 = nodes JSON array  $2 = page file suffix ("" or "-N")
+#       $3 = hasNextPage (default false)  $4 = endCursor (default null)
+_any_page() {
+  local nodes="$1" suffix="${2:-}" next="${3:-false}" cursor="${4:-null}"
+  mkdir -p "$FIXTURE_RESPONSES_DIR"
+  jq -n --argjson nodes "$nodes" --argjson next "$next" --argjson cursor "$cursor" \
+    '{data:{repository:{issues:{pageInfo:{hasNextPage:$next,endCursor:$cursor},nodes:$nodes}}}}' \
+    >"$FIXTURE_RESPONSES_DIR/graphql-response${suffix}.json"
+}
+
+# One ready-for-agent node.  Args: $1 = number  $2 = type label (afk|hitl)
+# $3 = parent JSON (null for a standalone)  $4 = blockedBy nodes JSON array
+# $5 = extra labels JSON array (default [])
+_ready_node() {
+  jq -n --argjson n "$1" --arg t "$2" --argjson p "$3" --argjson b "$4" \
+    --argjson extra "${5:-[]}" \
+    '{number:$n, state:"OPEN",
+      labels:{nodes:([{name:"formann:status:ready-for-agent"},{name:"formann:category:enhancement"},{name:("formann:type:" + $t)}] + $extra)},
+      parent:$p, blockedBy:{nodes:$b}}'
+}
+
+_feature_parent='{"number":10,"state":"OPEN","labels":{"nodes":[{"name":"formann:feature"},{"name":"formann:slug:alpha"}]}}'
+
+@test "--any-eligible: no when every ready AFK issue is blocked by an unfinished blocker in its feature" {
+  export FIXTURE_RESPONSES_DIR="$BATS_TEST_TMPDIR/any-unfinished"
+  _any_page "[$(_ready_node 11 afk "$_feature_parent" '[{"number":12,"state":"OPEN","stateReason":null,"parent":{"number":10}}]')]"
+  run "$TRACKER_SNAPSHOT" --any-eligible
+  assert_success
+  assert_output "no"
+}
+
+@test "--any-eligible: no when the only blocker is done but external (another feature's sub-issue)" {
+  export FIXTURE_RESPONSES_DIR="$BATS_TEST_TMPDIR/any-external"
+  _any_page "[$(_ready_node 11 afk "$_feature_parent" '[{"number":40,"state":"CLOSED","stateReason":"COMPLETED","parent":{"number":39}}]')]"
+  run "$TRACKER_SNAPSHOT" --any-eligible
+  assert_success
+  assert_output "no"
+}
+
+@test "--any-eligible: no when the only blocker is done but has no parent (a standalone outside the feature)" {
+  export FIXTURE_RESPONSES_DIR="$BATS_TEST_TMPDIR/any-orphan-blocker"
+  _any_page "[$(_ready_node 11 afk "$_feature_parent" '[{"number":40,"state":"CLOSED","stateReason":"COMPLETED","parent":null}]')]"
+  run "$TRACKER_SNAPSHOT" --any-eligible
+  assert_success
+  assert_output "no"
+}
+
+@test "--any-eligible: no when a blocker in the feature was closed as not planned" {
+  export FIXTURE_RESPONSES_DIR="$BATS_TEST_TMPDIR/any-wontfix"
+  _any_page "[$(_ready_node 11 afk "$_feature_parent" '[{"number":12,"state":"CLOSED","stateReason":"NOT_PLANNED","parent":{"number":10}}]')]"
+  run "$TRACKER_SNAPSHOT" --any-eligible
+  assert_success
+  assert_output "no"
+}
+
+@test "--any-eligible: no when the only ready issues are HITL" {
+  export FIXTURE_RESPONSES_DIR="$BATS_TEST_TMPDIR/any-hitl"
+  _any_page "[$(_ready_node 11 hitl "$_feature_parent" '[]'),$(_ready_node 13 hitl null '[]' '[{"name":"formann:feature"},{"name":"formann:slug:solo"}]')]"
+  run "$TRACKER_SNAPSHOT" --any-eligible
+  assert_success
+  assert_output "no"
+}
+
+@test "--any-eligible: no when no issue is ready at all" {
+  export FIXTURE_RESPONSES_DIR="$BATS_TEST_TMPDIR/any-none"
+  _any_page '[]'
+  run "$TRACKER_SNAPSHOT" --any-eligible
+  assert_success
+  assert_output "no"
+}
+
+@test "--any-eligible: no when the ready issue is in no feature (parent closed, or no slug anywhere)" {
+  export FIXTURE_RESPONSES_DIR="$BATS_TEST_TMPDIR/any-no-feature"
+  _any_page "[$(_ready_node 11 afk '{"number":10,"state":"CLOSED","labels":{"nodes":[{"name":"formann:slug:alpha"}]}}' '[]'),$(_ready_node 13 afk '{"number":20,"state":"OPEN","labels":{"nodes":[]}}' '[]'),$(_ready_node 15 afk null '[]')]"
+  run "$TRACKER_SNAPSHOT" --any-eligible
+  assert_success
+  assert_output "no"
+}
+
+@test "--any-eligible: yes when one ready AFK issue is unblocked" {
+  export FIXTURE_RESPONSES_DIR="$BATS_TEST_TMPDIR/any-unblocked"
+  _any_page "[$(_ready_node 11 afk "$_feature_parent" '[{"number":12,"state":"OPEN","stateReason":null,"parent":{"number":10}}]'),$(_ready_node 14 afk "$_feature_parent" '[]')]"
+  run "$TRACKER_SNAPSHOT" --any-eligible
+  assert_success
+  assert_output "yes"
+}
+
+@test "--any-eligible: yes when all its blockers in the same feature are done" {
+  export FIXTURE_RESPONSES_DIR="$BATS_TEST_TMPDIR/any-all-done"
+  _any_page "[$(_ready_node 11 afk "$_feature_parent" '[{"number":12,"state":"CLOSED","stateReason":"COMPLETED","parent":{"number":10}},{"number":13,"state":"CLOSED","stateReason":"COMPLETED","parent":{"number":10}}]')]"
+  run "$TRACKER_SNAPSHOT" --any-eligible
+  assert_success
+  assert_output "yes"
+}
+
+@test "--any-eligible: yes for a standalone work item whose blocker is its own done sub-issue" {
+  export FIXTURE_RESPONSES_DIR="$BATS_TEST_TMPDIR/any-standalone"
+  _any_page "[$(_ready_node 27 afk null '[{"number":30,"state":"CLOSED","stateReason":"COMPLETED","parent":{"number":27}}]' '[{"name":"formann:feature"},{"name":"formann:slug:solo"}]')]"
+  run "$TRACKER_SNAPSHOT" --any-eligible
+  assert_success
+  assert_output "yes"
+}
+
+@test "--any-eligible: one GraphQL query for a single page, filtered on the ready-for-agent label" {
+  export FIXTURE_RESPONSES_DIR="$BATS_TEST_TMPDIR/any-one-call"
+  _any_page '[]'
+  run "$TRACKER_SNAPSHOT" --any-eligible
+  assert_success
+  [ "$(graphql_call_count)" -eq 1 ]
+  grep -q 'formann:status:ready-for-agent' "$CALL_LOG"
+}
+
+@test "--any-eligible: follows pages until it finds an eligible issue" {
+  export FIXTURE_RESPONSES_DIR="$BATS_TEST_TMPDIR/any-pages"
+  _any_page "[$(_ready_node 11 hitl "$_feature_parent" '[]')]" "-1" true '"CURSOR1"'
+  _any_page "[$(_ready_node 14 afk "$_feature_parent" '[]')]" "-2" true '"CURSOR2"'
+  _any_page '[]' "-3"
+  run "$TRACKER_SNAPSHOT" --any-eligible
+  assert_success
+  assert_output "yes"
+  # Page 2 answered it; page 3 is never asked for.
+  [ "$(graphql_call_count)" -eq 2 ]
+  # The second call (and only it) carries page 1's cursor.
+  grep '^graphql call 2:' "$CALL_LOG" | grep -q 'cursor=CURSOR1'
+  [ -z "$(grep '^graphql call 1:' "$CALL_LOG" | grep 'cursor=' || true)" ]
+}
+
+@test "--any-eligible: no after the last page when no page has an eligible issue" {
+  export FIXTURE_RESPONSES_DIR="$BATS_TEST_TMPDIR/any-pages-no"
+  _any_page "[$(_ready_node 11 hitl "$_feature_parent" '[]')]" "-1" true '"CURSOR1"'
+  _any_page "[$(_ready_node 14 hitl "$_feature_parent" '[]')]" "-2"
+  run "$TRACKER_SNAPSHOT" --any-eligible
+  assert_success
+  assert_output "no"
+  [ "$(graphql_call_count)" -eq 2 ]
+}
+
+@test "--any-eligible: a persistent API failure exits 3" {
+  export FIXTURE_RESPONSES_DIR="$BATS_TEST_TMPDIR/any-fail"
+  _any_page '[]'
+  export FAIL_FIRST_N=99
+  run --separate-stderr "$TRACKER_SNAPSHOT" --any-eligible
+  [ "$status" -eq 3 ]
+  [ -z "$output" ]
+}
+
+# Rewrite a recorded <slug>-mode response as the --any-eligible query would
+# see the same tracker: the parent (labelled with the slug, as the slug query
+# implies) and its sub-issues, keeping the open ready-for-agent ones, each with
+# its parent and its blockers' state, close reason and parent.  A blocker
+# outside the recorded set is an open issue outside the feature.
+_as_any_eligible_response() {
+  local slug="$1" in="$2"
+  jq --arg slug "$slug" '
+    (.data.repository.issues.nodes[0]) as $p
+    | ($p.labels.nodes // []) as $pl
+    | ($pl + (if any($pl[]; .name == ("formann:slug:" + $slug)) then []
+              else [{name: ("formann:slug:" + $slug)}] end)) as $plabels
+    | {number: $p.number, state: ($p.state // "OPEN"), labels: {nodes: $plabels}} as $pnode
+    | ([{number: $p.number, state: ($p.state // "OPEN"), stateReason: $p.stateReason,
+         labels: {nodes: $plabels}, blockedBy: ($p.blockedBy // {nodes: []}), parent: null}]
+       + [($p.subIssues.nodes // [])[] | . + {parent: $pnode}]) as $all
+    | {data: {repository: {issues: {pageInfo: {hasNextPage: false, endCursor: null},
+        nodes: [ $all[]
+          | select((.state // "OPEN") == "OPEN")
+          | select(any(.labels.nodes[]?; .name == "formann:status:ready-for-agent"))
+          | . as $i
+          | .blockedBy.nodes = [ ($i.blockedBy.nodes // [])[] | .number as $n
+              | (first($all[] | select(.number == $n)) // null) as $b
+              | if $b then {number: $n, state: ($b.state // "OPEN"), stateReason: $b.stateReason,
+                            parent: (if $b.parent then {number: $b.parent.number} else null end)}
+                else {number: $n, state: "OPEN", stateReason: null, parent: null} end ] ]}}}}' "$in"
+}
+
+@test "--any-eligible agrees with 'some issue is eligible' on every recorded snapshot fixture" {
+  local checked=0 dir slug want got
+  for dir in "$FIXTURES"/*/; do
+    dir="${dir%/}"
+    [ -f "$dir/expected.json" ] || continue
+    # Slug-mode goldens only (the --list goldens are arrays).
+    jq -e 'type == "object" and has("issues")' "$dir/expected.json" >/dev/null || continue
+    slug="$(jq -r '.feature' "$dir/expected.json")"
+    want="$(jq -r 'if any(.issues[]; .eligible == true) then "yes" else "no" end' "$dir/expected.json")"
+    export FIXTURE_RESPONSES_DIR="$BATS_TEST_TMPDIR/agree-$(basename "$dir")"
+    mkdir -p "$FIXTURE_RESPONSES_DIR"
+    _as_any_eligible_response "$slug" "$dir/recorded-responses/graphql-response.json" \
+      >"$FIXTURE_RESPONSES_DIR/graphql-response.json"
+    got="$("$TRACKER_SNAPSHOT" --any-eligible)"
+    if [ "$got" != "$want" ]; then
+      echo "$(basename "$dir"): --any-eligible said $got, the snapshot says $want" >&2
+      return 1
+    fi
+    checked=$((checked + 1))
+  done
+  # The fixture set has both answers; make sure the loop really ran over them.
+  [ "$checked" -ge 7 ]
 }

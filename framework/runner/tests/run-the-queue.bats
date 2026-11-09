@@ -6873,6 +6873,10 @@ setup_drain_test() {
     return 0
   }
 
+  # The pass-level cheap check (#15) says there is work, so the drain walks
+  # every feature; the --any-eligible tests below plant other answers.
+  any_eligible_check() { ANY_ELIGIBLE_ANSWER="yes"; ANY_ELIGIBLE_FAILURE=""; }
+
   RUN_DIR="$BATS_TEST_TMPDIR/run"
   mkdir -p "$RUN_DIR"
   RUNNER_INTERRUPTED=0
@@ -10727,4 +10731,176 @@ teardown_dispatching_runner() {
   done
   teardown_dispatching_runner
   [ "$verdict" = "stale" ] || fail "claim still $verdict ${bound}s after the kill"
+}
+
+# === Drain pass: the cheap any-eligible check (#15) ===========================
+#
+# Before walking features one by one, a drain pass asks the binding once
+# (`tracker-snapshot --any-eligible`). On `no` with no pending Blocked re-walk
+# marker the pass ends at once: no per-feature snapshot, no branch sync.
+
+# Record every per-feature sync and snapshot the drain attempts.
+setup_any_eligible_drain_test() {
+  setup_drain_test
+  DISCOVERY_JSON='["alpha","beta"]'
+  HOST_BLOCKED_DIR="$BATS_TEST_TMPDIR/blocked"
+  ANY_SYNCS="$BATS_TEST_TMPDIR/syncs"
+  ANY_SNAPS="$BATS_TEST_TMPDIR/snaps"
+  : >"$ANY_SYNCS"
+  : >"$ANY_SNAPS"
+  eval "_any_orig_sync() $(declare -f ensure_runner_checkout_on_branch | sed 1d)"
+  eval "_any_orig_snap() $(declare -f take_snapshot | sed 1d)"
+  ensure_runner_checkout_on_branch() { echo "$1" >>"$ANY_SYNCS"; _any_orig_sync "$@"; }
+  take_snapshot() { echo "$1" >>"$ANY_SNAPS"; _any_orig_snap "$@"; }
+}
+
+@test "run_drain — check says no, nothing pending: the pass ends at once, no snapshot, no branch sync, one log line" {
+  setup_any_eligible_drain_test
+  any_eligible_check() { ANY_ELIGIBLE_ANSWER="no"; }
+
+  run_drain >"$BATS_TEST_TMPDIR/out" 2>&1
+
+  [ "$RUN_STOP_REASON" = "nothing-eligible" ]
+  [ ! -s "$ANY_SYNCS" ]
+  [ ! -s "$ANY_SNAPS" ]
+  [ "$(drain_outcomes_count)" = "0" ]
+  [ "$(drained_features_count)" = "0" ]
+  [ "$(grep -c 'nothing to do' "$BATS_TEST_TMPDIR/out")" -eq 1 ]
+  [ "$(wc -l <"$BATS_TEST_TMPDIR/out" | tr -d ' ')" -eq 1 ]
+}
+
+@test "run_drain — check says no but a Blocked re-walk marker is pending: the pass walks every feature" {
+  setup_any_eligible_drain_test
+  TEST_CHECKS="$BATS_TEST_TMPDIR/checks"
+  : >"$TEST_CHECKS"
+  any_eligible_check() { echo x >>"$TEST_CHECKS"; ANY_ELIGIBLE_ANSWER="no"; }
+  write_blocked_marker beta 03 "review" "the staging DB"
+
+  run_drain >/dev/null 2>&1
+
+  [ "$RUN_STOP_REASON" = "completed" ]
+  [ "$(cat "$ANY_SNAPS" | tr '\n' ' ')" = "alpha beta " ]
+  [ "$(drain_outcomes_count)" = "2" ]
+  # The local marker settles it: no tracker call at all.
+  [ ! -s "$TEST_CHECKS" ]
+}
+
+@test "run_drain — a post-drain Blocked marker is pending work too" {
+  setup_any_eligible_drain_test
+  any_eligible_check() { ANY_ELIGIBLE_ANSWER="no"; }
+  write_blocked_marker alpha post-drain "smoke" "the device lab"
+
+  run_drain >/dev/null 2>&1
+
+  [ "$RUN_STOP_REASON" = "completed" ]
+  grep -Fxq alpha "$ANY_SNAPS"
+}
+
+@test "run_drain — a marker for a feature no longer discovered does not hold the pass open" {
+  setup_any_eligible_drain_test
+  any_eligible_check() { ANY_ELIGIBLE_ANSWER="no"; }
+  write_blocked_marker archived-feature 02 "review" "x"
+
+  run_drain >/dev/null 2>&1
+
+  [ "$RUN_STOP_REASON" = "nothing-eligible" ]
+  [ ! -s "$ANY_SNAPS" ]
+}
+
+@test "run_drain — check says yes: the pass walks and dispatches as today" {
+  setup_any_eligible_drain_test
+  any_eligible_check() { ANY_ELIGIBLE_ANSWER="yes"; }
+
+  run_drain >"$BATS_TEST_TMPDIR/out" 2>&1
+
+  [ "$RUN_STOP_REASON" = "completed" ]
+  [ "$(drain_outcome_nth 0)" = "alpha|drained" ]
+  [ "$(drain_outcome_nth 1)" = "beta|drained" ]
+  [ "$(drained_features_count)" = "2" ]
+  run grep -q 'any-eligible\|nothing to do' "$BATS_TEST_TMPDIR/out"
+  assert_failure
+}
+
+@test "run_drain — a failed check falls back to the full walk, logged once" {
+  setup_any_eligible_drain_test
+  # The real any_eligible_check, against a binding script that fails transiently.
+  unset -f any_eligible_check
+  eval "$(sed -n '/^any_eligible_check() {/,/^}/p' "$RUNNER_SCRIPT")"
+  mkdir -p "$HOST_REPO/docs/formann/issue-tracker"
+  printf '#!/usr/bin/env bash\necho "tracker-snapshot: API request failed after 3 attempts" >&2\nexit 3\n' \
+    >"$HOST_REPO/docs/formann/issue-tracker/tracker-snapshot"
+
+  run_drain >"$BATS_TEST_TMPDIR/out" 2>&1
+
+  [ "$RUN_STOP_REASON" = "completed" ]
+  [ "$(cat "$ANY_SNAPS" | tr '\n' ' ')" = "alpha beta " ]
+  [ "$(drained_features_count)" = "2" ]
+  [ "$(grep -c 'any-eligible check failed' "$BATS_TEST_TMPDIR/out")" -eq 1 ]
+  grep -q 'tracker-snapshot --any-eligible exited 3); walking every feature' "$BATS_TEST_TMPDIR/out"
+}
+
+@test "any_eligible_check — an answer that is neither yes nor no is a failed check" {
+  HOST_REPO="$BATS_TEST_TMPDIR/host"
+  mkdir -p "$HOST_REPO/docs/formann/issue-tracker"
+  printf '#!/usr/bin/env bash\necho maybe\n' >"$HOST_REPO/docs/formann/issue-tracker/tracker-snapshot"
+  run any_eligible_check
+  assert_failure
+  any_eligible_check || true
+  [ "$ANY_ELIGIBLE_FAILURE" = "answered 'maybe'" ]
+}
+
+@test "run_drain — with the real local-markdown binding: no eligible issue anywhere ends the pass before any snapshot" {
+  setup_any_eligible_drain_test
+  unset -f any_eligible_check
+  eval "$(sed -n '/^any_eligible_check() {/,/^}/p' "$RUNNER_SCRIPT")"
+  mkdir -p "$HOST_REPO/docs/formann/issue-tracker"
+  cp "$HERE/../bindings/issue-tracker/local-markdown/tracker-snapshot" \
+     "$HOST_REPO/docs/formann/issue-tracker/tracker-snapshot"
+  local i="$HOST_REPO/.features/alpha/issues"
+  mkdir -p "$i" "$HOST_REPO/.features/beta/issues"
+  printf -- '---\nstatus: ready-for-agent\ncategory: enhancement\ntype: HITL\n---\n\n# A\n' >"$i/01-a.md"
+
+  run_drain >/dev/null 2>&1
+  [ "$RUN_STOP_REASON" = "nothing-eligible" ]
+  [ ! -s "$ANY_SNAPS" ]
+
+  # Make one issue AFK: the same check now says yes and the pass walks.
+  printf -- '---\nstatus: ready-for-agent\ncategory: enhancement\ntype: AFK\n---\n\n# A\n' >"$i/01-a.md"
+  RUN_STOP_REASON=""
+  run_drain >/dev/null 2>&1
+  [ "$RUN_STOP_REASON" = "completed" ]
+  grep -Fxq alpha "$ANY_SNAPS"
+}
+
+@test "format_multi_feature_summary_md — a nothing-eligible pass says so in one line" {
+  run bash -c "source '$RUNNER_SCRIPT'; printf '' | format_multi_feature_summary_md 20261109-120000 12:00:00 12:00:01 ended nothing-eligible"
+  assert_success
+  assert_output --partial "- Stop reason: nothing-eligible"
+  [ "$(printf '%s\n' "$output" | grep -c '^Nothing to do: no feature has an eligible issue')" -eq 1 ]
+}
+
+@test "run_idle — a quiet drain pass counts as a pass with nothing to do, and the next pass asks again" {
+  setup_any_eligible_drain_test
+  RUN_MODE=drain
+  ARG_IDLE=1
+  RUN_PASS=0
+  RUN_IDLE_PASSES=0
+  RUN_PASSES=()
+  RUN_POST_DRAIN=()
+  TEST_CHECKS="$BATS_TEST_TMPDIR/checks"
+  : >"$TEST_CHECKS"
+  any_eligible_check() { echo x >>"$TEST_CHECKS"; ANY_ELIGIBLE_ANSWER="no"; }
+  prepare_idle_pass() { return 0; }
+  idle_sleep() { [ "$RUN_PASS" -lt 3 ] || RUNNER_INTERRUPTED=1; }
+
+  run_idle run_drain >"$BATS_TEST_TMPDIR/progress" 2>&1
+
+  [ "$RUN_PASS" -eq 3 ]
+  [ "$RUN_IDLE_PASSES" -eq 3 ]
+  [ "$(wc -l <"$TEST_CHECKS" | tr -d ' ')" -eq 3 ]
+  [ ! -s "$ANY_SNAPS" ]
+  [ ! -s "$ANY_SYNCS" ]
+  grep -q 'pass 1 ended (nothing-eligible)' "$BATS_TEST_TMPDIR/progress"
+  run format_passes_section
+  assert_output --partial "3 pass(es) in total; 3 found nothing to do."
 }

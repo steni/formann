@@ -231,3 +231,149 @@ assert_snapshot_matches_golden() {
   [ "$eligible_field" = "true" ]
   [ "$has_parse_error" = "false" ]
 }
+
+# === tracker-snapshot --any-eligible ==========================================
+#
+# `yes` when some active feature's snapshot holds an eligible issue, `no`
+# otherwise — the cheap check the runner makes before a drain pass.
+
+# Write an issue file. Args: $1=tracker root  $2=feature  $3=NN  $4=status
+# $5=type  $6=blocked-by line (default "None.")
+_lm_issue() {
+  local root="$1" feature="$2" nn="$3" status="$4" type="$5" blocked="${6:-None.}"
+  mkdir -p "$root/$feature/issues"
+  printf -- '---\nstatus: %s\ncategory: enhancement\ntype: %s\n---\n\n# Issue %s\n\n## Blocked by\n\n%s\n' \
+    "$status" "$type" "$nn" "$blocked" >"$root/$feature/issues/$nn-issue.md"
+}
+
+@test "--any-eligible — no when every ready AFK issue has an unfinished blocker in its feature" {
+  local root="$BATS_TEST_TMPDIR/any-unfinished"
+  _lm_issue "$root" alpha 01 in-review AFK
+  _lm_issue "$root" alpha 02 ready-for-agent AFK "- alpha/01"
+  TRACKER_ROOT="$root" run "$TRACKER_SNAPSHOT" --any-eligible
+  assert_success
+  assert_output "no"
+}
+
+@test "--any-eligible — no when the only blocker is done but in another feature" {
+  local root="$BATS_TEST_TMPDIR/any-external"
+  _lm_issue "$root" alpha 01 ready-for-agent AFK "- beta/01"
+  _lm_issue "$root" beta 01 done AFK
+  TRACKER_ROOT="$root" run "$TRACKER_SNAPSHOT" --any-eligible
+  assert_success
+  assert_output "no"
+}
+
+@test "--any-eligible — no when the only ready issues are HITL" {
+  local root="$BATS_TEST_TMPDIR/any-hitl"
+  _lm_issue "$root" alpha 01 ready-for-agent HITL
+  _lm_issue "$root" beta 01 ready-for-agent HITL
+  TRACKER_ROOT="$root" run "$TRACKER_SNAPSHOT" --any-eligible
+  assert_success
+  assert_output "no"
+}
+
+@test "--any-eligible — no for an empty or missing tracker root, and archived features don't count" {
+  local root="$BATS_TEST_TMPDIR/any-empty"
+  mkdir -p "$root"
+  _lm_issue "$root/.archived" old 01 ready-for-agent AFK
+  TRACKER_ROOT="$root" run "$TRACKER_SNAPSHOT" --any-eligible
+  assert_success
+  assert_output "no"
+  TRACKER_ROOT="$BATS_TEST_TMPDIR/no-such-root" run "$TRACKER_SNAPSHOT" --any-eligible
+  assert_success
+  assert_output "no"
+}
+
+@test "--any-eligible — yes when one ready AFK issue (in a later feature) is unblocked" {
+  local root="$BATS_TEST_TMPDIR/any-unblocked"
+  _lm_issue "$root" alpha 01 ready-for-agent HITL
+  _lm_issue "$root" beta 01 ready-for-agent AFK
+  TRACKER_ROOT="$root" run "$TRACKER_SNAPSHOT" --any-eligible
+  assert_success
+  assert_output "yes"
+}
+
+@test "--any-eligible — yes when all its blockers in the same feature are done" {
+  local root="$BATS_TEST_TMPDIR/any-all-done"
+  _lm_issue "$root" alpha 01 done AFK
+  _lm_issue "$root" alpha 02 done AFK
+  _lm_issue "$root" alpha 03 ready-for-agent AFK "- alpha/01
+- alpha/02"
+  TRACKER_ROOT="$root" run "$TRACKER_SNAPSHOT" --any-eligible
+  assert_success
+  assert_output "yes"
+}
+
+@test "--any-eligible agrees with 'some issue is eligible' on every snapshot fixture" {
+  local checked=0 dir name want got root
+  for dir in "$FIXTURES"/*/; do
+    dir="${dir%/}"
+    name="$(basename "$dir")"
+    [ -f "$dir/expected.json" ] && [ -d "$dir/issues" ] || continue
+    want="$(jq -r 'if any(.issues[]; .eligible == true) then "yes" else "no" end' "$dir/expected.json")"
+    # A tracker root holding this one feature only.
+    root="$BATS_TEST_TMPDIR/agree/$name"
+    mkdir -p "$root"
+    cp -R "$dir" "$root/$name"
+    got="$(TRACKER_ROOT="$root" "$TRACKER_SNAPSHOT" --any-eligible)"
+    if [ "$got" != "$want" ]; then
+      echo "$name: --any-eligible said $got, the snapshot says $want" >&2
+      return 1
+    fi
+    checked=$((checked + 1))
+  done
+  [ "$checked" -ge 7 ]
+  # And all of them together: some fixture is eligible.
+  run "$TRACKER_SNAPSHOT" --any-eligible
+  assert_success
+  assert_output "yes"
+}
+
+@test "--any-eligible — reads the feature's committed branch when it is ahead of the working tree" {
+  # The runner snapshots a feature on its own branch. An issue made ready
+  # there (and not on the branch checked out in the working tree) is work.
+  local repo="$BATS_TEST_TMPDIR/any-branch-repo"
+  mkdir -p "$repo"
+  git -C "$repo" init --quiet --initial-branch=main
+  _lm_issue "$repo/.features" alpha 01 needs-triage AFK
+  git -C "$repo" add .features
+  git -C "$repo" -c user.email=t@t -c user.name=t commit --quiet -m init
+  TRACKER_ROOT="$repo/.features" run "$TRACKER_SNAPSHOT" --any-eligible
+  assert_output "no"
+
+  git -C "$repo" checkout --quiet -b alpha
+  _lm_issue "$repo/.features" alpha 01 ready-for-agent AFK
+  git -C "$repo" -c user.email=t@t -c user.name=t commit --quiet -am "tracker: ready"
+  git -C "$repo" checkout --quiet main
+
+  TRACKER_ROOT="$repo/.features" run "$TRACKER_SNAPSHOT" --any-eligible
+  assert_success
+  assert_output "yes"
+
+  # A remote-tracking branch of that name counts the same way.
+  local other="$BATS_TEST_TMPDIR/any-branch-other"
+  git clone --quiet "$repo" "$other"
+  git -C "$repo" branch --quiet -D alpha
+  TRACKER_ROOT="$repo/.features" run "$TRACKER_SNAPSHOT" --any-eligible
+  assert_output "no"
+  [ -d "$other/.features/alpha" ]
+  TRACKER_ROOT="$other/.features" run "$TRACKER_SNAPSHOT" --any-eligible
+  assert_success
+  assert_output "yes"
+}
+
+@test "--any-eligible — with SNAPSHOT_CHECKOUT_DIR reads that repo's HEAD (not the working tree)" {
+  local repo="$BATS_TEST_TMPDIR/any-checkout"
+  mkdir -p "$repo"
+  git -C "$repo" init --quiet --initial-branch=main
+  _lm_issue "$repo/.features" alpha 01 ready-for-agent AFK
+  git -C "$repo" add .features
+  git -C "$repo" -c user.email=t@t -c user.name=t commit --quiet -m init
+  # Uncommitted: the issue is no longer ready in the working tree.
+  _lm_issue "$repo/.features" alpha 01 in-review AFK
+  unset TRACKER_ROOT
+  SNAPSHOT_CHECKOUT_DIR="$repo" run "$TRACKER_SNAPSHOT" --any-eligible
+  assert_success
+  assert_output "yes"
+}

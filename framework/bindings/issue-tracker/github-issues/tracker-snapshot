@@ -3,10 +3,18 @@
 ### tracker-snapshot — github-issues binding's machine-readable interface.
 ###
 ### Usage: tracker-snapshot --list
+###        tracker-snapshot --any-eligible
 ###        tracker-snapshot <feature-slug>
 ###
 ### --list:  Emit a JSON array of active feature slugs (open formann:feature
 ###          parent issues, ordered by issue number ascending).
+###
+### --any-eligible:
+###          Print `yes` when at least one issue in an active feature would be
+###          `eligible: true` in that feature's own snapshot, otherwise `no`.
+###          One GraphQL query (plus pages) over the open ready-for-agent
+###          issues, never one per feature.  Exit 0 either way; 3 on a
+###          transient failure.
 ###
 ### <slug>:  Emit a JSON object describing the feature's sub-issues with their
 ###          metadata and eligibility.  Schema byte-compatible with the
@@ -33,7 +41,7 @@ if ! command -v jq &>/dev/null; then
 fi
 
 if [ "$#" -lt 1 ]; then
-  echo "usage: tracker-snapshot <feature-slug> | tracker-snapshot --list" >&2
+  echo "usage: tracker-snapshot <feature-slug> | tracker-snapshot --list | tracker-snapshot --any-eligible" >&2
   exit "$_EXIT_USAGE"
 fi
 
@@ -173,6 +181,91 @@ if [ "$1" = "--list" ]; then
     _k=$((_k + 1))
   done
   printf ']\n'
+  exit 0
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# --any-eligible mode
+# ═══════════════════════════════════════════════════════════════════════════════
+# One question for the whole tracker: would any feature's snapshot hold an
+# eligible issue?  Asked with one query over the open ready-for-agent issues
+# (paginated), each with its parent and its blockers' state, close reason and
+# parent, so the snapshot's blocker resolution can be applied in memory:
+#
+#   - The issue must be open, ready-for-agent and AFK.
+#   - It must belong to a feature: its parent is open and carries a
+#     formann:slug:* label (a sub-issue), or it carries one itself (a
+#     standalone work item, the parent of its own feature).
+#   - Every blocker must be done (closed as completed) and in the same
+#     feature: the feature's parent itself, or a sub-issue of it.
+#
+# The repository `labels:` filter matches any of the listed labels, not all
+# of them, so the query filters on the status label alone and the type is
+# checked here.  Where the snapshot could differ (a slug shared by two
+# parents, say) the answer errs towards `yes`: a wrong `yes` costs one full
+# pass, a wrong `no` would leave work undispatched.
+if [ "$1" = "--any-eligible" ]; then
+  _any_query='query($owner: String!, $name: String!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    issues(labels: ["formann:status:ready-for-agent"], states: [OPEN], first: 100, after: $cursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number
+        state
+        labels(first: 30) { nodes { name } }
+        parent { number state labels(first: 30) { nodes { name } } }
+        blockedBy(first: 50) {
+          nodes { number state stateReason parent { number } }
+        }
+      }
+    }
+  }
+}'
+
+  _cursor=""
+  while :; do
+    if [ -z "$_cursor" ]; then
+      _resp="$(_graphql -F owner="$_gh_owner" -F name="$_gh_name" -f query="$_any_query")"
+    else
+      _resp="$(_graphql -F owner="$_gh_owner" -F name="$_gh_name" \
+        -F cursor="$_cursor" -f query="$_any_query")"
+    fi
+
+    if ! _found="$(printf '%s' "$_resp" | jq -r '
+      def has_label($n): any(.labels.nodes[]?; .name == $n);
+      def slugged: any(.labels.nodes[]?; .name | startswith("formann:slug:"));
+      [ .data.repository.issues.nodes[]?
+        | select(.state == null or .state == "OPEN")
+        | select(has_label("formann:status:ready-for-agent"))
+        | select(has_label("formann:type:afk"))
+        | . as $i
+        | [ ( $i.parent // empty
+              | select(.state == null or .state == "OPEN")
+              | select(slugged) | .number ),
+            ( $i | select(slugged) | .number ) ] as $roots
+        | select(any($roots[]; . as $r
+            | all($i.blockedBy.nodes[]?;
+                .state == "CLOSED" and .stateReason == "COMPLETED"
+                and (.number == $r or ((.parent // {}).number == $r)))))
+      ] | if length > 0 then "yes" else "no" end')"; then
+      echo "tracker-snapshot: --any-eligible: unparseable API response" >&2
+      exit "$_EXIT_TRANSIENT"
+    fi
+
+    if [ "$_found" = "yes" ]; then
+      echo "yes"
+      exit 0
+    fi
+    if [ "$(printf '%s' "$_resp" | jq -r '.data.repository.issues.pageInfo.hasNextPage // false')" != "true" ]; then
+      break
+    fi
+    _cursor="$(printf '%s' "$_resp" | jq -r '.data.repository.issues.pageInfo.endCursor // empty')"
+    if [ -z "$_cursor" ]; then
+      echo "tracker-snapshot: --any-eligible: next page announced without a cursor" >&2
+      exit "$_EXIT_TRANSIENT"
+    fi
+  done
+  echo "no"
   exit 0
 fi
 

@@ -56,6 +56,11 @@
 #
 # Stop reasons (drain mode):
 #   - `completed`             — every discovery slug considered.
+#   - `nothing-eligible`      — `tracker-snapshot --any-eligible` said `no`
+#                                and no Blocked re-walk is pending: the pass
+#                                ended before any per-feature snapshot or
+#                                branch sync (#15). A failed check walks
+#                                every feature instead.
 #   - `interrupted`           — Ctrl-C during the outer loop.
 #   - `propagation-error`     — parking-ref publish failed inside a feature loop.
 #   - `runaway-halt (<ref>)`  — post-implement step pushed issue back to eligible.
@@ -968,6 +973,9 @@ format_multi_feature_summary_md() {
     printf -- '- Formann: %s\n' "$formann"
   fi
   printf -- '- Stop reason: %s\n\n' "$stop_reason"
+  if [ "$stop_reason" = "nothing-eligible" ]; then
+    printf 'Nothing to do: no feature has an eligible issue and no Blocked re-walk is pending, so no feature was snapshotted.\n\n'
+  fi
   printf '%s' "$records" | awk -F'|' '
     function humanize_dur(s,    h,m,r) {
       s = int(s)
@@ -4504,6 +4512,13 @@ run_drain() {
   local considered=""
   local feature
 
+  # A quiet pass is cheap: one tracker question before any per-feature
+  # snapshot or branch sync (#15).
+  if ! drain_pass_has_work; then
+    RUN_STOP_REASON="nothing-eligible"
+    return 0
+  fi
+
   while :; do
     if [ "$RUNNER_INTERRUPTED" -eq 1 ]; then
       echo "[$(now_clock)] runner: interrupted; not considering next feature"
@@ -4546,6 +4561,66 @@ run_drain() {
       return 0
     fi
   done
+}
+
+# Print the first discovered feature with a pending Blocked re-walk marker
+# (an issue's walk, or the post-drain phase, that ended Blocked), or nothing.
+# Local files only: no tracker call.
+pending_blocked_feature() {
+  [ -n "${HOST_BLOCKED_DIR:-}" ] && [ -d "$HOST_BLOCKED_DIR" ] || return 0
+  local slug f
+  while IFS= read -r slug; do
+    [ -n "$slug" ] || continue
+    [ -d "$HOST_BLOCKED_DIR/$slug" ] || continue
+    for f in "$HOST_BLOCKED_DIR/$slug"/*; do
+      if [ -f "$f" ]; then
+        printf '%s\n' "$slug"
+        return 0
+      fi
+    done
+  done < <(jq -r '.[]' <<<"${DISCOVERY_JSON:-[]}" 2>/dev/null)
+}
+
+# Ask the binding once whether any feature has an eligible issue
+# (`tracker-snapshot --any-eligible`). Sets ANY_ELIGIBLE_ANSWER to `yes` or
+# `no` and returns 0; on a failed check (non-zero exit, or an answer that is
+# neither) sets ANY_ELIGIBLE_FAILURE and returns 1.
+ANY_ELIGIBLE_ANSWER=""
+ANY_ELIGIBLE_FAILURE=""
+any_eligible_check() {
+  local rc=0 answer
+  ANY_ELIGIBLE_ANSWER=""
+  ANY_ELIGIBLE_FAILURE=""
+  answer="$(TRACKER_ROOT="$HOST_REPO/.features" \
+    bash "$HOST_REPO/docs/formann/issue-tracker/tracker-snapshot" --any-eligible)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    ANY_ELIGIBLE_FAILURE="exited $rc"
+    return 1
+  fi
+  case "$answer" in
+    yes|no) ANY_ELIGIBLE_ANSWER="$answer" ;;
+    *) ANY_ELIGIBLE_FAILURE="answered '$answer'"; return 1 ;;
+  esac
+}
+
+# Does this drain pass have anything to act on? Returns 0 (walk every
+# feature, as before) when a Blocked re-walk is pending on this machine, when
+# the tracker says some feature has an eligible issue, or when that check
+# failed (logged once). Returns 1 — the pass ends at once, no feature
+# snapshotted or synced — only on a clean `no` with nothing pending.
+drain_pass_has_work() {
+  if [ -n "$(pending_blocked_feature)" ]; then
+    return 0
+  fi
+  if ! any_eligible_check; then
+    echo "[$(now_clock)] runner: the any-eligible check failed (tracker-snapshot --any-eligible ${ANY_ELIGIBLE_FAILURE:-failed}); walking every feature"
+    return 0
+  fi
+  if [ "$ANY_ELIGIBLE_ANSWER" = "yes" ]; then
+    return 0
+  fi
+  echo "[$(now_clock)] runner: nothing to do — no feature has an eligible issue and no Blocked re-walk is pending; no feature snapshotted"
+  return 1
 }
 
 # Drain a single feature inside drain mode. Evaluates the per-feature gate,

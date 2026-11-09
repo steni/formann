@@ -3,6 +3,8 @@
 ### tracker-snapshot — local-markdown binding's machine-readable interface.
 ###
 ### Usage: tracker-snapshot <feature-slug>
+###        tracker-snapshot --list
+###        tracker-snapshot --any-eligible
 ###
 ### Emits a JSON document on stdout describing every issue under
 ### `<tracker-root>/<feature-slug>/issues/`. See
@@ -18,7 +20,7 @@ set -eu
 set -o pipefail
 
 if [ "$#" -lt 1 ]; then
-  echo "usage: tracker-snapshot <feature-slug> | tracker-snapshot --list" >&2
+  echo "usage: tracker-snapshot <feature-slug> | tracker-snapshot --list | tracker-snapshot --any-eligible" >&2
   exit 2
 fi
 
@@ -126,6 +128,61 @@ if [ "$1" = "--list" ]; then
     done < <(find "$tracker_root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
   fi
   printf ']\n'
+  exit 0
+fi
+
+# --any-eligible mode: print `yes` when some active feature's snapshot holds
+# an eligible issue, otherwise `no`. The answer is the per-feature snapshot's
+# own: this script is re-run per feature against the same tracker root.
+#
+# The runner snapshots a feature on the feature's branch, which can be ahead
+# of the tracker root read here. So when the tracker root is a git repo's
+# `.features/` (or SNAPSHOT_CHECKOUT_DIR names the repo), each feature's
+# committed state on a local or remote-tracking branch named after it is read
+# too. Any view with an eligible issue answers `yes`.
+if [ "$1" = "--any-eligible" ]; then
+  self="${BASH_SOURCE[0]}"
+  # Does the snapshot of feature $2 under tracker root $1 hold an eligible
+  # issue? The snapshot's JSON is this script's own compact output.
+  view_has_eligible() {
+    env -u SNAPSHOT_CHECKOUT_DIR TRACKER_ROOT="$1" bash "$self" "$2" 2>/dev/null \
+      | grep -q '"eligible":true'
+  }
+
+  repo=""
+  if [ -n "${SNAPSHOT_CHECKOUT_DIR:-}" ]; then
+    repo="$SNAPSHOT_CHECKOUT_DIR"
+  elif [ -d "$tracker_root" ]; then
+    root_dir="$(cd "$tracker_root" && pwd -P)"
+    top="$(git -C "$root_dir" rev-parse --show-toplevel 2>/dev/null || true)"
+    if [ -n "$top" ] && [ "$(cd "$top" && pwd -P)/.features" = "$root_dir" ]; then
+      repo="$top"
+    fi
+  fi
+  views_tmp="$(mktemp -d -t tracker-any.XXXXXX)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$views_tmp' ${_snap_tmp:+'$_snap_tmp'}" EXIT
+
+  answer="no"
+  if [ -d "$tracker_root" ]; then
+    while IFS= read -r d; do
+      [ -n "$d" ] || continue
+      slug="$(basename "$d")"
+      [ "$slug" = ".archived" ] && continue
+      if view_has_eligible "$tracker_root" "$slug"; then answer="yes"; break; fi
+      [ -n "$repo" ] || continue
+      while IFS= read -r ref; do
+        [ -n "$ref" ] || continue
+        view="$views_tmp/$(printf '%s' "$ref" | tr '/' '_')"
+        mkdir -p "$view"
+        git -C "$repo" archive "$ref" ".features/$slug" 2>/dev/null \
+          | tar -xC "$view" 2>/dev/null || continue
+        if view_has_eligible "$view/.features" "$slug"; then answer="yes"; break 2; fi
+      done < <(git -C "$repo" for-each-ref --format='%(refname)' \
+                 "refs/heads/$slug" "refs/remotes/*/$slug" 2>/dev/null)
+    done < <(find "$tracker_root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+  fi
+  echo "$answer"
   exit 0
 fi
 

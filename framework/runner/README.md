@@ -15,7 +15,7 @@ Drain and loop mode also accept `--idle <seconds>`: instead of exiting when ther
 
 Every form also accepts `--no-caffeinate`. By default the runner holds a macOS wake assertion for the whole run (`caffeinate -i -s` tied to the runner pid, released automatically on any exit) so an unattended host doesn't idle-sleep or timer-throttle a multi-hour run — the flag skips it for operators who manage power assertions themselves. On hosts without `caffeinate` (non-macOS) the runner logs a note and continues; either way `runner.log` records whether an assertion was held.
 
-Drain mode stops on: every feature considered (`completed`); Ctrl-C (`interrupted`); or `tracker-snapshot --list` itself failing (`preflight-abort: discovery`).
+Drain mode stops on: every feature considered (`completed`); nothing to do anywhere (`nothing-eligible`, see *A quiet pass is cheap* below); Ctrl-C (`interrupted`); or `tracker-snapshot --list` itself failing (`preflight-abort: discovery`).
 
 Narrowed modes stop on: queue empty; Ctrl-C (the in-flight container receives SIGTERM, then SIGKILL after `RUNNER_KILL_GRACE_SECONDS` if it lingers); or a mid-loop `tracker-snapshot` crash (`snapshot-failed`, exit 1). The full stop-reason vocabulary — including the pre-flight-phase stops — is enumerated below the per-issue table.
 
@@ -23,7 +23,8 @@ Narrowed modes stop on: queue empty; Ctrl-C (the in-flight container receives SI
 
 `run-the-queue.sh --idle <seconds>` (with or without `--feature <slug>`) keeps the runner alive. Each **pass** is one drain (or one loop over the feature) exactly as a run without `--idle` would do it; when the pass ends — queue empty, every feature considered, a feature parked, or a tracker or fetch outage — the runner sleeps `<seconds>` and starts the next pass:
 
-- **Fresh state every pass.** Drain mode re-runs discovery (`tracker-snapshot --list`; on failure it keeps the previous list), and every feature is re-synced and re-snapshotted, so an issue made ready — or a feature created — while the runner slept is dispatched on the next pass, without a restart. Loop mode re-syncs the runner-checkout before its snapshot (a sync failure skips that pass).
+- **A quiet pass is cheap.** Before it syncs or snapshots any feature, a drain pass asks the binding once, `tracker-snapshot --any-eligible`, whether any feature has an eligible issue. On `no`, and with no Blocked re-walk marker pending for a discovered feature under `.runner-state/blocked/` (read locally, no tracker call), the pass ends at once with stop reason `nothing-eligible`: no per-feature snapshot, no branch sync, one `nothing to do` line in `runner.log`, and it counts as a pass that found nothing to do. On `yes`, or with a marker pending, the pass runs as below. A failed check (network, rate limit) is logged once and the pass walks every feature. Under github-issues this keeps two idle runners on a large tracker from spending the shared GitHub API budget on snapshots of features with nothing ready.
+- **Fresh state every pass.** Drain mode re-runs discovery (`tracker-snapshot --list`; on failure it keeps the previous list), and every feature is re-synced and re-snapshotted (once the check above says there is work), so an issue made ready — or a feature created — while the runner slept is dispatched on the next pass, without a restart. Loop mode re-syncs the runner-checkout before its snapshot (a sync failure skips that pass).
 - **Blocked steps are re-run every pass.** A step that ended `blocked (<dependency>)` is re-run, from that step, on the next pass (never twice in one pass). The pass count is read from the tracker each time, so passes made by another machine count; the third leaves the issue for a human.
 - **One summary per pass.** A pass that dispatched anything writes `pass-<NNNN>/SUMMARY.md` in the run dir, and its per-issue artifacts land beside it, so a later pass never overwrites an earlier one's logs. A pass with nothing to do leaves no directory. The run's own `SUMMARY.md` ends with a `## Passes` index linking each pass.
 - **Stopping.** Ctrl-C or SIGTERM — during a dispatch or during the sleep (honoured within a second) — stops the runner with stop reason `interrupted`, exit 0, and the usual summary. A `propagation-error` or `runaway-halt` stops it with exit 1, as it would stop a single drain. A pre-flight failure exits 2 before the first pass.
@@ -259,6 +260,7 @@ The trailing `stop reason:` line varies by mode.
 **Drain mode (bare invocation):**
 
 - `completed` — every feature in discovery output considered (the multi-feature analogue of single-feature mode's `queue-empty` at the run level).
+- `nothing-eligible` — `tracker-snapshot --any-eligible` said `no` and no Blocked re-walk was pending, so no feature was synced or snapshotted. `SUMMARY.md` carries one `Nothing to do: …` line under the stop reason.
 - `interrupted` — Ctrl-C during the outer loop.
 - `propagation-error` — parking-ref publish failed inside a feature loop; the entire drain halts (exit 1).
 - A feature whose Shared-remote push was refused is not a run-level stop: its section reads `## <feature> — parked (Shared remote refused the fast-forward)` and the drain continues with the next feature.
