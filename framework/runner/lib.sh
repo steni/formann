@@ -127,6 +127,7 @@ RUNNER_LOCK_PATH="$RUNNER_STATE_DIR/lock"
 RUNNER_CHECKOUT_PATH="$RUNNER_STATE_DIR/checkout"
 RUNNER_RUNS_PATH="$RUNNER_STATE_DIR/runs"
 RUNNER_ABORT_PATH="$RUNNER_STATE_DIR/aborted"
+RUNNER_BLOCKED_PATH="$RUNNER_STATE_DIR/blocked"
 
 # Path inside the container where the runner-checkout mounts. The
 # entrypoint runs from this directory; `claude -p "/implement <ref>"`
@@ -146,3 +147,9 @@ RUNNER_CONSUMER_PROMPTS_DIR="runner"
 # A pre-flight invariant verifies the file's presence and validity before
 # the loop starts.
 RUNNER_MANIFEST_FILE="${RUNNER_CONSUMER_PROMPTS_DIR}/manifest.md"
+
+# Consumer-repo-relative path to the post-drain steps manifest: host-side
+# steps the runner runs once a feature has drained, before it releases the
+# feature's Claim (post-drain.sh). Same line format as the post-implement
+# manifest. Optional: a missing or empty manifest means no post-drain steps.
+RUNNER_POST_DRAIN_MANIFEST_FILE="${RUNNER_CONSUMER_PROMPTS_DIR}/post-drain.md"

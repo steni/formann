@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+###
+### comment-on-feature — local-markdown binding: comment on a feature's parent.
+###
+### Usage: comment-on-feature <feature> <Kind>     (comment body on stdin)
+###
+### Realizes "Comment with `<kind>`" on the feature's parent, its PRD
+### (`.features/<feature>/PRD.md`, as "Read the feature" reads it): appends a
+### `### <Kind> — <YYYY-MM-DD>` subsection (UTC; `### <Kind> (n) — <date>` on
+### a same-day same-kind collision) with the stdin body at the bottom of the
+### `## Comments` section, creating the section when missing, and commits it
+### as a `tracker:` commit — the verb is not done until committed. Prints the
+### PRD's path (relative to the checkout) on stdout.
+###
+### The AFK runner uses it to post the informational Note when it takes a
+### Claim, writing into its runner-checkout (TRACKER_CHECKOUT_DIR) and then
+### propagating the commit like a dispatch's.
+###
+### Checkout resolution (a git work tree; the commit lands on its HEAD):
+###   1. TRACKER_CHECKOUT_DIR.
+###   2. PWD-walk to the `.formann` ancestor.
+###
+### Exit codes: 0 posted, 1 no PRD.md for the feature (a PRD-less standalone
+### has no parent to comment on) or commit failed, 2 usage error.
+###
+### Bash 3.2 compatible (macOS default).
+###
+
+set -eu
+set -o pipefail
+
+if [ "$#" -ne 2 ] || [ -z "$1" ] || [ -z "$2" ]; then
+  echo "usage: comment-on-feature <feature> <Kind>  (body on stdin)" >&2
+  exit 2
+fi
+feature="$1"
+kind="$2"
+
+if [ -n "${TRACKER_CHECKOUT_DIR:-}" ]; then
+  root="$TRACKER_CHECKOUT_DIR"
+else
+  walk_dir="$PWD"
+  root=""
+  while [ "$walk_dir" != "/" ]; do
+    if [ -e "$walk_dir/.formann" ]; then
+      root="$walk_dir"
+      break
+    fi
+    walk_dir="$(dirname "$walk_dir")"
+  done
+  if [ -z "$root" ]; then
+    echo "comment-on-feature: could not find .formann ancestor from $PWD; set TRACKER_CHECKOUT_DIR to override" >&2
+    exit 2
+  fi
+fi
+
+rel=".features/$feature/PRD.md"
+file="$root/$rel"
+if [ ! -f "$file" ]; then
+  echo "comment-on-feature: no $rel in $root (a PRD-less feature has no parent to comment on)" >&2
+  exit 1
+fi
+
+body="$(cat)"
+date="$(date -u +%Y-%m-%d)"
+
+# Same-day same-kind headings already in `## Comments` (fenced blocks skipped).
+n="$(awk -v pre="### $kind" -v date="$date" '
+  { sub(/\r$/, "") }
+  /^```/ { fence = !fence; next }
+  fence { next }
+  /^## / { in_comments = ($0 == "## Comments"); next }
+  !in_comments { next }
+  index($0, pre) == 1 {
+    rest = substr($0, length(pre) + 1)
+    if (rest == " — " date || rest ~ ("^ \\([0-9]+\\) — " date "$")) count++
+  }
+  END { print count + 0 }
+' "$file")"
+if [ "$n" -eq 0 ]; then
+  heading="### $kind — $date"
+else
+  heading="### $kind ($((n + 1))) — $date"
+fi
+
+has_comments="$(awk '
+  /^```/ { fence = !fence; next }
+  !fence && $0 == "## Comments" { found = 1 }
+  END { print found + 0 }
+' "$file")"
+
+# Comments sit at the bottom of the file, so appending lands at the bottom
+# of `## Comments`.
+{
+  if [ "$has_comments" -eq 0 ]; then
+    printf '\n## Comments\n'
+  fi
+  printf '\n%s\n\n%s\n' "$heading" "$body"
+} >>"$file"
+
+ident=()
+if [ -z "$(git -C "$root" config user.email 2>/dev/null || true)" ]; then
+  ident=(-c user.name=formann-runner -c user.email=runner@localhost)
+fi
+if ! git -C "$root" add -- "$rel" \
+    || ! git -C "$root" ${ident[@]+"${ident[@]}"} commit --quiet \
+        -m "tracker: $feature — $kind on the feature" -- "$rel"; then
+  echo "comment-on-feature: could not commit $rel in $root" >&2
+  exit 1
+fi
+printf '%s\n' "$rel"

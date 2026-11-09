@@ -45,6 +45,16 @@ The issue ref is appended to this prompt below the `---` separator at the end. I
 - **No `--comment`, no push.** `/code-review` runs with `--fix` only; the runner fast-forwards to host afterward, so a push from inside the sandbox is wrong.
 - **Minimal fixes.** Apply only what `/code-review --fix` lands; do not refactor or clean up beyond it.
 
+## When a dependency is unreachable
+
+If something this step needs from outside the run is unreachable — a consumer's service, a preview environment, a remote API — the step ends **Blocked**. An outage outside the run is not a defect in the code, so do not report it as a finding and do not fail.
+
+1. **Comment with Blocked** on the issue, naming the dependency and the error you got (the command and its output, trimmed to what shows the failure). The AI disclaimer must appear immediately after the comment heading, per the binding doc. This comment is the step's only tracker write — it replaces the step's usual comment and state change.
+2. **Change no state.** Leave the issue where it is.
+3. **End your final message with the line** `BLOCKED: <dependency>`, alone on the last line, where `<dependency>` is a short name for what was unreachable (for example `BLOCKED: preview-daemon`). Omit any `verdict:` line.
+
+The runner reads that line, leaves the issue's state alone, moves on to other work, and re-runs this step on a later pass. After three Blocked passes it leaves the issue for a human with the Blocked comments as the reason.
+
 ## On failure
 
 This is a soft-fail step. If `/code-review` cannot run or errors out, do **not** abort the dispatch — handle it in-prompt: make no code changes, **Comment with Note** recording that the automated fix pass could not run and why, and finish your turn normally. The issue stays at `in-review`, the dispatch exits cleanly, and the next manifest step (review-and-gate) still runs. A clean pass that simply found no bugs is the same shape: a Note saying so, no commit, normal exit.

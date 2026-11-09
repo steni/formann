@@ -6,6 +6,8 @@ This binding represents the issue-tracker role of the lifecycle for projects who
 
 - **[`BINDING.md`](BINDING.md)** — the role doc. Source of truth for the agent-facing conventions: **Tracker operations** (the seven binding-agnostic verbs and their local-markdown realizations), issue conventions, frontmatter properties, references, default query scope, workspace setup, publish/fetch semantics, committing tracker changes, archiving. Adopting projects symlink `docs/formann/issue-tracker/` at this binding folder so existing references in `CLAUDE.md` and skills keep resolving via the role surface.
 - **[`tracker-snapshot`](tracker-snapshot)** — executable shell script. The binding's machine-readable interface. Emits a JSON snapshot of a feature's issues with computed eligibility flags. Contract documented below.
+- **[`blocked-passes`](blocked-passes)** — executable shell script. Prints an issue's Blocked pass count (Blocked comments since its latest Implementation comment), which the AFK runner reads after a step ends Blocked. See [`BINDING.md`](BINDING.md#comment-with-kind).
+- **[`comment-on-feature`](comment-on-feature)** — executable shell script. Appends a comment to a feature's `PRD.md` and commits it ("Comment with `<kind>`" on the feature's parent). The AFK runner posts its claim Note through it. See [`BINDING.md`](BINDING.md#comment-with-kind).
 
 ## Authorship
 

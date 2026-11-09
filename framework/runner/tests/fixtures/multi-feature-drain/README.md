@@ -88,7 +88,7 @@ bash .formann/runner/run-the-queue.sh
 ```
 
 **Expected:** exit 0; `stop reason: completed`; both rows `done` with
-`propagated → host`; both `refs/heads/multi-drain-*` advanced; HEAD still
+`local-only (propagated → host)`; both `refs/heads/multi-drain-*` advanced; HEAD still
 `main`.
 
 ### 2 — Bare invocation, host on a feature branch
@@ -104,8 +104,8 @@ bash .formann/runner/run-the-queue.sh
 ```
 
 **Expected:** exit 0; `stop reason: completed`; `alpha` →
-`parked → runner/multi-drain-alpha` (host branch unchanged, parking ref
-advanced); `beta` → `propagated → host`.
+`local-only (parked → runner/multi-drain-alpha)` (host branch unchanged, parking ref
+advanced); `beta` → `local-only (propagated → host)`.
 
 ### 3 — `--feature multi-drain-alpha`, host on that branch
 
@@ -119,7 +119,7 @@ bash .formann/runner/run-the-queue.sh --feature multi-drain-alpha
 ```
 
 **Expected:** exit 0; `stop reason: queue-empty`; `alpha` →
-`parked → runner/multi-drain-alpha`; `beta`'s branch tip unchanged.
+`local-only (parked → runner/multi-drain-alpha)`; `beta`'s branch tip unchanged.
 
 ### 4 — `--feature <unknown>`
 

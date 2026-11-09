@@ -64,11 +64,23 @@ RUN wget -qO /usr/share/keyrings/githubcli-archive-keyring.gpg \
       gh \
  && rm -rf /var/lib/apt/lists/*
 
-# Node.js 20 from NodeSource, then the Claude CLI.
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+# Node.js 22 from NodeSource, then the Claude CLI. Current Claude Code releases
+# need Node >= 22. On an older Node, npm does not fail: it quietly installs the
+# newest release whose `engines` still allows that Node, a client too old for
+# newer models. So the layer compares the installed version with the
+# registry's latest and fails the build if they differ — raise the
+# NodeSource `setup_<major>.x` when Claude Code next raises its Node floor.
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
  && apt-get install -y --no-install-recommends nodejs \
  && rm -rf /var/lib/apt/lists/* \
  && npm install -g @anthropic-ai/claude-code \
+ && installed="$(claude --version | awk '{print $1}')" \
+ && latest="$(npm view @anthropic-ai/claude-code version)" \
+ && if [ "$installed" != "$latest" ]; then \
+      echo "Claude Code ${installed:-<none>} was installed, but the latest release is ${latest}." >&2; \
+      echo "The image's Node ($(node --version)) is probably too old for the current Claude Code; raise the NodeSource setup_<major>.x in runner/Dockerfile." >&2; \
+      exit 1; \
+    fi \
  && npm cache clean --force
 
 ARG RUNNER_UID=1000

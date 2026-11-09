@@ -137,8 +137,10 @@ emit_result_event() {
 # === classify_item_action =====================================================
 #
 # Pure classifier for the per-item control-flow decision after a post-implement
-# step runs. Inputs: (post-item status string, dispatch exit code). Returns
-# exactly one of `stop-success`, `continue`, `terminate-run`, `fail`.
+# step runs. Inputs: (post-item status string, dispatch exit code, and the
+# optional blocked / blocked-passes pair). Returns exactly one of
+# `stop-success`, `continue`, `terminate-run`, `fail`, or — for a Blocked
+# step — `blocked` / `left-for-human` (see "Blocked steps" below).
 
 @test "classify_item_action — exit 0 + done is stop-success" {
   [ "$(classify_item_action done 0)" = "stop-success" ]
@@ -185,8 +187,8 @@ emit_result_event() {
 }
 
 @test "classify_item_action — no transport_crash input, no transport-flavoured output" {
-  # The function takes exactly two args; any third arg is ignored and the
-  # output must never include a transport-flavoured token.
+  # The optional inputs are blocked / blocked-passes, never a transport
+  # flag; the output must never include a transport-flavoured token.
   result="$(classify_item_action in-review 1)"
   [ "$result" != "review-aborted" ]
   [ "$result" != "dispatch-aborted" ]
@@ -669,6 +671,37 @@ EOF
   grep -q '^BASH_MAX_TIMEOUT_MS=[0-9]*$' "$cap"
   # The OAuth token still arrives alongside the dispatch env.
   grep -q '^CLAUDE_CODE_OAUTH_TOKEN=oauth$' "$cap"
+}
+
+# Agents kept trying to push their own work (upstream jervell/formann#96): one
+# stalled asking the maintainer, another rewrote the runner-checkout's origin
+# and broke the next sync. The preamble — injected into /implement and every
+# walk step — tells them the runner publishes and they must not push or touch
+# remotes.
+@test "RUNNER_DISPATCH_PREAMBLE — says the runner publishes the commits and forbids push and remote changes" {
+  [[ "$RUNNER_DISPATCH_PREAMBLE" == *"The runner publishes this dispatch's commits after the dispatch ends"* ]]
+  [[ "$RUNNER_DISPATCH_PREAMBLE" == *"do not push,"* ]]
+  [[ "$RUNNER_DISPATCH_PREAMBLE" == *"do not add, remove or change git remotes"* ]]
+}
+
+@test "run_dispatch_container — the /implement prompt carries the no-push, no-remote-change instruction" {
+  local cap="$BATS_TEST_TMPDIR/claude-args"
+  run_sandbox_container() { shift; printf '%s\n' "$*" >"$cap"; return 0; }
+  HOST_CHECKOUT="$BATS_TEST_TMPDIR"
+  run_dispatch_container "#71" "$BATS_TEST_TMPDIR/base"
+  grep -q -- 'do not push,' "$cap"
+  grep -q -- 'do not add, remove or change git remotes' "$cap"
+}
+
+@test "run_item_container — every step prompt carries the no-push, no-remote-change instruction" {
+  local cap="$BATS_TEST_TMPDIR/claude-args"
+  local prompt="$BATS_TEST_TMPDIR/step.md"
+  printf 'Do the review step.\n' >"$prompt"
+  run_sandbox_container() { shift; printf '%s\n' "$*" >"$cap"; return 0; }
+  HOST_CHECKOUT="$BATS_TEST_TMPDIR"
+  run_item_container "#71" "$BATS_TEST_TMPDIR/base" "$prompt"
+  grep -q -- 'do not push,' "$cap"
+  grep -q -- 'do not add, remove or change git remotes' "$cap"
 }
 
 @test "RUNNER_DISPATCH_PREAMBLE — tells the agent background Bash is off and builds run in the foreground" {
@@ -2126,6 +2159,8 @@ setup_dispatch_one_test() {
   HOST_RUNS="$TEST_RUN_DIR"
   HOST_REPO="$BATS_TEST_TMPDIR"
   HOST_ABORT_DIR="$BATS_TEST_TMPDIR/aborted"
+  HOST_BLOCKED_DIR="$BATS_TEST_TMPDIR/blocked"
+  RUN_BLOCKED_THIS_RUN=""
   # Set the resolved manifest to the default one-item entry so the walk runs.
   RESOLVED_MANIFEST="$(printf 'review\t%s\n' "$HERE/review-and-gate.md")"
 }
@@ -5383,7 +5418,7 @@ setup_propagate_test() {
   # Both host branch and parking ref advance to the runner-checkout tip.
   [ "$host_f_after" = "$checkout_tip" ]
   [ "$parking_after" = "$checkout_tip" ]
-  [ "$RUNNER_LAST_PROPAGATION" = "propagated → host" ]
+  [ "$RUNNER_LAST_PROPAGATION" = "local-only (propagated → host)" ]
   # host HEAD (master) must not have moved.
   [ "$(git -C "$HOST_REPO" symbolic-ref --short HEAD)" = "master" ]
 }
@@ -5410,7 +5445,7 @@ setup_propagate_test() {
   # Parking ref advanced; host branch ref is unchanged (HEAD-on-target).
   [ "$parking_after" = "$checkout_tip" ]
   [ "$host_f_after" = "$host_f_before" ]
-  [ "$RUNNER_LAST_PROPAGATION" = "parked → runner/f" ]
+  [ "$RUNNER_LAST_PROPAGATION" = "local-only (parked → runner/f)" ]
   # HEAD-on-target is an expected refusal; no unexpected-error diagnostic.
   ! grep -q 'unexpected step-2' "$err_file" || { cat "$err_file"; false; }
 }
@@ -5442,7 +5477,7 @@ setup_propagate_test() {
   # divergent tip (non-ff refusal).
   [ "$parking_after" = "$checkout_tip" ]
   [ "$host_f_after" = "$host_f_before" ]
-  [ "$RUNNER_LAST_PROPAGATION" = "parked → runner/f" ]
+  [ "$RUNNER_LAST_PROPAGATION" = "local-only (parked → runner/f)" ]
   # Non-ff is an expected refusal; no unexpected-error diagnostic.
   ! grep -q 'unexpected step-2' "$err_file" || { cat "$err_file"; false; }
 }
@@ -5462,7 +5497,7 @@ setup_propagate_test() {
   d1_tip="$(git -C "$HOST_CHECKOUT" rev-parse HEAD)"
 
   propagate_feature "f"
-  [ "$RUNNER_LAST_PROPAGATION" = "parked → runner/f" ]
+  [ "$RUNNER_LAST_PROPAGATION" = "local-only (parked → runner/f)" ]
   [ "$(git -C "$HOST_REPO" rev-parse refs/remotes/runner/f)" = "$d1_tip" ]
 
   # Set up the diverged-tip scenario: reset the runner-checkout back to
@@ -5485,7 +5520,7 @@ setup_propagate_test() {
   propagate_feature "f"
 
   # The parking ref moves to d2_tip and the dispatch is parked, not errored.
-  [ "$RUNNER_LAST_PROPAGATION" = "parked → runner/f" ]
+  [ "$RUNNER_LAST_PROPAGATION" = "local-only (parked → runner/f)" ]
   [ "$(git -C "$HOST_REPO" rev-parse refs/remotes/runner/f)" = "$d2_tip" ]
 }
 
@@ -5546,40 +5581,315 @@ setup_propagate_test() {
 
 # === select_sync_base — pre-dispatch sync-base selector ====================
 #
-# Pure function: takes a pre-computed parking-ref relation and returns
-# which tip the runner-checkout should sync to.
+# Pure function: takes the Shared remote's branch relation and the parking
+# ref's relation, both relative to the host branch, and returns which tip the
+# runner-checkout should sync to (#5).
 #
-# Relation vocabulary: absent | equal | ahead | behind | diverged
-# Rules:
-#   absent   → host-branch   (no prior runner output)
-#   equal    → host-branch   (runner output already at host tip)
-#   ahead    → parking-ref   (runner output is ahead; chain from it)
-#   behind   → host-branch   (host has moved past runner output)
-#   diverged → parking-ref   (runner chain authoritative; maintainer reconciles)
+# Relation vocabulary: absent | equal | behind | ahead | diverged
+# (an absent host branch counts as the empty history: every present ref is
+# `ahead` of it). Rule: the most advanced ref that the others are ancestors of
+# wins. When the remote branch and the parking ref are both ahead of (or
+# diverged from) the host branch, their order is the optional third input,
+# the remote branch's relation to the parking ref: only a remote strictly
+# ahead of the parking ref wins; anything else (including an omitted third
+# input) is `parking-ref`, and publish parks the feature if the two diverged.
 
-@test "select_sync_base — absent: no parking ref → host-branch" {
-  result="$(select_sync_base absent)"
-  [ "$result" = "host-branch" ]
+# Expected verdict for every (remote-rel, parking-rel) pair with the third
+# input omitted. Rows: remote-rel; columns: parking-rel in REL_ORDER.
+REL_ORDER=(absent equal behind ahead diverged)
+
+expected_sync_base() {
+  local remote="$1" parking="$2"
+  case "$parking" in
+    ahead|diverged) echo "parking-ref" ;;
+    *)
+      case "$remote" in
+        ahead) echo "remote-branch" ;;
+        *)     echo "host-branch" ;;
+      esac ;;
+  esac
 }
 
-@test "select_sync_base — equal: parking ref equals host's branch → host-branch" {
-  result="$(select_sync_base equal)"
-  [ "$result" = "host-branch" ]
+@test "select_sync_base — exhaustive over the 25 relation pairs (third input omitted)" {
+  local r p got want count=0
+  for r in "${REL_ORDER[@]}"; do
+    for p in "${REL_ORDER[@]}"; do
+      got="$(select_sync_base "$r" "$p")"
+      want="$(expected_sync_base "$r" "$p")"
+      if [ "$got" != "$want" ]; then
+        echo "select_sync_base $r $p → '$got', want '$want'"
+        return 1
+      fi
+      count=$((count + 1))
+    done
+  done
+  [ "$count" -eq 25 ]
 }
 
-@test "select_sync_base — ahead: parking ref strictly ahead of host's branch → parking-ref" {
-  result="$(select_sync_base ahead)"
-  [ "$result" = "parking-ref" ]
+@test "select_sync_base — remote and parking both ahead/diverged: only a remote strictly ahead of the parking ref wins" {
+  local r p rp got want count=0
+  for r in ahead diverged; do
+    for p in ahead diverged; do
+      for rp in absent equal behind ahead diverged; do
+        got="$(select_sync_base "$r" "$p" "$rp")"
+        if [ "$rp" = "ahead" ]; then want="remote-branch"; else want="parking-ref"; fi
+        if [ "$got" != "$want" ]; then
+          echo "select_sync_base $r $p $rp → '$got', want '$want'"
+          return 1
+        fi
+        count=$((count + 1))
+      done
+    done
+  done
+  [ "$count" -eq 20 ]
 }
 
-@test "select_sync_base — behind: host's branch strictly ahead of parking ref → host-branch" {
-  result="$(select_sync_base behind)"
-  [ "$result" = "host-branch" ]
+@test "select_sync_base — the third input does not change any unambiguous pair" {
+  local r p rp got
+  for r in "${REL_ORDER[@]}"; do
+    for p in "${REL_ORDER[@]}"; do
+      case "$r/$p" in ahead/ahead|ahead/diverged|diverged/ahead|diverged/diverged) continue ;; esac
+      for rp in absent equal behind ahead diverged; do
+        got="$(select_sync_base "$r" "$p" "$rp")"
+        [ "$got" = "$(expected_sync_base "$r" "$p")" ] || {
+          echo "select_sync_base $r $p $rp → '$got'"; return 1; }
+      done
+    done
+  done
 }
 
-@test "select_sync_base — diverged: neither ancestor → parking-ref" {
-  result="$(select_sync_base diverged)"
-  [ "$result" = "parking-ref" ]
+@test "select_sync_base — named cases: remote ahead of host and parking ref is the base; parking ref ahead of the remote is the base" {
+  [ "$(select_sync_base ahead absent)" = "remote-branch" ]
+  [ "$(select_sync_base ahead equal)" = "remote-branch" ]
+  [ "$(select_sync_base ahead ahead ahead)" = "remote-branch" ]
+  [ "$(select_sync_base ahead ahead behind)" = "parking-ref" ]
+  [ "$(select_sync_base equal ahead)" = "parking-ref" ]
+  [ "$(select_sync_base absent ahead)" = "parking-ref" ]
+  # Remote and parking diverged from each other → parking-ref (publish parks).
+  [ "$(select_sync_base ahead ahead diverged)" = "parking-ref" ]
+  [ "$(select_sync_base diverged diverged diverged)" = "parking-ref" ]
+  # One-machine behaviour unchanged when there is no remote branch.
+  [ "$(select_sync_base absent absent)" = "host-branch" ]
+  [ "$(select_sync_base absent behind)" = "host-branch" ]
+  [ "$(select_sync_base absent diverged)" = "parking-ref" ]
+}
+
+@test "select_sync_base — pure: no I/O, no git, deterministic output" {
+  # With PATH emptied, any external command would fail; the selector runs on
+  # bash builtins alone and writes nothing but its verdict.
+  local out
+  out="$(PATH=/nonexistent; cd /; select_sync_base ahead ahead ahead 2>&1)"
+  [ "$out" = "remote-branch" ]
+  out="$(PATH=/nonexistent; select_sync_base diverged absent 2>&1)"
+  [ "$out" = "host-branch" ]
+}
+
+@test "select_sync_base — unknown relations are refused" {
+  run select_sync_base bogus absent
+  assert_failure
+  assert_output --partial "unknown relation 'bogus'"
+  run select_sync_base absent bogus
+  assert_failure
+  run select_sync_base ahead ahead bogus
+  assert_failure
+  run select_sync_base
+  assert_failure
+}
+
+# === Runner-checkout sync from the Shared remote (#5) ======================
+#
+# Real host repo, runner-checkout cloned from it, and a bare repo standing in
+# for the Shared remote. Outcomes only: which commit the runner-checkout is
+# on, and which refs exist on the bare repo.
+
+# Host repo with `main` (one commit) and a bare Shared remote registered as
+# $1 (default `origin`) holding `main`. Host HEAD stays on main.
+setup_sync_shared_test() {
+  local remote_name="${1:-origin}"
+  HOST_REPO="$BATS_TEST_TMPDIR/sync-host"
+  HOST_CHECKOUT="$BATS_TEST_TMPDIR/sync-checkout"
+  SHARED_BARE="$BATS_TEST_TMPDIR/sync-shared.git"
+  TARGET_FEATURE="f"
+  mkdir -p "$HOST_REPO"
+  git -C "$HOST_REPO" init --quiet --initial-branch=main
+  git -C "$HOST_REPO" -c user.email=t@t -c user.name=t \
+    commit --allow-empty --quiet -m "main"
+  git init --quiet --bare --initial-branch=main "$SHARED_BARE"
+  git -C "$HOST_REPO" remote add "$remote_name" "$SHARED_BARE"
+  git -C "$HOST_REPO" push --quiet "$remote_name" main
+  git clone --quiet "$HOST_REPO" "$HOST_CHECKOUT" >&2
+  unset RUNNER_SHARED_REMOTE
+}
+
+# Another machine pushes commit(s) to the Shared remote's `$1`, starting
+# from `$2` (a ref on the remote, default: `$1` itself). Prints the new tip.
+other_machine_push() {
+  local branch="$1" from="${2:-$1}"
+  local other="$BATS_TEST_TMPDIR/other-$RANDOM"
+  git clone --quiet "$SHARED_BARE" "$other" >&2
+  git -C "$other" checkout --quiet -B "$branch" "origin/$from" >&2
+  git -C "$other" -c user.email=o@o -c user.name=o \
+    commit --allow-empty --quiet -m "other machine's work on $branch"
+  git -C "$other" push --quiet origin "$branch" >&2
+  git -C "$other" rev-parse HEAD
+}
+
+# Commits on top of `$2` in the host repo and points the host ref `$1` at it.
+host_commit_on() {
+  local ref="$1" base="$2" sha
+  sha="$(git -C "$HOST_REPO" -c user.email=t@t -c user.name=t \
+    commit-tree -p "$base" -m "commit on $ref" "$(git -C "$HOST_REPO" rev-parse "$base^{tree}")")"
+  git -C "$HOST_REPO" update-ref "$ref" "$sha"
+  echo "$sha"
+}
+
+shared_ref() { git -C "$SHARED_BARE" rev-parse --verify "refs/heads/$1" 2>/dev/null || true; }
+
+@test "sync from Shared remote — branch only on the Shared remote: a machine that never had it builds from it" {
+  setup_sync_shared_test
+  local remote_tip
+  remote_tip="$(other_machine_push f main)"
+  # This machine has never seen f: no host branch, no parking ref.
+  ! git -C "$HOST_REPO" show-ref --quiet --verify refs/heads/f
+  ! git -C "$HOST_REPO" show-ref --quiet --verify refs/remotes/runner/f
+
+  run ensure_runner_checkout_on_branch f
+
+  assert_success
+  [ "$(git -C "$HOST_CHECKOUT" symbolic-ref --short HEAD)" = "f" ]
+  [ "$(git -C "$HOST_CHECKOUT" rev-parse HEAD)" = "$remote_tip" ]
+  # Not re-created from main, and the remote branch is untouched.
+  [ "$(shared_ref f)" = "$remote_tip" ]
+}
+
+@test "sync from Shared remote — remote branch ahead of the host branch (no parking ref): remote is the base" {
+  setup_sync_shared_test
+  git -C "$HOST_REPO" branch f main
+  git -C "$HOST_REPO" push --quiet origin f
+  local remote_tip
+  remote_tip="$(other_machine_push f)"
+
+  run ensure_runner_checkout_on_branch f
+
+  assert_success
+  [ "$(git -C "$HOST_CHECKOUT" rev-parse HEAD)" = "$remote_tip" ]
+}
+
+@test "sync from Shared remote — remote branch ahead of host and parking ref: remote is the base" {
+  setup_sync_shared_test
+  git -C "$HOST_REPO" branch f main
+  local parked
+  parked="$(host_commit_on refs/remotes/runner/f refs/heads/f)"
+  git -C "$HOST_REPO" push --quiet origin "$parked:refs/heads/f"
+  local remote_tip
+  remote_tip="$(other_machine_push f)"
+
+  run ensure_runner_checkout_on_branch f
+
+  assert_success
+  [ "$(git -C "$HOST_CHECKOUT" rev-parse HEAD)" = "$remote_tip" ]
+  git -C "$HOST_CHECKOUT" merge-base --is-ancestor "$parked" HEAD
+}
+
+@test "sync from Shared remote — parking ref ahead of the remote branch: parking ref is the base" {
+  setup_sync_shared_test
+  git -C "$HOST_REPO" branch f main
+  git -C "$HOST_REPO" push --quiet origin f
+  local p1 p2
+  p1="$(host_commit_on refs/remotes/runner/f refs/heads/f)"
+  git -C "$HOST_REPO" push --quiet origin "$p1:refs/heads/f"
+  p2="$(host_commit_on refs/remotes/runner/f "$p1")"
+
+  run ensure_runner_checkout_on_branch f
+
+  assert_success
+  [ "$(git -C "$HOST_CHECKOUT" rev-parse HEAD)" = "$p2" ]
+  [ "$(shared_ref f)" = "$p1" ]
+}
+
+@test "sync from Shared remote — remote branch and parking ref diverged: parking ref is the base, remote untouched" {
+  setup_sync_shared_test
+  git -C "$HOST_REPO" branch f main
+  git -C "$HOST_REPO" push --quiet origin f
+  local parked theirs
+  parked="$(host_commit_on refs/remotes/runner/f refs/heads/f)"
+  theirs="$(other_machine_push f)"
+
+  run ensure_runner_checkout_on_branch f
+
+  assert_success
+  [ "$(git -C "$HOST_CHECKOUT" rev-parse HEAD)" = "$parked" ]
+  [ "$(shared_ref f)" = "$theirs" ]
+}
+
+@test "sync from Shared remote — remote branch equal to the host branch: host branch path, unchanged" {
+  setup_sync_shared_test
+  git -C "$HOST_REPO" branch f main
+  git -C "$HOST_REPO" push --quiet origin f
+
+  run ensure_runner_checkout_on_branch f
+
+  assert_success
+  [ "$(git -C "$HOST_CHECKOUT" rev-parse HEAD)" = "$(git -C "$HOST_REPO" rev-parse refs/heads/f)" ]
+}
+
+@test "sync from Shared remote — branch missing everywhere: created from main and on the Shared remote before the first dispatch" {
+  setup_sync_shared_test
+  local main_tip
+  main_tip="$(git -C "$HOST_REPO" rev-parse refs/heads/main)"
+  [ -z "$(shared_ref f)" ]
+
+  run ensure_runner_checkout_on_branch f
+
+  assert_success
+  [ "$(git -C "$HOST_CHECKOUT" symbolic-ref --short HEAD)" = "f" ]
+  [ "$(git -C "$HOST_CHECKOUT" rev-parse HEAD)" = "$main_tip" ]
+  [ "$(shared_ref f)" = "$main_tip" ]
+  assert_output --partial "runner: created f from main and pushed it to origin/f"
+}
+
+@test "sync from Shared remote — branch missing everywhere, RUNNER_SHARED_REMOTE names a non-origin remote: pushed there" {
+  setup_sync_shared_test upstream
+  export RUNNER_SHARED_REMOTE=upstream
+
+  run ensure_runner_checkout_on_branch f
+
+  assert_success
+  [ "$(shared_ref f)" = "$(git -C "$HOST_REPO" rev-parse refs/heads/main)" ]
+}
+
+@test "sync from Shared remote — the first dispatch's propagation publishes onto the branch created at sync" {
+  setup_sync_shared_test
+  ensure_runner_checkout_on_branch f >/dev/null 2>&1
+  git -C "$HOST_CHECKOUT" -c user.email=t@t -c user.name=t \
+    commit --allow-empty --quiet -m "dispatch 1"
+
+  propagate_feature f >/dev/null 2>&1
+
+  [ "$RUNNER_LAST_PROPAGATION" = "published → origin/f" ]
+  [ "$(shared_ref f)" = "$(git -C "$HOST_CHECKOUT" rev-parse HEAD)" ]
+}
+
+@test "sync from Shared remote — no Shared remote: branch missing everywhere is created from main, nothing pushed" {
+  setup_sync_shared_test
+  git -C "$HOST_REPO" remote remove origin
+
+  run ensure_runner_checkout_on_branch f
+
+  assert_success
+  [ "$(git -C "$HOST_CHECKOUT" rev-parse HEAD)" = "$(git -C "$HOST_REPO" rev-parse refs/heads/main)" ]
+  [ -z "$(shared_ref f)" ]
+}
+
+@test "sync from Shared remote — unreachable Shared remote: sync fails with a diagnostic" {
+  setup_sync_shared_test
+  git -C "$HOST_REPO" branch f main
+  git -C "$HOST_REPO" remote set-url origin "$BATS_TEST_TMPDIR/does-not-exist.git"
+
+  run ensure_runner_checkout_on_branch f
+
+  assert_failure
+  assert_output --partial "cannot read origin/f from the Shared remote"
 }
 
 # === ensure_runner_checkout_on_branch — parking-ref sync path ==============
@@ -5600,6 +5910,77 @@ setup_ensure_checkout_parking_test() {
 
   git clone --quiet "$HOST_REPO" "$HOST_CHECKOUT" >&2
   git -C "$HOST_CHECKOUT" checkout --quiet -B f origin/f
+}
+
+# === Runner-checkout origin reset (#4, upstream jervell/formann#96) ==========
+#
+# Inside the sandbox the runner-checkout's `origin` is a host path, so an
+# agent's `git push` fails; one agent rewrote `origin` to the GitHub URL to push,
+# and the next host-side sync then fetched from the wrong place and halted the
+# loop with `preflight-abort: runner-checkout`. Every sync now puts `origin`
+# back to HOST_REPO first, and logs a line when it had to.
+
+@test "ensure_runner_checkout_on_branch — origin rewritten to another URL (#96): resets it, logs the reset, syncs normally" {
+  setup_ensure_checkout_parking_test
+  git -C "$HOST_REPO" -c user.email=t@t -c user.name=t \
+    commit --allow-empty --quiet -m "host advance"
+  local host_tip
+  host_tip="$(git -C "$HOST_REPO" rev-parse refs/heads/f)"
+  # The #96 scenario: a dispatch rewrote origin to push to the hosted remote.
+  git -C "$HOST_CHECKOUT" remote set-url origin "https://github.com/example/consumer.git"
+
+  run ensure_runner_checkout_on_branch "f"
+
+  assert_success
+  assert_output --partial "runner: runner-checkout origin was 'https://github.com/example/consumer.git'; reset to $HOST_REPO"
+  [ "$(git -C "$HOST_CHECKOUT" remote get-url origin)" = "$HOST_REPO" ]
+  [ "$(git -C "$HOST_CHECKOUT" rev-parse HEAD)" = "$host_tip" ]
+}
+
+@test "ensure_runner_checkout_on_branch — origin removed by a dispatch: re-adds it and syncs normally" {
+  setup_ensure_checkout_parking_test
+  git -C "$HOST_CHECKOUT" remote remove origin
+
+  run ensure_runner_checkout_on_branch "f"
+
+  assert_success
+  assert_output --partial "runner: runner-checkout origin was '(missing)'; reset to $HOST_REPO"
+  [ "$(git -C "$HOST_CHECKOUT" remote get-url origin)" = "$HOST_REPO" ]
+  [ "$(git -C "$HOST_CHECKOUT" rev-parse HEAD)" = "$(git -C "$HOST_REPO" rev-parse refs/heads/f)" ]
+}
+
+@test "ensure_runner_checkout_on_branch — origin given a separate push URL: clears it" {
+  setup_ensure_checkout_parking_test
+  git -C "$HOST_CHECKOUT" remote set-url --push origin "git@github.com:example/consumer.git"
+
+  run ensure_runner_checkout_on_branch "f"
+
+  assert_success
+  assert_output --partial "runner: runner-checkout origin push URL was 'git@github.com:example/consumer.git'; cleared"
+  [ "$(git -C "$HOST_CHECKOUT" remote get-url --push origin)" = "$HOST_REPO" ]
+}
+
+@test "ensure_runner_checkout_on_branch — origin already the host repo: no reset line" {
+  setup_ensure_checkout_parking_test
+
+  run ensure_runner_checkout_on_branch "f"
+
+  assert_success
+  refute_output --partial "runner-checkout origin"
+  [ "$(git -C "$HOST_CHECKOUT" remote get-url origin)" = "$HOST_REPO" ]
+}
+
+@test "ensure_runner_checkout — rewritten origin (#96) no longer aborts the run with preflight-abort: runner-checkout" {
+  setup_ensure_checkout_test
+  RUN_MODE=single
+  git -C "$HOST_CHECKOUT" remote set-url origin "https://github.com/example/consumer.git"
+  fail_invariant() { echo "fail_invariant $*"; return 99; }
+
+  run ensure_runner_checkout
+
+  assert_success
+  refute_output --partial "fail_invariant"
+  [ "$(git -C "$HOST_CHECKOUT" remote get-url origin)" = "$HOST_REPO" ]
 }
 
 @test "ensure_runner_checkout_on_branch — parking-ref strictly ahead: syncs to parking-ref tip" {
@@ -6007,8 +6388,24 @@ SHIM
   git -C "$HOST_CHECKOUT" symbolic-ref HEAD refs/heads/main
   git -C "$HOST_CHECKOUT" update-ref -d refs/heads/main 2>/dev/null || true
 
-  # Point origin at a nonexistent path so the recovery fetch fails.
-  git -C "$HOST_CHECKOUT" remote set-url origin "$BATS_TEST_TMPDIR/nonexistent"
+  # Make the recovery fetch fail. Rewriting origin's URL no longer works: the
+  # sync resets origin to HOST_REPO first (#4). A git shim fails every fetch
+  # in the runner-checkout instead.
+  local real_git fake_bin
+  real_git="$(command -v git)"
+  fake_bin="$BATS_TEST_TMPDIR/fake_bin"
+  mkdir -p "$fake_bin"
+  export SHIM_HOST_CHECKOUT="$HOST_CHECKOUT" SHIM_REAL_GIT="$real_git"
+  cat >"$fake_bin/git" <<'SHIM'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-C" ] && [ "${2:-}" = "$SHIM_HOST_CHECKOUT" ] && [ "${3:-}" = "fetch" ]; then
+  echo "fatal: could not read from remote repository (shim)" >&2
+  exit 128
+fi
+exec "$SHIM_REAL_GIT" "$@"
+SHIM
+  chmod +x "$fake_bin/git"
+  export PATH="$fake_bin:$PATH"
 
   run ensure_runner_checkout_on_branch "main"
   [ "$status" -ne 0 ]
@@ -6618,6 +7015,91 @@ EOF
   grep -qx "newfeat" "$REPRO_DRAINED_FILE"
 }
 
+@test "drain_one_feature — feature branch only on the Shared remote (#5): a machine that never had it drains it from the remote's tip" {
+  # Another machine created `remotefeat` (with one eligible AFK issue) and
+  # pushed it to the Shared remote; this machine's host repo has only main.
+  # Real ensure_runner_checkout_on_branch and real take_snapshot via the real
+  # local-markdown tracker-snapshot; only the mvn cache and the per-issue loop
+  # are mocked. Built from main instead, the snapshot would find no issues
+  # and the drain would skip queue-empty.
+  HOST_REPO="$BATS_TEST_TMPDIR/rf-host"
+  HOST_CHECKOUT="$BATS_TEST_TMPDIR/rf-checkout"
+  HOST_ABORT_DIR="$BATS_TEST_TMPDIR/rf-aborted"
+  SHARED_BARE="$BATS_TEST_TMPDIR/rf-shared.git"
+  mkdir -p "$HOST_REPO" "$HOST_ABORT_DIR"
+  unset RUNNER_SHARED_REMOTE
+
+  git -C "$HOST_REPO" init --quiet --initial-branch=main
+  mkdir -p "$HOST_REPO/docs/formann/issue-tracker" "$HOST_REPO/.features"
+  cp "$HERE/../bindings/issue-tracker/local-markdown/tracker-snapshot" \
+     "$HOST_REPO/docs/formann/issue-tracker/tracker-snapshot"
+  chmod +x "$HOST_REPO/docs/formann/issue-tracker/tracker-snapshot"
+  touch "$HOST_REPO/.features/.gitkeep"
+  git -C "$HOST_REPO" add -A
+  git -C "$HOST_REPO" -c user.email=t@t -c user.name=t \
+    commit --quiet -m "initial main commit"
+  git init --quiet --bare --initial-branch=main "$SHARED_BARE"
+  git -C "$HOST_REPO" remote add origin "$SHARED_BARE"
+  git -C "$HOST_REPO" push --quiet origin main
+  git clone --quiet "$HOST_REPO" "$HOST_CHECKOUT" >&2
+
+  # The other machine.
+  local other="$BATS_TEST_TMPDIR/rf-other"
+  git clone --quiet "$SHARED_BARE" "$other" >&2
+  git -C "$other" checkout --quiet -b remotefeat
+  mkdir -p "$other/.features/remotefeat/issues"
+  cat >"$other/.features/remotefeat/issues/01-do-the-thing.md" <<'EOF'
+---
+status: ready-for-agent
+category: enhancement
+type: AFK
+---
+
+# Do the thing
+
+## What to build
+
+A trivial thing.
+
+## Acceptance criteria
+
+- [ ] It does the thing.
+
+## Blocked by
+
+None — can start immediately.
+EOF
+  git -C "$other" add -A
+  git -C "$other" -c user.email=o@o -c user.name=o \
+    commit --quiet -m "remotefeat: feature with one eligible issue"
+  git -C "$other" push --quiet origin remotefeat >&2
+  local remote_tip
+  remote_tip="$(git -C "$other" rev-parse HEAD)"
+  ! git -C "$HOST_REPO" show-ref --quiet --verify refs/heads/remotefeat
+
+  RF_DRAINED_FILE="$BATS_TEST_TMPDIR/rf-drained"
+  : >"$RF_DRAINED_FILE"
+  ensure_mvn_cache_for() { MVN_VOLUME="rf-mvn"; return 0; }
+  run_loop() {
+    echo "$TARGET_FEATURE $(git -C "$HOST_CHECKOUT" rev-parse HEAD)" >>"$RF_DRAINED_FILE"
+    RUN_STOP_REASON="queue-empty"
+    return 0
+  }
+  RUN_DIR="$BATS_TEST_TMPDIR/rf-run"
+  mkdir -p "$RUN_DIR"
+  RUNNER_INTERRUPTED=0
+  RUN_FEATURE_OUTCOMES=()
+  RUN_DISPATCHES=()
+  RUN_STOP_REASON=""
+  TARGET_FEATURE=""
+  RUN_MODE="drain"
+
+  drain_one_feature "remotefeat"
+
+  [ "${RUN_FEATURE_OUTCOMES[0]}" = "remotefeat|drained" ]
+  grep -qx "remotefeat $remote_tip" "$RF_DRAINED_FILE"
+}
+
 @test "drain_one_feature — records skip:fetch-failed when runner-checkout sync fails" {
   setup_drain_test
   git -C "$HOST_REPO" branch alpha
@@ -6849,6 +7331,300 @@ EOF
   [ "$(drain_outcomes_count)" = "2" ]
   [ "$(drain_outcome_nth 0)" = "alpha|feature-snapshot-failed" ]
   [ "$(drain_outcome_nth 1)" = "beta|drained" ]
+}
+
+# === Claim in the drain loop (#7) ==========================================
+
+# Drain harness plus a bare Shared remote as the host's `origin`, a dummy
+# runner-checkout, and a recording `comment-on-feature` on the role surface.
+setup_claim_drain_test() {
+  setup_drain_test
+  unset RUNNER_SHARED_REMOTE RUNNER_FORMANN_SHA
+  SHARED="$BATS_TEST_TMPDIR/shared.git"
+  git init --quiet --bare --initial-branch=main "$SHARED"
+  git -C "$HOST_REPO" remote add origin "$SHARED"
+  HOST_CHECKOUT="$BATS_TEST_TMPDIR/claim-checkout"
+  git init --quiet --initial-branch=master "$HOST_CHECKOUT"
+  git -C "$HOST_CHECKOUT" -c user.email=t@t -c user.name=t \
+    commit --allow-empty --quiet -m init
+  RUNNER_MACHINE="m1"
+  RUN_TS="20261108-120000"
+  CLAIM_HELD_FEATURE=""
+  CLAIM_HELD_SHA=""
+  NOTES_FILE="$BATS_TEST_TMPDIR/notes"
+  : >"$NOTES_FILE"
+  mkdir -p "$HOST_REPO/docs/formann/issue-tracker"
+  cat >"$HOST_REPO/docs/formann/issue-tracker/comment-on-feature" <<SCRIPT
+#!/usr/bin/env bash
+{ printf '%s %s\n' "\$1" "\$2"; cat; printf '\n--\n'; } >>"$NOTES_FILE"
+echo "#1"
+SCRIPT
+  chmod +x "$HOST_REPO/docs/formann/issue-tracker/comment-on-feature"
+  # The per-issue loop stand-in records whose claim was on the Shared
+  # remote while the feature drained.
+  CLAIM_SEEN_FILE="$BATS_TEST_TMPDIR/claim-seen"
+  : >"$CLAIM_SEEN_FILE"
+  run_loop() {
+    echo "$TARGET_FEATURE" >>"$DRAIN_DRAINED_FILE"
+    local sha
+    sha="$(git -C "$SHARED" rev-parse --verify --quiet "refs/formann/claims/$TARGET_FEATURE" || true)"
+    if [ -n "$sha" ]; then
+      printf '%s %s\n' "$TARGET_FEATURE" \
+        "$(claim_field "$(git -C "$SHARED" log -1 --format=%B "$sha")" machine)" >>"$CLAIM_SEEN_FILE"
+    fi
+    RUN_STOP_REASON="queue-empty"
+    return 0
+  }
+}
+
+# Another runner (machine $2) takes a claim on feature $1.
+claim_by_other() {
+  local other="$BATS_TEST_TMPDIR/other-$2"
+  [ -d "$other" ] || { git init --quiet "$other"; git -C "$other" remote add origin "$SHARED"; }
+  ( HOST_REPO="$other"; RUNNER_MACHINE="$2"; claim take "$1" >/dev/null )
+}
+
+@test "run_drain — claims (#7): a held feature is skipped and the next eligible one drained; SUMMARY says held-by <machine>" {
+  setup_claim_drain_test
+  DISCOVERY_JSON='["alpha","beta"]'
+  claim_by_other alpha m2
+  local alpha_claim
+  alpha_claim="$(git -C "$SHARED" rev-parse refs/formann/claims/alpha)"
+
+  run_drain
+
+  [ "$RUN_STOP_REASON" = "completed" ]
+  [ "$(drain_outcome_nth 0)" = "alpha|held-by m2" ]
+  [ "$(drain_outcome_nth 1)" = "beta|drained" ]
+  # alpha was never drained here, and m2's claim is untouched.
+  [ "$(cat "$DRAIN_DRAINED_FILE")" = "beta" ]
+  [ "$(git -C "$SHARED" rev-parse refs/formann/claims/alpha)" = "$alpha_claim" ]
+  # beta drained under this runner's claim, released at drain end.
+  [ "$(cat "$CLAIM_SEEN_FILE")" = "beta m1" ]
+  ! git -C "$SHARED" rev-parse --verify --quiet refs/formann/claims/beta
+  [ -z "$CLAIM_HELD_FEATURE" ]
+
+  local summary
+  summary="$(print_multi_feature_records | format_multi_feature_summary_md \
+    "$RUN_TS" "12:00:00" "12:01:00" "ended" "completed")"
+  [[ "$summary" == *"## alpha — held-by m2"* ]]
+  [[ "$summary" == *"## beta — drained"* ]]
+}
+
+@test "drain_one_feature — claims (#7): a claim Note is posted on the taken feature through comment-on-feature, never on a held one" {
+  setup_claim_drain_test
+  claim_by_other alpha m2
+
+  drain_one_feature alpha
+  drain_one_feature beta
+
+  # One Note, for beta, naming the machine, the run and the claim ref.
+  [ "$(grep -c '^-- *$' "$NOTES_FILE")" = "1" ]
+  [ "$(head -n 1 "$NOTES_FILE")" = "beta Note" ]
+  grep -q 'AFK runner' "$NOTES_FILE"
+  grep -q '`m1`' "$NOTES_FILE"
+  grep -q '`20261108-120000`' "$NOTES_FILE"
+  grep -q 'refs/formann/claims/beta' "$NOTES_FILE"
+}
+
+@test "drain_one_feature — claims (#7): the claim is released however the feature's loop ends" {
+  setup_claim_drain_test
+  local reason
+  for reason in snapshot-failed propagation-error runaway-halt publish-parked; do
+    run_loop() { RUN_STOP_REASON="$CLAIM_TEST_REASON"; return 1; }
+    CLAIM_TEST_REASON="$reason"
+    RUN_STOP_REASON=""
+    drain_one_feature alpha
+    git -C "$SHARED" rev-parse --verify --quiet refs/formann/claims/alpha \
+      && fail "claim left after a loop ending $reason"
+    [ -z "$CLAIM_HELD_FEATURE" ]
+  done
+}
+
+@test "drain_one_feature — claims (#7): a Note that can't be posted doesn't stop the drain" {
+  setup_claim_drain_test
+  printf '#!/usr/bin/env bash\nexit 3\n' >"$HOST_REPO/docs/formann/issue-tracker/comment-on-feature"
+
+  drain_one_feature alpha
+
+  [ "$(drain_outcome_nth 0)" = "alpha|drained" ]
+  [ "$(cat "$CLAIM_SEEN_FILE")" = "alpha m1" ]
+}
+
+@test "drain_one_feature — claims (#7): unreachable Shared remote: skip:claim-failed, nothing drained" {
+  setup_claim_drain_test
+  git -C "$HOST_REPO" remote set-url origin "$BATS_TEST_TMPDIR/missing.git"
+
+  drain_one_feature alpha
+
+  [ "$(drain_outcome_nth 0)" = "alpha|skip:claim-failed" ]
+  [ ! -s "$DRAIN_DRAINED_FILE" ]
+}
+
+@test "drain_one_feature — claims (#7): no Shared remote: no claim, no Note, drains as before" {
+  setup_claim_drain_test
+  git -C "$HOST_REPO" remote remove origin
+
+  drain_one_feature alpha
+
+  [ "$(drain_outcome_nth 0)" = "alpha|drained" ]
+  [ ! -s "$NOTES_FILE" ]
+  [ ! -s "$CLAIM_SEEN_FILE" ]
+  [ -z "$(git -C "$SHARED" for-each-ref refs/formann/)" ]
+}
+
+@test "run_claimed_loop — claims (#7): loop mode skips a held feature with stop reason held-by, drains and releases a free one" {
+  setup_claim_drain_test
+  RUN_MODE="loop"
+  claim_by_other alpha m2
+
+  TARGET_FEATURE="alpha"
+  run_claimed_loop
+  [ "$RUN_STOP_REASON" = "held-by m2" ]
+  [ ! -s "$DRAIN_DRAINED_FILE" ]
+
+  TARGET_FEATURE="beta"
+  run_claimed_loop
+  [ "$RUN_STOP_REASON" = "queue-empty" ]
+  [ "$(cat "$CLAIM_SEEN_FILE")" = "beta m1" ]
+  ! git -C "$SHARED" rev-parse --verify --quiet refs/formann/claims/beta
+}
+
+# A runner process draining one feature under its claim, interruptible: the
+# per-issue loop stand-in signals readiness, then waits for the interrupt.
+# $1 = the INT handler to install (handle_signal: the drain's own path;
+# handle_preflight_signal: exit at once, leaving only finalize_run).
+claim_interrupt_runner() {
+  cat >"$BATS_TEST_TMPDIR/runner.sh" <<SCRIPT
+source "$RUNNER_SCRIPT"
+HOST_REPO="$HOST_REPO"; HOST_CHECKOUT="$HOST_CHECKOUT"; HOST_ABORT_DIR="$HOST_ABORT_DIR"
+RUNNER_MACHINE=m1; RUN_TS=r1; RUN_DIR=""; RUN_MODE=drain; LOCK_HELD=0
+RUNNER_DISABLE_LIVENESS=1
+ensure_runner_checkout_on_branch() { return 0; }
+take_snapshot() { printf '{"feature":"%s","issues":[{"ref":"%s/01","nn":"01","status":"ready-for-agent","type":"AFK","blocked_by":[],"eligible":true}]}' "\$1" "\$1"; }
+ensure_mvn_cache_for() { MVN_VOLUME=x; return 0; }
+run_loop() {
+  : >"$BATS_TEST_TMPDIR/ready"
+  while [ "\$RUNNER_INTERRUPTED" -eq 0 ]; do sleep 0.1; done
+  RUN_STOP_REASON=interrupted
+  return 0
+}
+trap finalize_run EXIT
+trap $1 INT TERM
+DISCOVERY_JSON='["alpha"]'
+run_drain
+SCRIPT
+  # Job control on: a background job of a non-interactive shell starts with
+  # SIGINT ignored (and an ignored signal can't be trapped), unlike a runner
+  # started from a terminal.
+  set -m
+  bash "$BATS_TEST_TMPDIR/runner.sh" >"$BATS_TEST_TMPDIR/runner.out" 2>&1 &
+  local pid=$! i
+  set +m
+  for i in $(seq 1 100); do
+    [ -f "$BATS_TEST_TMPDIR/ready" ] && break
+    sleep 0.1
+  done
+  [ -f "$BATS_TEST_TMPDIR/ready" ] || fail "runner never reached the loop: $(cat "$BATS_TEST_TMPDIR/runner.out")"
+  git -C "$SHARED" rev-parse --verify --quiet refs/formann/claims/alpha >/dev/null \
+    || fail "no claim while draining"
+  kill -INT "$pid"
+  wait "$pid" || true
+}
+
+@test "claims (#7): SIGINT mid-drain — the drain ends and the claim ref is gone" {
+  setup_claim_drain_test
+  claim_interrupt_runner handle_signal
+  ! git -C "$SHARED" rev-parse --verify --quiet refs/formann/claims/alpha
+  grep -q 'released the claim on alpha' "$BATS_TEST_TMPDIR/runner.out"
+}
+
+@test "claims (#7): SIGINT that exits at once — finalize_run releases the claim" {
+  setup_claim_drain_test
+  claim_interrupt_runner handle_preflight_signal
+  ! git -C "$SHARED" rev-parse --verify --quiet refs/formann/claims/alpha
+  grep -q 'released the claim on alpha' "$BATS_TEST_TMPDIR/runner.out"
+}
+
+@test "drain_one_feature — claims (#7), local-markdown end to end: claim held while draining, Note committed on the PRD and published, claim gone after" {
+  # Real sync, real local-markdown tracker-snapshot and comment-on-feature on
+  # the role surface; only the mvn cache and the per-issue loop are mocked.
+  HOST_REPO="$BATS_TEST_TMPDIR/lm-host"
+  HOST_CHECKOUT="$BATS_TEST_TMPDIR/lm-checkout"
+  HOST_ABORT_DIR="$BATS_TEST_TMPDIR/lm-aborted"
+  SHARED="$BATS_TEST_TMPDIR/lm-shared.git"
+  mkdir -p "$HOST_REPO" "$HOST_ABORT_DIR"
+  unset RUNNER_SHARED_REMOTE
+  RUNNER_MACHINE="m1"
+  RUN_TS="20261108-120000"
+  CLAIM_HELD_FEATURE=""
+
+  git -C "$HOST_REPO" init --quiet --initial-branch=main
+  mkdir -p "$HOST_REPO/docs/formann/issue-tracker" "$HOST_REPO/.features/lmfeat/issues"
+  cp "$HERE/../bindings/issue-tracker/local-markdown/tracker-snapshot" \
+     "$HERE/../bindings/issue-tracker/local-markdown/comment-on-feature" \
+     "$HOST_REPO/docs/formann/issue-tracker/"
+  printf '# LM feature\n\n## Gist\n\nx\n' >"$HOST_REPO/.features/lmfeat/PRD.md"
+  cat >"$HOST_REPO/.features/lmfeat/issues/01-do-the-thing.md" <<'MD'
+---
+status: ready-for-agent
+category: enhancement
+type: AFK
+---
+
+# Do the thing
+
+## What to build
+
+A trivial thing.
+
+## Acceptance criteria
+
+- [ ] It does the thing.
+
+## Blocked by
+
+None — can start immediately.
+MD
+  git -C "$HOST_REPO" add -A
+  git -C "$HOST_REPO" -c user.email=t@t -c user.name=t commit --quiet -m init
+  git -C "$HOST_REPO" branch lmfeat
+  git init --quiet --bare --initial-branch=main "$SHARED"
+  git -C "$HOST_REPO" remote add origin "$SHARED"
+  git -C "$HOST_REPO" push --quiet origin main lmfeat
+  git clone --quiet "$HOST_REPO" "$HOST_CHECKOUT" >&2
+  git -C "$HOST_REPO" remote add runner "$HOST_CHECKOUT"
+
+  LM_SEEN="$BATS_TEST_TMPDIR/lm-seen"
+  : >"$LM_SEEN"
+  ensure_mvn_cache_for() { MVN_VOLUME="lm-mvn"; return 0; }
+  run_loop() {
+    git -C "$SHARED" rev-parse --verify --quiet "refs/formann/claims/$TARGET_FEATURE" >/dev/null \
+      && echo "claimed" >>"$LM_SEEN"
+    RUN_STOP_REASON="queue-empty"
+    return 0
+  }
+  RUN_DIR="$BATS_TEST_TMPDIR/lm-run"
+  mkdir -p "$RUN_DIR"
+  RUNNER_INTERRUPTED=0
+  RUN_FEATURE_OUTCOMES=()
+  RUN_DISPATCHES=()
+  RUN_STOP_REASON=""
+  TARGET_FEATURE=""
+  RUN_MODE="drain"
+
+  drain_one_feature lmfeat
+
+  [ "${RUN_FEATURE_OUTCOMES[0]}" = "lmfeat|drained" ]
+  [ "$(cat "$LM_SEEN")" = "claimed" ]
+  ! git -C "$SHARED" rev-parse --verify --quiet refs/formann/claims/lmfeat
+  # The Note is a tracker: commit on the feature branch, on the Shared remote
+  # and on host.
+  local prd
+  prd="$(git -C "$SHARED" show lmfeat:.features/lmfeat/PRD.md)"
+  [[ "$prd" == *"## Comments"*"### Note — "*"\`m1\`"* ]]
+  [ "$(git -C "$SHARED" log -1 --format=%s lmfeat)" = "tracker: lmfeat — Note on the feature" ]
+  [ "$(git -C "$HOST_REPO" rev-parse lmfeat)" = "$(git -C "$SHARED" rev-parse lmfeat)" ]
 }
 
 # === parse_args — drain mode accepts bare invocation ======================
@@ -7921,4 +8697,1821 @@ _setup_sweep_test_with_checkout() {
   # Warning logged.
   grep -q "keeping refs/remotes/runner/foo.*refs/heads/foo" "$sw_log"
   [ "${#RUN_SWEPT_REFS[@]}" -eq 0 ]
+}
+
+# === Publisher step 3: the Shared remote (ADR-0011) ========================
+#
+# propagate_feature's third step fast-forwards the dispatch's commit onto
+# `<shared-remote>/<branch>` from the host repo — never a force push. These
+# tests run against a real host repo, a runner-checkout cloned from it, and a
+# bare repo standing in for the Shared remote.
+
+# Builds on setup_propagate_test: adds a bare repo at $SHARED_BARE, registers
+# it in the host repo as remote $1 (default `origin`), and seeds its `f`
+# branch with the host's `f` tip. Host HEAD moves to `master` so the step-2
+# host fast-forward is not the variable under test.
+setup_shared_remote_test() {
+  local remote_name="${1:-origin}"
+  setup_propagate_test
+  SHARED_BARE="$BATS_TEST_TMPDIR/shared-${remote_name}.git"
+  git init --quiet --bare --initial-branch=f "$SHARED_BARE"
+  git -C "$HOST_REPO" remote add "$remote_name" "$SHARED_BARE"
+  git -C "$HOST_REPO" push --quiet "$remote_name" f
+  git -C "$HOST_REPO" checkout --quiet -b master
+  unset RUNNER_SHARED_REMOTE
+}
+
+shared_tip() { git -C "$SHARED_BARE" rev-parse --verify "refs/heads/$1" 2>/dev/null || true; }
+
+# Makes the Shared remote's `f` diverge from the runner-checkout: a commit the
+# runner lacks lands on the remote (pushed from a scratch clone, as another
+# machine would). Prints the diverging commit's SHA.
+diverge_shared_remote() {
+  local other="$BATS_TEST_TMPDIR/other-machine"
+  git clone --quiet "$SHARED_BARE" "$other" >&2
+  git -C "$other" -c user.email=o@o -c user.name=o \
+    commit --allow-empty --quiet -m "someone else's work"
+  git -C "$other" push --quiet origin f >&2
+  git -C "$other" rev-parse HEAD
+}
+
+@test "publish — published: the Shared remote's branch is fast-forwarded to the dispatch's commit" {
+  setup_shared_remote_test
+  git -C "$HOST_CHECKOUT" -c user.email=t@t -c user.name=t \
+    commit --allow-empty --quiet -m "tracker: f/01 → in-review"
+  local checkout_tip
+  checkout_tip="$(git -C "$HOST_CHECKOUT" rev-parse HEAD)"
+
+  propagate_feature "f" >"$BATS_TEST_TMPDIR/out" 2>&1
+
+  [ "$(git -C "$HOST_REPO" ls-remote origin refs/heads/f | cut -f1)" = "$checkout_tip" ]
+  [ "$RUNNER_LAST_PROPAGATION" = "published → origin/f" ]
+  [ "$RUNNER_PUBLISH_PARKED" = "0" ]
+  # Parking ref and host branch still advance as before.
+  [ "$(git -C "$HOST_REPO" rev-parse refs/remotes/runner/f)" = "$checkout_tip" ]
+  [ "$(git -C "$HOST_REPO" rev-parse refs/heads/f)" = "$checkout_tip" ]
+  # The progress line carries the publish state.
+  grep -q "published → origin/f" "$BATS_TEST_TMPDIR/out"
+}
+
+@test "publish — published even when the host fast-forward is refused (HEAD on the branch)" {
+  setup_shared_remote_test
+  git -C "$HOST_REPO" checkout --quiet f
+  git -C "$HOST_CHECKOUT" -c user.email=t@t -c user.name=t \
+    commit --allow-empty --quiet -m "tracker: f/01 → in-review"
+  local checkout_tip
+  checkout_tip="$(git -C "$HOST_CHECKOUT" rev-parse HEAD)"
+
+  propagate_feature "f" >/dev/null 2>&1
+
+  [ "$(shared_tip f)" = "$checkout_tip" ]
+  [ "$RUNNER_LAST_PROPAGATION" = "published → origin/f" ]
+}
+
+@test "publish — parked on divergence: remote unchanged, work on the parking ref, no force push" {
+  setup_shared_remote_test
+  local theirs
+  theirs="$(diverge_shared_remote)"
+  git -C "$HOST_CHECKOUT" -c user.email=t@t -c user.name=t \
+    commit --allow-empty --quiet -m "tracker: f/01 → in-review"
+  local checkout_tip
+  checkout_tip="$(git -C "$HOST_CHECKOUT" rev-parse HEAD)"
+
+  local rc=0
+  propagate_feature "f" >"$BATS_TEST_TMPDIR/out" 2>"$BATS_TEST_TMPDIR/err" || rc=$?
+
+  # Not an error: the work is safe on the parking ref.
+  [ "$rc" -eq 0 ]
+  [ "$RUNNER_LAST_PROPAGATION" = "parked → runner/f" ]
+  [ "$RUNNER_PUBLISH_PARKED" = "1" ]
+  [ "$(git -C "$HOST_REPO" rev-parse refs/remotes/runner/f)" = "$checkout_tip" ]
+  # No force push: the remote branch still points at the other machine's
+  # commit, which stays reachable, and the runner's commit is not on it.
+  [ "$(shared_tip f)" = "$theirs" ]
+  git -C "$SHARED_BARE" merge-base --is-ancestor "$theirs" refs/heads/f
+  ! git -C "$SHARED_BARE" cat-file -e "$checkout_tip^{commit}" 2>/dev/null
+  grep -q "publish refused" "$BATS_TEST_TMPDIR/err"
+  grep -q "parked → runner/f (git pull runner f)" "$BATS_TEST_TMPDIR/out"
+}
+
+@test "publish — other push errors (unreachable remote) classify as parked with git's stderr" {
+  setup_shared_remote_test
+  git -C "$HOST_REPO" remote set-url origin "$BATS_TEST_TMPDIR/no-such-remote.git"
+  git -C "$HOST_CHECKOUT" -c user.email=t@t -c user.name=t \
+    commit --allow-empty --quiet -m "tracker: f/01 → in-review"
+
+  local rc=0
+  propagate_feature "f" >/dev/null 2>"$BATS_TEST_TMPDIR/err" || rc=$?
+
+  [ "$rc" -eq 0 ]
+  [ "$RUNNER_LAST_PROPAGATION" = "parked → runner/f" ]
+  [ "$RUNNER_PUBLISH_PARKED" = "1" ]
+  grep -q "publish refused" "$BATS_TEST_TMPDIR/err"
+  # git's own diagnostic reaches runner.log.
+  grep -qi "does not appear to be a git repository\|not found\|fatal" "$BATS_TEST_TMPDIR/err" || {
+    cat "$BATS_TEST_TMPDIR/err"; false; }
+}
+
+@test "publish — local-only: no Shared remote, behaviour as before plus local-only" {
+  setup_propagate_test
+  git -C "$HOST_REPO" checkout --quiet -b master
+  git -C "$HOST_CHECKOUT" -c user.email=t@t -c user.name=t \
+    commit --allow-empty --quiet -m "tracker: f/01 → in-review"
+  local checkout_tip
+  checkout_tip="$(git -C "$HOST_CHECKOUT" rev-parse HEAD)"
+
+  propagate_feature "f" >/dev/null 2>"$BATS_TEST_TMPDIR/err"
+
+  [ "$RUNNER_LAST_PROPAGATION" = "local-only (propagated → host)" ]
+  [ "$RUNNER_PUBLISH_PARKED" = "0" ]
+  [ "$(git -C "$HOST_REPO" rev-parse refs/heads/f)" = "$checkout_tip" ]
+  [ "$(git -C "$HOST_REPO" rev-parse refs/remotes/runner/f)" = "$checkout_tip" ]
+  [ ! -s "$BATS_TEST_TMPDIR/err" ]
+}
+
+@test "publish — RUNNER_SHARED_REMOTE=upstream pushes to upstream, not origin" {
+  setup_shared_remote_test upstream
+  local upstream_bare="$SHARED_BARE"
+  # An `origin` also exists; it must not be touched.
+  local origin_bare="$BATS_TEST_TMPDIR/origin.git"
+  git init --quiet --bare --initial-branch=f "$origin_bare"
+  git -C "$HOST_REPO" remote add origin "$origin_bare"
+  git -C "$HOST_REPO" push --quiet origin f
+  local origin_before
+  origin_before="$(git -C "$origin_bare" rev-parse refs/heads/f)"
+  git -C "$HOST_CHECKOUT" -c user.email=t@t -c user.name=t \
+    commit --allow-empty --quiet -m "tracker: f/01 → in-review"
+  local checkout_tip
+  checkout_tip="$(git -C "$HOST_CHECKOUT" rev-parse HEAD)"
+
+  RUNNER_SHARED_REMOTE=upstream
+  propagate_feature "f" >/dev/null 2>&1
+
+  [ "$(git -C "$upstream_bare" rev-parse refs/heads/f)" = "$checkout_tip" ]
+  [ "$(git -C "$origin_bare" rev-parse refs/heads/f)" = "$origin_before" ]
+  [ "$RUNNER_LAST_PROPAGATION" = "published → upstream/f" ]
+}
+
+@test "publish — RUNNER_SHARED_REMOTE naming a missing remote is local-only" {
+  setup_shared_remote_test
+  local before
+  before="$(shared_tip f)"
+  git -C "$HOST_CHECKOUT" -c user.email=t@t -c user.name=t \
+    commit --allow-empty --quiet -m "tracker: f/01 → in-review"
+
+  RUNNER_SHARED_REMOTE=upstream
+  propagate_feature "f" >/dev/null 2>&1
+
+  [ "$RUNNER_LAST_PROPAGATION" = "local-only (propagated → host)" ]
+  [ "$(shared_tip f)" = "$before" ]
+}
+
+@test "dispatch_one — Shared remote holds the implement commit before the first post-implement step starts" {
+  setup_dispatch_one_test
+  install_afk_snapshots done
+  setup_shared_remote_test
+
+  local seen_file="$BATS_TEST_TMPDIR/seen-at-review-start"
+  local impl_tip_file="$BATS_TEST_TMPDIR/impl-tip"
+  run_item_container() {
+    # Record what the Shared remote serves as the step starts, and the
+    # runner-checkout tip (the implement commit) at that moment.
+    git -C "$HOST_REPO" ls-remote origin refs/heads/f | cut -f1 >"$seen_file"
+    git -C "$HOST_CHECKOUT" rev-parse HEAD >"$impl_tip_file"
+    git -C "$HOST_CHECKOUT" -c user.email=t@t -c user.name=t \
+      commit --allow-empty --quiet -m "tracker: review f/01 → done"
+    return 0
+  }
+
+  RUN_DISPATCHES=()
+  dispatch_one "f" "01" "$TEST_RUN_DIR" >/dev/null 2>&1
+
+  [ -s "$seen_file" ]
+  [ "$(cat "$seen_file")" = "$(cat "$impl_tip_file")" ]
+  # The review step's own commit is published too.
+  [ "$(shared_tip f)" = "$(git -C "$HOST_CHECKOUT" rev-parse HEAD)" ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|done|"*"|published → origin/f" ]]
+}
+
+@test "dispatch_one — diverged Shared remote: implement parked, walk not started, remote unchanged" {
+  setup_dispatch_one_test
+  install_afk_snapshots done
+  setup_shared_remote_test
+  local theirs
+  theirs="$(diverge_shared_remote)"
+
+  local walk_file="$BATS_TEST_TMPDIR/walk-started"
+  : >"$walk_file"
+  run_item_container() { echo started >>"$walk_file"; return 0; }
+
+  RUN_DISPATCHES=()
+  RUN_STOP_REASON=""
+  local rc=0
+  dispatch_one "f" "01" "$TEST_RUN_DIR" >/dev/null 2>&1 || rc=$?
+
+  [ "$rc" -eq 0 ]
+  [ "$RUNNER_PUBLISH_PARKED" = "1" ]
+  [ ! -s "$walk_file" ]
+  [ "$(shared_tip f)" = "$theirs" ]
+  [ "$(git -C "$HOST_REPO" rev-parse refs/remotes/runner/f)" = "$(git -C "$HOST_CHECKOUT" rev-parse HEAD)" ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|in-review|"*"|parked → runner/f" ]]
+}
+
+@test "dispatch_one — Shared remote refuses a walk step's commit: walk stops, left-for-human" {
+  setup_dispatch_one_test
+  install_afk_snapshots in-review
+  setup_shared_remote_test
+  # Two-step manifest; the remote diverges while step 1 runs.
+  RESOLVED_MANIFEST="$(printf 'review\t%s\nfix\t%s\n' "$HERE/review-and-gate.md" "$HERE/review-and-gate.md")"
+  local steps_file="$BATS_TEST_TMPDIR/steps"
+  : >"$steps_file"
+  run_item_container() {
+    echo step >>"$steps_file"
+    diverge_shared_remote >/dev/null
+    git -C "$HOST_CHECKOUT" -c user.email=t@t -c user.name=t \
+      commit --allow-empty --quiet -m "tracker: review f/01 comment"
+    return 0
+  }
+
+  RUN_DISPATCHES=()
+  local rc=0
+  dispatch_one "f" "01" "$TEST_RUN_DIR" >/dev/null 2>&1 || rc=$?
+
+  [ "$rc" -eq 0 ]
+  [ "$RUNNER_PUBLISH_PARKED" = "1" ]
+  [ "$(wc -l <"$steps_file" | tr -d ' ')" = "1" ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|left-for-human|"*"|parked → runner/f" ]]
+}
+
+@test "run_loop — a parked publish stops the loop on the feature with publish-parked" {
+  setup_loop_test
+  plant_queue 01 02
+
+  dispatch_one() {
+    local feature="$1" nn="$2"
+    echo "$feature/$nn" >>"$TEST_DISPATCHED_FILE"
+    local rest
+    rest="$(tail -n +2 "$TEST_QUEUE_FILE" 2>/dev/null || true)"
+    printf '%s\n' "$rest" >"$TEST_QUEUE_FILE"
+    RUNNER_PUBLISH_PARKED=1
+    RUNNER_LAST_PROPAGATION="parked → runner/$feature"
+    return 0
+  }
+
+  RUN_STOP_REASON=""
+  local rc=0
+  run_loop >"$BATS_TEST_TMPDIR/out" 2>&1 || rc=$?
+
+  [ "$rc" -eq 0 ]
+  [ "$RUN_STOP_REASON" = "publish-parked" ]
+  [ "$(dispatched_count)" = "1" ]
+  grep -q "Shared remote refused" "$BATS_TEST_TMPDIR/out"
+}
+
+@test "run_drain — a parked feature stops; the drain continues with the next feature" {
+  setup_drain_test
+  DISCOVERY_JSON='["alpha","beta"]'
+  git -C "$HOST_REPO" branch alpha
+  git -C "$HOST_REPO" branch beta
+
+  run_loop() {
+    echo "$TARGET_FEATURE" >>"$DRAIN_DRAINED_FILE"
+    if [ "$TARGET_FEATURE" = "alpha" ]; then
+      RUN_STOP_REASON="publish-parked"
+      return 0
+    fi
+    RUN_STOP_REASON="queue-empty"
+    return 0
+  }
+
+  local rc=0
+  run_drain >/dev/null 2>&1 || rc=$?
+
+  [ "$rc" -eq 0 ]
+  [ "$RUN_STOP_REASON" = "completed" ]
+  [ "$(drained_features_count)" = "2" ]
+  [ "$(drain_outcome_nth 0)" = "alpha|parked" ]
+  [ "$(drain_outcome_nth 1)" = "beta|drained" ]
+}
+
+@test "format_multi_feature_summary_md — parked feature renders its table and the parked ledger" {
+  input='F|alpha|parked
+I|alpha|01|alpha/01|in-review|42||1|parked → runner/alpha
+F|beta|drained
+I|beta|01|beta/01|done|10|01-review|1|published → origin/beta'
+  result="$(printf '%s\n' "$input" | format_multi_feature_summary_md "ts" "10:00" "10:05" "ended" "completed")"
+
+  echo "$result" | grep -qF '## alpha — parked (Shared remote refused the fast-forward)'
+  echo "$result" | grep -qF '| alpha/01 | in-review | 42s | parked → runner/alpha |'
+  echo "$result" | grep -qF '| beta/01 | done | 10s | published → origin/beta |'
+  echo "$result" | grep -qF -- '- **alpha** (1 dispatch): `git pull runner alpha`'
+  ! echo "$result" | grep -qF -- '- **beta**'
+}
+
+@test "format_parked_ledger — local-only parked counts; published and local-only propagated do not" {
+  input='f|01|f/01|done|10|y|1|local-only (parked → runner/f)
+g|01|g/01|done|10|y|1|published → origin/g
+h|01|h/01|done|10|y|1|local-only (propagated → host)'
+  result="$(printf '%s\n' "$input" | format_parked_ledger)"
+  echo "$result" | grep -qF -- '- **f** (1 dispatch): `git pull runner f`'
+  ! echo "$result" | grep -qF -- '**g**'
+  ! echo "$result" | grep -qF -- '**h**'
+}
+
+@test "format_end_of_run_table — publish-state indicators render in the propagation column" {
+  input='f|01|f/01|done|10|y|1|published → origin/f
+f|02|f/02|in-review|10|y|1|local-only (propagated → host)'
+  result="$(printf '%s\n' "$input" | format_end_of_run_table "completed")"
+  echo "$result" | grep -qF 'published → origin/f'
+  echo "$result" | grep -qF 'local-only (propagated → host)'
+}
+
+@test "publish — no force push anywhere in propagate_feature's Shared-remote step" {
+  body="$(declare -f propagate_feature)"
+  ! grep -qE 'push[^|]*(--force|-f |\+\$|"\+)' <<<"$body"
+  grep -q 'push --quiet' <<<"$body"
+}
+
+# === Blocked steps (#3) =======================================================
+#
+# A post-implement step that cannot reach a dependency posts a Blocked comment
+# and ends its result with `BLOCKED: <dependency>`. The runner leaves the
+# issue's state alone, writes no abort flag, and moves on; at the third Blocked
+# pass (count read from the tracker via the binding's blocked-passes script)
+# the issue is left for a human.
+
+# Write a clean terminal `result` event whose closing message is $2.
+emit_result_text() {
+  local base="$1" text="$2"
+  jq -cn --arg t "$text" \
+    '{type:"result",subtype:"success",is_error:false,api_error_status:null,result:$t,uuid:"u"}' \
+    >"$base.stdout.jsonl"
+}
+
+# Independent oracle for the classifier's documented guard order.
+_expected_item_action() {
+  local status="$1" rc="$2" blocked="$3" passes="$4"
+  if [ "$rc" != "0" ]; then echo fail; return; fi
+  if [ "$blocked" = "true" ]; then
+    if [ "$passes" -ge 3 ]; then echo left-for-human; else echo blocked; fi
+    return
+  fi
+  case "$status" in
+    done|wontfix|"") echo stop-success ;;
+    in-review) echo continue ;;
+    ready-for-agent) echo terminate-run ;;
+    *) echo fail ;;
+  esac
+}
+
+@test "classify_item_action — exhaustive over status × exit code × blocked × passes 0–3" {
+  local status rc blocked passes got want n=0
+  for status in done wontfix "" in-review ready-for-agent ready-for-human needs-triage needs-info some-unknown; do
+    for rc in 0 1 137; do
+      for blocked in false true; do
+        for passes in 0 1 2 3; do
+          n=$((n + 1))
+          got="$(classify_item_action "$status" "$rc" "$blocked" "$passes")"
+          want="$(_expected_item_action "$status" "$rc" "$blocked" "$passes")"
+          [ "$got" = "$want" ] || fail "status='$status' rc=$rc blocked=$blocked passes=$passes: got '$got', want '$want'"
+        done
+      done
+      # Two-argument form behaves as blocked=false.
+      got="$(classify_item_action "$status" "$rc")"
+      want="$(_expected_item_action "$status" "$rc" false 0)"
+      [ "$got" = "$want" ] || fail "two-arg status='$status' rc=$rc: got '$got', want '$want'"
+    done
+  done
+  [ "$n" -eq 216 ]
+}
+
+@test "classify_item_action — blocked below three passes is blocked, at three or more is left-for-human" {
+  [ "$(classify_item_action in-review 0 true 0)" = "blocked" ]
+  [ "$(classify_item_action in-review 0 true 2)" = "blocked" ]
+  [ "$(classify_item_action in-review 0 true 3)" = "left-for-human" ]
+  [ "$(classify_item_action in-review 0 true 4)" = "left-for-human" ]
+  # blocked precedes the status-based actions; a nonzero exit is still fail.
+  [ "$(classify_item_action done 0 true 1)" = "blocked" ]
+  [ "$(classify_item_action ready-for-agent 0 true 1)" = "blocked" ]
+  [ "$(classify_item_action in-review 1 true 1)" = "fail" ]
+  # An unreadable pass count is treated as 0, never as exhausted.
+  [ "$(classify_item_action in-review 0 true "")" = "blocked" ]
+  [ "$(classify_item_action in-review 0 true x)" = "blocked" ]
+}
+
+@test "blocked_dependency — reads the dependency from a final BLOCKED: line" {
+  local base="$BATS_TEST_TMPDIR/d"
+  emit_result_text "$base" $'Posted a Blocked comment.\n\nBLOCKED: preview-daemon\n'
+  [ "$(blocked_dependency "$base.stdout.jsonl")" = "preview-daemon" ]
+
+  emit_result_text "$base" 'BLOCKED:   consumer api  '
+  [ "$(blocked_dependency "$base.stdout.jsonl")" = "consumer api" ]
+}
+
+@test "blocked_dependency — empty unless BLOCKED: is the final line" {
+  local base="$BATS_TEST_TMPDIR/d"
+  emit_result_text "$base" $'BLOCKED: preview-daemon\nverdict: clean'
+  [ -z "$(blocked_dependency "$base.stdout.jsonl")" ]
+  emit_result_text "$base" 'verdict: blocked'
+  [ -z "$(blocked_dependency "$base.stdout.jsonl")" ]
+  emit_result_text "$base" 'BLOCKED:'
+  [ -z "$(blocked_dependency "$base.stdout.jsonl")" ]
+  emit_result_text "$base" 'not BLOCKED: x'
+  [ -z "$(blocked_dependency "$base.stdout.jsonl")" ]
+  [ -z "$(blocked_dependency "$BATS_TEST_TMPDIR/missing.stdout.jsonl")" ]
+}
+
+@test "read_blocked_passes — runs the role surface's blocked-passes against the runner-checkout" {
+  HOST_REPO="$BATS_TEST_TMPDIR/host"
+  HOST_CHECKOUT="$BATS_TEST_TMPDIR/checkout"
+  mkdir -p "$HOST_REPO/docs/formann/issue-tracker"
+  cat >"$HOST_REPO/docs/formann/issue-tracker/blocked-passes" <<'S'
+#!/usr/bin/env bash
+echo "$1|$SNAPSHOT_CHECKOUT_DIR" >"$BLOCKED_PASSES_ARGS"
+echo 2
+S
+  chmod +x "$HOST_REPO/docs/formann/issue-tracker/blocked-passes"
+  export BLOCKED_PASSES_ARGS="$BATS_TEST_TMPDIR/args"
+
+  [ "$(read_blocked_passes '#7')" = "2" ]
+  [ "$(cat "$BLOCKED_PASSES_ARGS")" = "#7|$HOST_CHECKOUT" ]
+}
+
+@test "read_blocked_passes — a failing or absent script yields an error, not a count" {
+  HOST_REPO="$BATS_TEST_TMPDIR/host"
+  HOST_CHECKOUT="$BATS_TEST_TMPDIR/checkout"
+  mkdir -p "$HOST_REPO/docs/formann/issue-tracker"
+  run read_blocked_passes '#7'
+  assert_failure
+
+  printf '#!/usr/bin/env bash\nexit 3\n' >"$HOST_REPO/docs/formann/issue-tracker/blocked-passes"
+  chmod +x "$HOST_REPO/docs/formann/issue-tracker/blocked-passes"
+  run read_blocked_passes '#7'
+  assert_failure
+
+  printf '#!/usr/bin/env bash\necho lots\n' >"$HOST_REPO/docs/formann/issue-tracker/blocked-passes"
+  run read_blocked_passes '#7'
+  assert_failure
+}
+
+# Walk fixture: a two-item manifest whose first step ends Blocked. The issue
+# stays at in-review; read_blocked_passes returns $TEST_BLOCKED_PASSES.
+setup_blocked_walk() {
+  setup_dispatch_one_test
+  BLOCKED_MANIFEST="$(printf 'review\t%s\ngate\t%s\n' "$HERE/review-and-gate.md" "$HERE/gate.md")"
+  BLOCKED_POST_IMPL='{"feature":"f","issues":[{"ref":"f/01","nn":"01","status":"in-review","category":"enhancement","type":"AFK","blocked_by":[],"eligible":false}]}'
+  take_snapshot() { printf '%s' "$BLOCKED_POST_IMPL"; }
+  TEST_ITEM_CALLS="$BATS_TEST_TMPDIR/item-calls"
+  : >"$TEST_ITEM_CALLS"
+  run_item_container() {
+    printf '%s\n' "$3" >>"$TEST_ITEM_CALLS"
+    emit_result_text "$2" $'Posted a Blocked comment.\nBLOCKED: preview-daemon'
+    return 0
+  }
+  TEST_BLOCKED_PASSES=1
+  TEST_PASSES_REFS="$BATS_TEST_TMPDIR/passes-refs"
+  : >"$TEST_PASSES_REFS"
+  read_blocked_passes() { echo "$1" >>"$TEST_PASSES_REFS"; echo "$TEST_BLOCKED_PASSES"; }
+  TEST_PROPAGATE_CALLS="$BATS_TEST_TMPDIR/prop-calls"
+  : >"$TEST_PROPAGATE_CALLS"
+  propagate_feature() { echo called >>"$TEST_PROPAGATE_CALLS"; return 0; }
+  RUN_DISPATCHES=()
+  RUN_STOP_REASON=""
+}
+
+@test "walk_post_implement_steps — BLOCKED: <dep> stops the walk, records blocked (<dep>), no abort flag" {
+  setup_blocked_walk
+  local progress="$BATS_TEST_TMPDIR/progress"
+  walk_post_implement_steps "f" "01" "f/01" \
+    "$TEST_RUN_DIR" "$TEST_RUN_DIR" "01" "$BLOCKED_POST_IMPL" \
+    "in-review" 10 1 "$BLOCKED_MANIFEST" >"$progress"
+  local rc=$?
+
+  [ "$rc" -eq 0 ]
+  # Only the blocked step ran; the gate step was not dispatched.
+  [ "$(wc -l <"$TEST_ITEM_CALLS" | tr -d ' ')" = "1" ]
+  # The pass count was read for this issue's ref.
+  [ "$(cat "$TEST_PASSES_REFS")" = "f/01" ]
+  [ "${#RUN_DISPATCHES[@]}" -eq 1 ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|blocked (preview-daemon)|"*"|01-review|"* ]]
+  grep -qF ' f/01 review → blocked (preview-daemon) (' "$progress"
+  [ ! -e "$HOST_ABORT_DIR/f/01" ]
+  [ -z "$RUN_STOP_REASON" ]
+}
+
+@test "walk_post_implement_steps — a Blocked step's commit (its Blocked comment) is propagated" {
+  setup_blocked_walk
+  run_item_container() {
+    git -C "$HOST_CHECKOUT" -c user.email=t@t -c user.name=t \
+      commit --allow-empty --quiet -m "tracker: f/01 Blocked"
+    emit_result_text "$2" 'BLOCKED: preview-daemon'
+    return 0
+  }
+  walk_post_implement_steps "f" "01" "f/01" \
+    "$TEST_RUN_DIR" "$TEST_RUN_DIR" "01" "$BLOCKED_POST_IMPL" \
+    "in-review" 10 1 "$BLOCKED_MANIFEST" >/dev/null
+  [ "$(wc -l <"$TEST_PROPAGATE_CALLS" | tr -d ' ')" = "1" ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|blocked (preview-daemon)|"* ]]
+}
+
+@test "walk_post_implement_steps — two prior Blocked comments + this pass (3) leaves the issue for a human" {
+  setup_blocked_walk
+  TEST_BLOCKED_PASSES=3
+  local progress="$BATS_TEST_TMPDIR/progress"
+  walk_post_implement_steps "f" "01" "f/01" \
+    "$TEST_RUN_DIR" "$TEST_RUN_DIR" "01" "$BLOCKED_POST_IMPL" \
+    "in-review" 10 1 "$BLOCKED_MANIFEST" >"$progress"
+  local rc=$?
+
+  [ "$rc" -eq 0 ]
+  [ "$(wc -l <"$TEST_ITEM_CALLS" | tr -d ' ')" = "1" ]
+  [ "${#RUN_DISPATCHES[@]}" -eq 1 ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|left-for-human (blocked: preview-daemon)|"*"|01-review|"* ]]
+  grep -qF ' f/01 review → left-for-human (blocked: preview-daemon, 3 passes) (' "$progress"
+  [ ! -e "$HOST_ABORT_DIR/f/01" ]
+}
+
+@test "walk_post_implement_steps — an unreadable pass count still ends blocked (count treated as 0)" {
+  setup_blocked_walk
+  read_blocked_passes() { return 1; }
+  walk_post_implement_steps "f" "01" "f/01" \
+    "$TEST_RUN_DIR" "$TEST_RUN_DIR" "01" "$BLOCKED_POST_IMPL" \
+    "in-review" 10 1 "$BLOCKED_MANIFEST" >/dev/null 2>"$BATS_TEST_TMPDIR/err"
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|blocked (preview-daemon)|"* ]]
+  grep -q 'could not read the Blocked pass count' "$BATS_TEST_TMPDIR/err"
+}
+
+@test "walk_post_implement_steps — a step without a BLOCKED: line does not read the pass count" {
+  setup_blocked_walk
+  run_item_container() { emit_result_text "$2" 'verdict: blocked'; return 0; }
+  walk_post_implement_steps "f" "01" "f/01" \
+    "$TEST_RUN_DIR" "$TEST_RUN_DIR" "01" "$BLOCKED_POST_IMPL" \
+    "in-review" 10 1 "$BLOCKED_MANIFEST" >/dev/null
+  [ ! -s "$TEST_PASSES_REFS" ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|left-for-human|"*"|01-review:02-gate|"* ]]
+}
+
+@test "walk_post_implement_steps — BLOCKED: with a nonzero exit is a failure, not blocked" {
+  setup_blocked_walk
+  run_item_container() { emit_result_text "$2" 'BLOCKED: preview-daemon'; return 1; }
+  set +e
+  walk_post_implement_steps "f" "01" "f/01" \
+    "$TEST_RUN_DIR" "$TEST_RUN_DIR" "01" "$BLOCKED_POST_IMPL" \
+    "in-review" 10 1 "$BLOCKED_MANIFEST" >/dev/null
+  local rc=$?
+  set -e
+  [ "$rc" -eq 1 ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|gate-failed|"* ]]
+  [ -f "$HOST_ABORT_DIR/f/01" ]
+}
+
+@test "walk_post_implement_steps — a dependency name containing | is recorded without breaking the record" {
+  setup_blocked_walk
+  run_item_container() { emit_result_text "$2" 'BLOCKED: a|b'; return 0; }
+  walk_post_implement_steps "f" "01" "f/01" \
+    "$TEST_RUN_DIR" "$TEST_RUN_DIR" "01" "$BLOCKED_POST_IMPL" \
+    "in-review" 10 1 "$BLOCKED_MANIFEST" >/dev/null
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|blocked (a/b)|"* ]]
+}
+
+@test "run_loop — a Blocked issue keeps its status, gets no abort flag, and the run dispatches the next eligible issue" {
+  setup_dispatch_one_test
+  ensure_runner_checkout() { :; }
+  propagate_feature() { return 0; }
+  read_blocked_passes() { echo 1; }
+  RUN_DIR="$TEST_RUN_DIR"
+  RESOLVED_MANIFEST="$(printf 'review\t%s\n' "$HERE/review-and-gate.md")"
+
+  # Tracker state: one status per issue, rewritten by the mocked dispatches.
+  TEST_STATE="$BATS_TEST_TMPDIR/state"
+  printf '01 ready-for-agent\n02 ready-for-agent\n' >"$TEST_STATE"
+  take_snapshot() {
+    jq -Rn '{feature:"f",issues:[inputs | split(" ") |
+      {ref:("f/"+.[0]), nn:.[0], status:.[1], category:"enhancement", type:"AFK",
+       blocked_by:[], eligible:(.[1]=="ready-for-agent")}]}' <"$TEST_STATE"
+  }
+  TEST_IMPL_CALLS="$BATS_TEST_TMPDIR/impl-calls"
+  : >"$TEST_IMPL_CALLS"
+  run_dispatch_container() {
+    local nn="${1##*/}"
+    echo "$1" >>"$TEST_IMPL_CALLS"
+    sed -i.bak "s/^$nn .*/$nn in-review/" "$TEST_STATE"
+    return 0
+  }
+  run_item_container() {
+    local nn="${1##*/}"
+    if [ "$nn" = "01" ]; then
+      emit_result_text "$2" 'BLOCKED: preview-daemon'
+    else
+      sed -i.bak "s/^$nn .*/$nn done/" "$TEST_STATE"
+      emit_result_text "$2" 'verdict: clean'
+    fi
+    return 0
+  }
+
+  RUN_DISPATCHES=()
+  RUN_STOP_REASON=""
+  run_loop >"$BATS_TEST_TMPDIR/progress"
+
+  [ "$RUN_STOP_REASON" = "queue-empty" ]
+  [ "$(cat "$TEST_IMPL_CALLS")" = "$(printf 'f/01\nf/02')" ]
+  # f/01 untouched by the runner after its Blocked step: still in-review.
+  grep -qx '01 in-review' "$TEST_STATE"
+  grep -qx '02 done' "$TEST_STATE"
+  [ ! -e "$HOST_ABORT_DIR/f/01" ]
+  [ "${#RUN_DISPATCHES[@]}" -eq 2 ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|blocked (preview-daemon)|"* ]]
+  [[ "${RUN_DISPATCHES[1]}" == "f|02|f/02|done|"* ]]
+}
+
+# --- Blocked retries (#3 rework) ---------------------------------------------
+#
+# A walk that ends Blocked leaves a marker under .runner-state/blocked naming
+# the step; the next run re-runs the walk from that step without re-running
+# /implement. The marker decides only what to retry; the count is the tracker's.
+
+@test "Blocked marker — write, read the step, clear" {
+  HOST_BLOCKED_DIR="$BATS_TEST_TMPDIR/blocked"
+  [ -z "$(blocked_marker_step f 01)" ]
+  write_blocked_marker f 01 gate preview-daemon
+  [ "$(blocked_marker_step f 01)" = "gate" ]
+  grep -qx 'dependency: preview-daemon' "$HOST_BLOCKED_DIR/f/01"
+  clear_blocked_marker f 01
+  [ ! -e "$HOST_BLOCKED_DIR/f/01" ]
+  [ -z "$(blocked_marker_step f 01)" ]
+}
+
+@test "Blocked marker — helpers are no-ops without HOST_BLOCKED_DIR" {
+  unset HOST_BLOCKED_DIR
+  local dir="$BATS_TEST_TMPDIR/empty"
+  mkdir -p "$dir"
+  cd "$dir"
+  write_blocked_marker f 01 gate dep
+  clear_blocked_marker f 01
+  [ -z "$(blocked_marker_step f 01)" ]
+  [ -z "$(ls -A "$dir")" ]
+}
+
+@test "blocked_retry_step — only an AFK in-review issue with a marker, not already Blocked this run" {
+  HOST_BLOCKED_DIR="$BATS_TEST_TMPDIR/blocked"
+  RUN_BLOCKED_THIS_RUN=""
+  [ -z "$(blocked_retry_step f 01 in-review AFK)" ]
+  write_blocked_marker f 01 gate dep
+  [ "$(blocked_retry_step f 01 in-review AFK)" = "gate" ]
+  [ -z "$(blocked_retry_step f 01 ready-for-agent AFK)" ]
+  [ -z "$(blocked_retry_step f 01 done AFK)" ]
+  [ -z "$(blocked_retry_step f 01 in-review HITL)" ]
+  RUN_BLOCKED_THIS_RUN=$'g/01\nf/01'
+  [ -z "$(blocked_retry_step f 01 in-review AFK)" ]
+  RUN_BLOCKED_THIS_RUN="f/011"
+  [ "$(blocked_retry_step f 01 in-review AFK)" = "gate" ]
+}
+
+@test "walk_post_implement_steps — a blocked step writes the marker naming it; the run will not retry it" {
+  setup_blocked_walk
+  walk_post_implement_steps "f" "01" "f/01" \
+    "$TEST_RUN_DIR" "$TEST_RUN_DIR" "01" "$BLOCKED_POST_IMPL" \
+    "in-review" 10 1 "$BLOCKED_MANIFEST" >/dev/null
+  [ "$(blocked_marker_step f 01)" = "review" ]
+  grep -qx 'dependency: preview-daemon' "$HOST_BLOCKED_DIR/f/01"
+  [ "$RUN_BLOCKED_THIS_RUN" = "f/01" ]
+}
+
+@test "walk_post_implement_steps — the third Blocked pass and a clean pass both clear the marker" {
+  setup_blocked_walk
+  write_blocked_marker f 01 review preview-daemon
+  TEST_BLOCKED_PASSES=3
+  walk_post_implement_steps "f" "01" "f/01" \
+    "$TEST_RUN_DIR" "$TEST_RUN_DIR" "01" "$BLOCKED_POST_IMPL" \
+    "in-review" 10 1 "$BLOCKED_MANIFEST" "review" >/dev/null
+  [ ! -e "$HOST_BLOCKED_DIR/f/01" ]
+
+  write_blocked_marker f 01 review preview-daemon
+  run_item_container() { emit_result_text "$2" 'verdict: clean'; return 0; }
+  RUN_DISPATCHES=()
+  walk_post_implement_steps "f" "01" "f/01" \
+    "$TEST_RUN_DIR" "$TEST_RUN_DIR" "01" "$BLOCKED_POST_IMPL" \
+    "in-review" 10 1 "$BLOCKED_MANIFEST" "review" >/dev/null
+  [ ! -e "$HOST_BLOCKED_DIR/f/01" ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|left-for-human|"*"|01-review:02-gate|"* ]]
+}
+
+@test "walk_post_implement_steps — a start label skips the earlier steps and keeps manifest positions in the logs" {
+  setup_blocked_walk
+  walk_post_implement_steps "f" "01" "f/01" \
+    "$TEST_RUN_DIR" "$TEST_RUN_DIR" "01" "$BLOCKED_POST_IMPL" \
+    "in-review" 0 1 "$BLOCKED_MANIFEST" "gate" >/dev/null
+  [ "$(cat "$TEST_ITEM_CALLS")" = "$HERE/gate.md" ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|blocked (preview-daemon)|"*"|02-gate|"* ]]
+  [ "$(blocked_marker_step f 01)" = "gate" ]
+}
+
+@test "retry_blocked_walk — a step missing from the manifest re-runs the whole walk" {
+  setup_blocked_walk
+  RESOLVED_MANIFEST="$BLOCKED_MANIFEST"
+  retry_blocked_walk f 01 "$TEST_RUN_DIR" "gone" >/dev/null 2>"$BATS_TEST_TMPDIR/err"
+  [ "$(head -n 1 "$TEST_ITEM_CALLS")" = "$HERE/review-and-gate.md" ]
+  grep -q "blocked step 'gone' is not in the manifest" "$BATS_TEST_TMPDIR/err"
+  grep -q '/implement was not re-run' "$TEST_RUN_DIR/01.summary.md"
+}
+
+@test "feature_has_dispatchable_ref — a Blocked retry counts as dispatchable work" {
+  HOST_ABORT_DIR="$BATS_TEST_TMPDIR/aborted"
+  HOST_BLOCKED_DIR="$BATS_TEST_TMPDIR/blocked"
+  RUN_BLOCKED_THIS_RUN=""
+  local snap='{"feature":"f","issues":[{"ref":"f/01","nn":"01","status":"in-review","category":"enhancement","type":"AFK","blocked_by":[],"eligible":false}]}'
+  ! feature_has_dispatchable_ref f "$snap"
+  write_blocked_marker f 01 gate dep
+  feature_has_dispatchable_ref f "$snap"
+  mkdir -p "$HOST_ABORT_DIR/f"
+  : >"$HOST_ABORT_DIR/f/01"
+  ! feature_has_dispatchable_ref f "$snap"
+}
+
+@test "run_single — a Blocked retry is accepted and re-runs the walk from the blocked step" {
+  setup_blocked_walk
+  RESOLVED_MANIFEST="$BLOCKED_MANIFEST"
+  RUN_DIR="$TEST_RUN_DIR"
+  ISSUE_FEATURE=f
+  ISSUE_NN=01
+  ARG_ISSUE_REF=f/01
+  run_dispatch_container() { echo implement >>"$TEST_ITEM_CALLS"; return 0; }
+  write_blocked_marker f 01 gate preview-daemon
+  run_single >/dev/null
+  [ "$(cat "$TEST_ITEM_CALLS")" = "$HERE/gate.md" ]
+  [ "$RUN_STOP_REASON" = "single-dispatch (success)" ]
+}
+
+@test "run_loop — a marker on an issue no longer at in-review is cleared, not retried" {
+  setup_dispatch_one_test
+  ensure_runner_checkout() { :; }
+  take_snapshot() {
+    printf '{"feature":"f","issues":[{"ref":"f/01","nn":"01","status":"done","category":"enhancement","type":"AFK","blocked_by":[],"eligible":false}]}'
+  }
+  run_item_container() { echo called >>"$BATS_TEST_TMPDIR/calls"; return 0; }
+  write_blocked_marker f 01 review dep
+  RUN_DIR="$TEST_RUN_DIR"
+  RUN_DISPATCHES=()
+  run_loop >/dev/null
+  [ "$RUN_STOP_REASON" = "queue-empty" ]
+  [ ! -e "$HOST_BLOCKED_DIR/f/01" ]
+  [ ! -e "$BATS_TEST_TMPDIR/calls" ]
+}
+
+# Real local-markdown tracker for the multi-run tests: the binding's own
+# tracker-snapshot and blocked-passes on the role surface, reading committed
+# issue files in a real runner-checkout. read_blocked_passes and take_snapshot
+# are the runner's real functions. Only containers and publishing are mocked;
+# the mocked containers write their comments into the issue file and commit,
+# as /implement and a Blocked step do under local-markdown.
+setup_real_tracker_runs() {
+  setup_dispatch_one_test
+  # Restore the runner's real take_snapshot / read_blocked_passes / container
+  # functions that the dispatch fixture mocked.
+  source "$RUNNER_SCRIPT"
+  RUNNER_DISABLE_LIVENESS=1
+  TARGET_FEATURE="f"
+  HOST_REPO="$BATS_TEST_TMPDIR/host"
+  mkdir -p "$HOST_REPO/docs/formann/issue-tracker"
+  local s
+  for s in tracker-snapshot blocked-passes; do
+    cp "$(dirname "$RUNNER_SCRIPT")/../bindings/issue-tracker/local-markdown/$s" "$HOST_REPO/docs/formann/issue-tracker/$s"
+    chmod +x "$HOST_REPO/docs/formann/issue-tracker/$s"
+  done
+  ISSUE_FILE="$HOST_CHECKOUT/.features/f/issues/01-thing.md"
+  mkdir -p "$(dirname "$ISSUE_FILE")"
+  cat >"$ISSUE_FILE" <<'EOF'
+---
+status: ready-for-agent
+category: enhancement
+type: AFK
+---
+
+# Thing
+
+## What to build
+
+A thing.
+
+## Blocked by
+
+None — can start immediately.
+
+## Comments
+EOF
+  tracker_commit "tracker: f/01 created"
+
+  ensure_runner_checkout() { :; }
+  propagate_feature() { return 0; }
+  RESOLVED_MANIFEST="$(printf 'review\t%s\ngate\t%s\n' "$HERE/review.md" "$HERE/gate.md")"
+  TEST_CALLS="$BATS_TEST_TMPDIR/calls"
+  : >"$TEST_CALLS"
+  run_dispatch_container() {
+    echo implement >>"$TEST_CALLS"
+    set_issue_status in-review
+    printf '\n### Implementation%s — 2026-11-08\n\n> *This was generated by AI during implementation.*\n\nDone.\n' \
+      "$(heading_suffix Implementation)" >>"$ISSUE_FILE"
+    tracker_commit "tracker: f/01 Implementation"
+    emit_result_text "$2" 'Shipped for review.'
+  }
+  run_item_container() {
+    local label
+    label="$(basename "$3" .md)"
+    echo "$label" >>"$TEST_CALLS"
+    if [ "$label" = "gate" ]; then
+      printf '\n### Blocked%s — 2026-11-08\n\n> *This was generated by AI during gate.*\n\n`preview-daemon` unreachable: connection refused.\n' \
+        "$(heading_suffix Blocked)" >>"$ISSUE_FILE"
+      tracker_commit "tracker: f/01 Blocked"
+      emit_result_text "$2" $'Posted a Blocked comment.\nBLOCKED: preview-daemon'
+    else
+      emit_result_text "$2" 'verdict: clean'
+    fi
+  }
+}
+
+tracker_commit() {
+  git -C "$HOST_CHECKOUT" add -A
+  git -C "$HOST_CHECKOUT" -c user.email=t@t -c user.name=t commit --quiet -m "$1"
+}
+
+set_issue_status() {
+  sed -i.bak "s/^status: .*/status: $1/" "$ISSUE_FILE"
+  rm -f "$ISSUE_FILE.bak"
+}
+
+# Same-day collision suffix for a comment kind: "" or " (n)".
+heading_suffix() {
+  local n
+  n="$(grep -cE "^### $1( \([0-9]+\))? — 2026-11-08$" "$ISSUE_FILE" || true)"
+  [ "$n" -eq 0 ] || printf ' (%d)' "$((n + 1))"
+}
+
+# One run of the loop: fresh per-run state; .runner-state persists.
+one_run() {
+  RUN_DIR="$BATS_TEST_TMPDIR/runs/$1"
+  mkdir -p "$RUN_DIR"
+  RUN_DISPATCHES=()
+  RUN_STOP_REASON=""
+  RUN_BLOCKED_THIS_RUN=""
+  : >"$TEST_CALLS"
+  run_loop >"$RUN_DIR/progress"
+}
+
+@test "run_loop — over several runs a Blocked step is retried, its tracker count going 1 → 3, ending left-for-human (blocked: <dep>)" {
+  setup_real_tracker_runs
+
+  # Run 1: implement, review (clean), gate ends Blocked — pass 1.
+  one_run 1
+  [ "$RUN_STOP_REASON" = "queue-empty" ]
+  [ "$(cat "$TEST_CALLS")" = "$(printf 'implement\nreview\ngate')" ]
+  [ "${#RUN_DISPATCHES[@]}" -eq 1 ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|blocked (preview-daemon)|"* ]]
+  [ "$(read_blocked_passes f/01)" = "1" ]
+  [ "$(blocked_marker_step f 01)" = "gate" ]
+  grep -qx 'status: in-review' "$ISSUE_FILE"
+  [ ! -e "$HOST_ABORT_DIR/f/01" ]
+
+  # Run 2: no implement, no review — only the blocked gate step — pass 2.
+  one_run 2
+  [ "$RUN_STOP_REASON" = "queue-empty" ]
+  [ "$(cat "$TEST_CALLS")" = "gate" ]
+  [ "${#RUN_DISPATCHES[@]}" -eq 1 ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|blocked (preview-daemon)|"*"|02-gate|"* ]]
+  [ "$(read_blocked_passes f/01)" = "2" ]
+  grep -qF 'f/01 retrying Blocked walk from gate' "$RUN_DIR/progress"
+
+  # Run 3: the third Blocked pass leaves the issue for a human.
+  one_run 3
+  [ "$(cat "$TEST_CALLS")" = "gate" ]
+  [ "${#RUN_DISPATCHES[@]}" -eq 1 ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|left-for-human (blocked: preview-daemon)|"* ]]
+  grep -qF 'f/01 gate → left-for-human (blocked: preview-daemon, 3 passes)' "$RUN_DIR/progress"
+  [ ! -e "$HOST_BLOCKED_DIR/f/01" ]
+  [ ! -e "$HOST_ABORT_DIR/f/01" ]
+  grep -qx 'status: in-review' "$ISSUE_FILE"
+  [ "$(grep -c '^### Blocked' "$ISSUE_FILE")" -eq 3 ]
+
+  # Run 4: nothing left for the runner.
+  one_run 4
+  [ "$RUN_STOP_REASON" = "queue-empty" ]
+  [ ! -s "$TEST_CALLS" ]
+  [ "${#RUN_DISPATCHES[@]}" -eq 0 ]
+
+  # Rework: the maintainer sends it back; the new Implementation comment
+  # resets the count, so the next Blocked pass is pass 1 again.
+  set_issue_status ready-for-agent
+  tracker_commit "tracker: f/01 rework"
+  one_run 5
+  [ "$(cat "$TEST_CALLS")" = "$(printf 'implement\nreview\ngate')" ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|blocked (preview-daemon)|"* ]]
+  [ "$(read_blocked_passes f/01)" = "1" ]
+}
+
+@test "run_loop — Blocked passes made by another runner count: the next retry here continues the tracker's count" {
+  # Two Blocked passes are already on the tracker (from another machine).
+  # The local marker only says which step to retry; the count is read from
+  # the tracker, so this retry is pass 3 and leaves the issue for a human.
+  setup_real_tracker_runs
+  set_issue_status in-review
+  printf '\n### Implementation — 2026-11-08\n\nDone.\n\n### Blocked — 2026-11-08\n\nDown.\n\n### Blocked (2) — 2026-11-08\n\nDown.\n' >>"$ISSUE_FILE"
+  tracker_commit "tracker: f/01 two Blocked passes elsewhere"
+  write_blocked_marker f 01 gate preview-daemon
+
+  one_run 1
+  [ "$(cat "$TEST_CALLS")" = "gate" ]
+  [[ "${RUN_DISPATCHES[0]}" == "f|01|f/01|left-for-human (blocked: preview-daemon)|"* ]]
+}
+
+@test "format_summary_md — a Blocked row shows blocked (<dependency>)" {
+  run format_summary_md f 20261108-120000 12:00:00 12:05:00 ended queue-empty \
+    <<<"f|01|f/01|blocked (preview-daemon)|42|01-review|1|"
+  assert_success
+  assert_output --partial '| f/01 | blocked (preview-daemon) | 42s | - | [01.summary.md](01.summary.md) [01-01-review.summary.md](01-01-review.summary.md) |'
+}
+
+# === Idle loop (--idle, #6) ================================================
+
+@test "parse_args — --idle takes a whole number of seconds; refused with --issue and for bad values" {
+  parse_args --idle 60
+  [ "$ARG_IDLE" = "60" ]
+  [ "$RUN_MODE" = "drain" ]
+  ARG_IDLE=""
+  parse_args --feature f --idle 5
+  [ "$ARG_IDLE" = "5" ]
+  [ "$RUN_MODE" = "loop" ]
+
+  ARG_IDLE=""
+  run parse_args --issue f/01 --idle 60
+  assert_failure 2
+  assert_output --partial "--idle applies to drain and --feature modes"
+  run parse_args --idle 0
+  assert_failure 2
+  run parse_args --idle soon
+  assert_failure 2
+  assert_output --partial "--idle must be a whole number of seconds"
+  run parse_args --idle
+  assert_failure 2
+}
+
+@test "parse_args — without --idle, ARG_IDLE stays empty (main runs one pass as before)" {
+  ARG_IDLE=""
+  parse_args --feature f
+  [ -z "$ARG_IDLE" ]
+  parse_args
+  [ -z "$ARG_IDLE" ]
+}
+
+@test "--help — usage documents --idle" {
+  run bash "$RUNNER_SCRIPT" --help
+  assert_success
+  assert_output --partial "--idle <seconds>"
+  assert_output --partial "Exit codes:"
+}
+
+@test "idle_sleep — counts the wall clock, and stops early on an interrupt" {
+  TEST_NOW=1000
+  runner_epoch_now() { echo "$TEST_NOW"; }
+  TEST_TICKS=0
+  idle_sleep_tick() { TEST_TICKS=$((TEST_TICKS + 1)); TEST_NOW=$((TEST_NOW + 1)); }
+  RUNNER_INTERRUPTED=0
+  idle_sleep 5
+  [ "$TEST_TICKS" -eq 5 ]
+
+  # A throttled host whose one tick took 30s: the deadline ends the wait.
+  TEST_TICKS=0
+  idle_sleep_tick() { TEST_TICKS=$((TEST_TICKS + 1)); TEST_NOW=$((TEST_NOW + 30)); }
+  idle_sleep 5
+  [ "$TEST_TICKS" -eq 1 ]
+
+  # An interrupt arriving during a tick ends the wait at once.
+  TEST_TICKS=0
+  idle_sleep_tick() { TEST_TICKS=$((TEST_TICKS + 1)); TEST_NOW=$((TEST_NOW + 1)); RUNNER_INTERRUPTED=1; }
+  idle_sleep 60
+  [ "$TEST_TICKS" -eq 1 ]
+}
+
+@test "run_idle — an issue made ready while the runner sleeps is dispatched on the next pass, no restart" {
+  setup_loop_test
+  RUN_MODE=loop
+  ARG_IDLE=60
+  RUN_DIR="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$RUN_DIR"
+  RUN_DISPATCHES=()
+  ensure_runner_checkout_on_branch() { echo sync >>"$BATS_TEST_TMPDIR/syncs"; }
+  dispatch_one() {
+    echo "$1/$2" >>"$TEST_DISPATCHED_FILE"
+    : >"$TEST_QUEUE_FILE"
+    record_dispatch "$1" "$2" "$1/$2" "in-review" 5
+  }
+  TEST_SLEEPS="$BATS_TEST_TMPDIR/sleeps"
+  : >"$TEST_SLEEPS"
+  idle_sleep() {
+    echo "$1" >>"$TEST_SLEEPS"
+    case "$(wc -l <"$TEST_SLEEPS" | tr -d ' ')" in
+      1) plant_queue 01 ;;           # made ready while the runner sleeps
+      3) RUNNER_INTERRUPTED=1 ;;
+    esac
+  }
+  : >"$TEST_QUEUE_FILE"
+
+  run_idle run_loop >"$BATS_TEST_TMPDIR/progress"
+
+  [ "$RUN_STOP_REASON" = "interrupted" ]
+  [ "$(dispatched_count)" = "1" ]
+  [ "$(dispatched_nth 1)" = "f/01" ]
+  [ "$RUN_PASS" -eq 3 ]
+  [ "$(head -n 1 "$TEST_SLEEPS")" = "60" ]
+  # Passes 2 and 3 re-synced the runner-checkout first; pass 1 relied on pre-flight.
+  [ "$(wc -l <"$BATS_TEST_TMPDIR/syncs" | tr -d ' ')" -eq 2 ]
+  # Only the pass that dispatched wrote a pass directory.
+  [ ! -e "$RUN_DIR/pass-0001" ]
+  [ -f "$RUN_DIR/pass-0002/SUMMARY.md" ]
+  [ ! -e "$RUN_DIR/pass-0003" ]
+  grep -qF '| f/01 | in-review |' "$RUN_DIR/pass-0002/SUMMARY.md"
+  grep -qF -- '- Stop reason: queue-empty' "$RUN_DIR/pass-0002/SUMMARY.md"
+  [ "${#RUN_DISPATCHES[@]}" -eq 0 ]
+  run format_passes_section
+  assert_output --partial '- 3 pass(es) in total; 2 found nothing to do.'
+  assert_output --partial '- [pass 2](pass-0002/SUMMARY.md): 1 dispatch(es), stop reason: queue-empty'
+}
+
+@test "run_loop — without --idle, dispatch artifacts still land in the run dir itself" {
+  setup_loop_test
+  RUN_DIR="$BATS_TEST_TMPDIR/run"
+  RUN_PASS_DIR=""
+  dispatch_one() { echo "$3" >"$BATS_TEST_TMPDIR/dir"; : >"$TEST_QUEUE_FILE"; }
+  plant_queue 01
+  run_loop >/dev/null
+  [ "$(cat "$BATS_TEST_TMPDIR/dir")" = "$RUN_DIR" ]
+}
+
+@test "run_idle — a Blocked step is re-run on each next pass; the count continues from the tracker to left-for-human" {
+  setup_real_tracker_runs
+  RUN_MODE=loop
+  ARG_IDLE=60
+  RUN_DIR="$BATS_TEST_TMPDIR/runs/idle"
+  mkdir -p "$RUN_DIR"
+  RUN_DISPATCHES=()
+  RUN_BLOCKED_THIS_RUN=""
+  ensure_runner_checkout_on_branch() { :; }
+  TEST_SLEEPS="$BATS_TEST_TMPDIR/sleeps"
+  : >"$TEST_SLEEPS"
+  idle_sleep() {
+    echo "$1" >>"$TEST_SLEEPS"
+    [ "$(wc -l <"$TEST_SLEEPS" | tr -d ' ')" -lt 4 ] || RUNNER_INTERRUPTED=1
+  }
+
+  run_idle run_loop >"$BATS_TEST_TMPDIR/progress"
+
+  [ "$RUN_STOP_REASON" = "interrupted" ]
+  # Pass 1: implement, review, gate Blocked. Passes 2–3: only the gate.
+  [ "$(cat "$TEST_CALLS")" = "$(printf 'implement\nreview\ngate\ngate\ngate')" ]
+  grep -qF '| f/01 | blocked (preview-daemon) |' "$RUN_DIR/pass-0001/SUMMARY.md"
+  grep -qF '| f/01 | blocked (preview-daemon) |' "$RUN_DIR/pass-0002/SUMMARY.md"
+  grep -qF '| f/01 | left-for-human (blocked: preview-daemon) |' "$RUN_DIR/pass-0003/SUMMARY.md"
+  grep -qF 'f/01 retrying Blocked walk from gate' "$BATS_TEST_TMPDIR/progress"
+  grep -qF '3 passes' "$BATS_TEST_TMPDIR/progress"
+  [ "$(grep -c '^### Blocked' "$ISSUE_FILE")" -eq 3 ]
+  # Per-pass logs do not overwrite each other.
+  [ -f "$RUN_DIR/pass-0001/01.summary.md" ]
+  [ -f "$RUN_DIR/pass-0002/01.summary.md" ]
+  # Pass 4 had nothing to do.
+  [ "$RUN_PASS" -eq 4 ]
+  [ ! -e "$RUN_DIR/pass-0004" ]
+}
+
+@test "run_idle — a propagation error leaves the idle loop with that stop reason; a queue-empty or tracker outage does not" {
+  setup_loop_test
+  RUN_MODE=loop
+  ARG_IDLE=1
+  RUN_DIR="$BATS_TEST_TMPDIR/run"
+  RUN_DISPATCHES=()
+  ensure_runner_checkout_on_branch() { :; }
+  TEST_N="$BATS_TEST_TMPDIR/n"
+  : >"$TEST_N"
+  idle_sleep() { :; }
+  fake_pass() {
+    echo x >>"$TEST_N"
+    case "$(wc -l <"$TEST_N" | tr -d ' ')" in
+      1) RUN_STOP_REASON="queue-empty"; return 0 ;;
+      2) RUN_STOP_REASON="snapshot-failed"; return 1 ;;
+      *) RUN_STOP_REASON="propagation-error"; return 1 ;;
+    esac
+  }
+  set +e
+  run_idle fake_pass >/dev/null
+  local rc=$?
+  set -e
+  [ "$rc" -eq 1 ]
+  [ "$RUN_STOP_REASON" = "propagation-error" ]
+  [ "$RUN_PASS" -eq 3 ]
+}
+
+@test "run_idle — drain mode re-runs discovery on later passes; a failed discovery keeps the old list" {
+  RUN_MODE=drain
+  ARG_IDLE=1
+  RUN_DIR="$BATS_TEST_TMPDIR/run"
+  RUN_DISPATCHES=()
+  RUNNER_INTERRUPTED=0
+  HOST_REPO="$BATS_TEST_TMPDIR/host"
+  mkdir -p "$HOST_REPO/docs/formann/issue-tracker"
+  local ts="$HOST_REPO/docs/formann/issue-tracker/tracker-snapshot"
+  printf '#!/usr/bin/env bash\ncat "%s"\n' "$BATS_TEST_TMPDIR/list" >"$ts"
+  DISCOVERY_JSON='["a"]'
+  echo '["a","b"]' >"$BATS_TEST_TMPDIR/list"
+  TEST_SEEN="$BATS_TEST_TMPDIR/seen"
+  : >"$TEST_SEEN"
+  fake_pass() { echo "$DISCOVERY_JSON" | jq -c . >>"$TEST_SEEN"; RUN_STOP_REASON=completed; }
+  idle_sleep() {
+    case "$RUN_PASS" in
+      1) : ;;
+      2) printf '#!/usr/bin/env bash\nexit 3\n' >"$ts" ;;
+      *) RUNNER_INTERRUPTED=1 ;;
+    esac
+  }
+  run_idle fake_pass >"$BATS_TEST_TMPDIR/progress"
+  [ "$(cat "$TEST_SEEN")" = "$(printf '["a"]\n["a","b"]\n["a","b"]')" ]
+  grep -qF 'discovery failed' "$BATS_TEST_TMPDIR/progress"
+}
+
+@test "run_idle — SIGTERM during the sleep exits 0 promptly with an interrupted SUMMARY.md" {
+  local driver="$BATS_TEST_TMPDIR/driver.sh"
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  cat >"$driver" <<DRIVER
+#!/usr/bin/env bash
+source "$RUNNER_SCRIPT"
+set -euo pipefail
+RUN_MODE=loop
+ARG_IDLE=60
+TARGET_FEATURE=f
+RUN_FEATURE=f
+RUN_DIR="$run_dir"
+RUN_TS=test
+RUN_START_CLOCK=00:00:00
+HOST_ABORT_DIR="$run_dir/aborted"
+HOST_BLOCKED_DIR="$run_dir/blocked"
+take_snapshot() { printf '{"feature":"f","issues":[]}'; }
+ensure_runner_checkout_on_branch() { :; }
+idle_sleep_tick() { : >"$run_dir/sleeping"; sleep 1; }
+trap finalize_run EXIT
+trap handle_signal INT TERM
+run_idle run_loop
+DRIVER
+  bash "$driver" >"$BATS_TEST_TMPDIR/out" 2>&1 &
+  local pid=$!
+  local i=0
+  while [ ! -e "$run_dir/sleeping" ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+  [ -e "$run_dir/sleeping" ]
+  local start=$SECONDS
+  kill -TERM "$pid"
+  local rc=0
+  wait "$pid" || rc=$?
+  [ "$rc" -eq 0 ]
+  [ $((SECONDS - start)) -lt 10 ]
+  grep -qF -- '- Stop reason: interrupted' "$run_dir/SUMMARY.md"
+  grep -qF '(started 00:00:00, interrupted' "$run_dir/SUMMARY.md"
+  grep -qF '## Passes' "$run_dir/SUMMARY.md"
+  grep -qF '1 pass(es) in total; 1 found nothing to do.' "$run_dir/SUMMARY.md"
+  grep -qF 'stop reason: interrupted' "$BATS_TEST_TMPDIR/out"
+}
+
+# === Claim heartbeat and takeover in the drain loop (#8) ===================
+
+# Another runner (machine $2), judging the claim on feature $1 stale by its
+# own clock, takes it over. Uses $SHARED_CLAIMS as the Shared remote.
+take_over_by_other() {
+  local other="$BATS_TEST_TMPDIR/taker-$2"
+  [ -d "$other" ] || { git init --quiet "$other"; git -C "$other" remote add origin "$SHARED_CLAIMS"; }
+  (
+    HOST_REPO="$other"; RUNNER_MACHINE="$2"
+    claim_now_epoch() { echo $(( $(date +%s) + 7200 )); }
+    claim take "$1" >/dev/null
+    [ "$CLAIM_RESULT" = "taken-over-from m1" ] || { echo "takeover failed: $CLAIM_RESULT" >&2; exit 1; }
+  )
+}
+
+claims_remote_field() {
+  claim_field "$(git -C "$SHARED_CLAIMS" log -1 --format=%B "refs/formann/claims/$1")" "$2"
+}
+
+# The loop harness plus a bare Shared remote as the host's origin, and this
+# runner (m1) holding the claim on `f` with a heartbeat from long ago — as if
+# the previous dispatch had run for hours.
+setup_heartbeat_loop_test() {
+  setup_loop_test
+  unset RUNNER_SHARED_REMOTE RUNNER_CLAIM_STALE_AFTER
+  SHARED_CLAIMS="$BATS_TEST_TMPDIR/claims.git"
+  git init --quiet --bare --initial-branch=main "$SHARED_CLAIMS"
+  git -C "$HOST_REPO" remote add origin "$SHARED_CLAIMS"
+  RUNNER_MACHINE="m1"
+  RUN_TS="20261108-120000"
+  RUNNER_CLAIM_LOST=""
+  local tree sha
+  tree="$(git -C "$HOST_REPO" mktree </dev/null)"
+  sha="$(claim_message m1 "$RUN_TS" unknown 2000-01-01T00:00:00Z \
+    | git -C "$HOST_REPO" -c user.email=t@t -c user.name=t commit-tree "$tree")"
+  git -C "$HOST_REPO" push --quiet origin "$sha:refs/formann/claims/f"
+  CLAIM_HELD_FEATURE="f"
+  CLAIM_HELD_SHA="$sha"
+  HEARTBEATS_FILE="$BATS_TEST_TMPDIR/heartbeats"
+  : >"$HEARTBEATS_FILE"
+  # Each dispatch records the claim on the Shared remote as it starts:
+  # its sha, holder, and heartbeat age by this clock.
+  dispatch_one() {
+    local feature="$1" nn="$2"
+    echo "$feature/$nn" >>"$TEST_DISPATCHED_FILE"
+    local rest
+    rest="$(tail -n +2 "$TEST_QUEUE_FILE" 2>/dev/null || true)"
+    printf '%s\n' "$rest" >"$TEST_QUEUE_FILE"
+    [ -s "$TEST_QUEUE_FILE" ] || : >"$TEST_QUEUE_FILE"
+    local hb
+    hb="$(claims_remote_field f heartbeat)"
+    printf '%s %s %s\n' "$(git -C "$SHARED_CLAIMS" rev-parse refs/formann/claims/f)" \
+      "$(claims_remote_field f machine)" \
+      "$(( $(date +%s) - $(claim_iso_to_epoch "$hb") ))" >>"$HEARTBEATS_FILE"
+    [ -n "${HB_TAKEOVER_AT:-}" ] && [ "$(dispatched_count)" = "$HB_TAKEOVER_AT" ] \
+      && take_over_by_other f m2
+    return 0
+  }
+}
+
+@test "run_loop — claims (#8): a drain over several dispatches heart-beats before each, so the claim is never thirty minutes old" {
+  setup_heartbeat_loop_test
+  plant_queue 01 02 03
+
+  run_loop >"$BATS_TEST_TMPDIR/out" 2>&1
+
+  [ "$RUN_STOP_REASON" = "queue-empty" ]
+  [ "$(dispatched_count)" = "3" ]
+  [ "$(wc -l <"$HEARTBEATS_FILE" | tr -d ' ')" = "3" ]
+  local sha machine age
+  while read -r sha machine age; do
+    [ "$machine" = "m1" ]
+    # A fresh heartbeat at every dispatch (the planted one was from 2000).
+    # Two heartbeats in the same second are the same commit, so the age —
+    # not the sha — is what shows the refresh.
+    [ "$age" -le 5 ] || fail "heartbeat $age s old at a dispatch"
+  done <"$HEARTBEATS_FILE"
+  [ "$CLAIM_HELD_SHA" = "$(git -C "$SHARED_CLAIMS" rev-parse refs/formann/claims/f)" ]
+  [ "$(claim_verdict "$(git -C "$SHARED_CLAIMS" log -1 --format=%B refs/formann/claims/f)" "$(date +%s)" 1800)" = "held" ]
+}
+
+@test "run_loop — claims (#8): a claim taken over mid-dispatch stops the feature after that dispatch: taken-over-by <machine>, the claim not released" {
+  setup_heartbeat_loop_test
+  plant_queue 01 02 03
+  HB_TAKEOVER_AT=1
+
+  run_loop >"$BATS_TEST_TMPDIR/out" 2>&1
+
+  [ "$RUN_STOP_REASON" = "taken-over-by m2" ]
+  # The dispatch in flight finished; no further issue was taken.
+  [ "$(dispatched_count)" = "1" ]
+  [ "$(claims_remote_field f machine)" = "m2" ]
+  [ -z "$CLAIM_HELD_FEATURE" ]
+  claim_release_held >/dev/null
+  [ "$(claims_remote_field f machine)" = "m2" ]
+  grep -q "taken-over-by m2" "$BATS_TEST_TMPDIR/out"
+}
+
+@test "run_loop — claims (#8): a heartbeat that fails for a network reason doesn't stop the drain" {
+  setup_heartbeat_loop_test
+  plant_queue 01 02
+  git -C "$HOST_REPO" remote set-url origin "$BATS_TEST_TMPDIR/missing.git"
+  dispatch_one() {
+    echo "$1/$2" >>"$TEST_DISPATCHED_FILE"
+    local rest
+    rest="$(tail -n +2 "$TEST_QUEUE_FILE" 2>/dev/null || true)"
+    printf '%s\n' "$rest" >"$TEST_QUEUE_FILE"
+    [ -s "$TEST_QUEUE_FILE" ] || : >"$TEST_QUEUE_FILE"
+    return 0
+  }
+
+  run_loop >"$BATS_TEST_TMPDIR/out" 2>&1
+
+  [ "$RUN_STOP_REASON" = "queue-empty" ]
+  [ "$(dispatched_count)" = "2" ]
+  [ "$CLAIM_HELD_FEATURE" = "f" ]
+  grep -q "trying again at the next heartbeat" "$BATS_TEST_TMPDIR/out"
+}
+
+@test "dispatch_one — claims (#8): a heartbeat before every post-implement step; a takeover mid-walk lets the walk finish and marks the claim lost" {
+  setup_dispatch_one_test
+  install_afk_snapshots in-review
+  setup_shared_remote_test
+  SHARED_CLAIMS="$SHARED_BARE"
+  RUNNER_MACHINE="m1"
+  RUNNER_CLAIM_LOST=""
+  # This runner holds the claim on f, last heart-beat long ago.
+  local tree taken_sha
+  tree="$(git -C "$HOST_REPO" mktree </dev/null)"
+  taken_sha="$(claim_message m1 r0 unknown 2000-01-01T00:00:00Z \
+    | git -C "$HOST_REPO" -c user.email=t@t -c user.name=t commit-tree "$tree")"
+  git -C "$HOST_REPO" push --quiet origin "$taken_sha:refs/formann/claims/f"
+  CLAIM_HELD_FEATURE="f"; CLAIM_HELD_SHA="$taken_sha"
+  RESOLVED_MANIFEST="$(printf 'review\t%s\nfix\t%s\n' "$HERE/review-and-gate.md" "$HERE/review-and-gate.md")"
+  local steps_file="$BATS_TEST_TMPDIR/steps"
+  : >"$steps_file"
+  run_item_container() {
+    printf '%s\n' "$(git -C "$SHARED_CLAIMS" rev-parse refs/formann/claims/f)" >>"$steps_file"
+    # During the first step another runner takes the claim over.
+    [ "$(wc -l <"$steps_file" | tr -d ' ')" = "1" ] && take_over_by_other f m2
+    return 0
+  }
+
+  RUN_DISPATCHES=()
+  dispatch_one "f" "01" "$TEST_RUN_DIR" >/dev/null 2>&1 || true
+
+  # Both steps ran: the dispatch in flight finishes.
+  [ "$(wc -l <"$steps_file" | tr -d ' ')" = "2" ]
+  # The first step started on a fresh heartbeat (not the old claim).
+  [ "$(sed -n 1p "$steps_file")" != "$taken_sha" ]
+  # The heartbeat before the second step found the claim taken over.
+  [ "$RUNNER_CLAIM_LOST" = "taken-over-by m2" ]
+  [ "$(claims_remote_field f machine)" = "m2" ]
+  [ -z "$CLAIM_HELD_FEATURE" ]
+}
+
+@test "drain_one_feature — claims (#8): a stale claim is taken over: logged, noted as a takeover, drained, released" {
+  setup_claim_drain_test
+  local other="$BATS_TEST_TMPDIR/dead-m2" tree sha
+  git init --quiet "$other"
+  tree="$(git -C "$other" mktree </dev/null)"
+  sha="$(claim_message m2 r0 unknown 2000-01-01T00:00:00Z \
+    | git -C "$other" -c user.email=t@t -c user.name=t commit-tree "$tree")"
+  git -C "$other" push --quiet "$SHARED" "$sha:refs/formann/claims/alpha"
+
+  drain_one_feature alpha >"$BATS_TEST_TMPDIR/out" 2>&1
+
+  [ "$(drain_outcome_nth 0)" = "alpha|drained" ]
+  [ "$(cat "$CLAIM_SEEN_FILE")" = "alpha m1" ]
+  grep -q "took over the stale claim on alpha (m2" "$BATS_TEST_TMPDIR/out"
+  grep -q 'Taken over from `m2`' "$NOTES_FILE"
+  ! git -C "$SHARED" rev-parse --verify --quiet refs/formann/claims/alpha
+}
+
+@test "run_drain — claims (#8): a feature taken over mid-drain reads taken-over-by <machine> with its dispatches; the claim is left to its new holder; the drain moves on" {
+  setup_claim_drain_test
+  DISCOVERY_JSON='["alpha","beta"]'
+  SHARED_CLAIMS="$SHARED"
+  run_loop() {
+    echo "$TARGET_FEATURE" >>"$DRAIN_DRAINED_FILE"
+    if [ "$TARGET_FEATURE" = "alpha" ]; then
+      record_dispatch alpha 01 "alpha/01" "in-review" 60 "" 1 "published → origin/alpha"
+      take_over_by_other alpha m2
+      heartbeat_claim
+      RUN_STOP_REASON="$RUNNER_CLAIM_LOST"
+      return 0
+    fi
+    RUN_STOP_REASON="queue-empty"
+    return 0
+  }
+
+  run_drain >"$BATS_TEST_TMPDIR/out" 2>&1
+
+  [ "$RUN_STOP_REASON" = "completed" ]
+  [ "$(drain_outcome_nth 0)" = "alpha|taken-over-by m2" ]
+  [ "$(drain_outcome_nth 1)" = "beta|drained" ]
+  [ "$(claims_remote_field alpha machine)" = "m2" ]
+  ! git -C "$SHARED" rev-parse --verify --quiet refs/formann/claims/beta
+
+  local summary
+  summary="$(print_multi_feature_records | format_multi_feature_summary_md \
+    "$RUN_TS" "12:00:00" "12:01:00" "ended" "completed")"
+  [[ "$summary" == *"## alpha — taken-over-by m2 (stopped after its current dispatch)"* ]]
+  [[ "$summary" == *"| alpha/01 | in-review |"* ]]
+  [[ "$summary" == *"## beta — drained"* ]]
+}
+
+@test "run_claimed_loop — claims (#8): loop mode reports stop reason taken-over-by <machine>" {
+  setup_claim_drain_test
+  RUN_MODE="loop"
+  SHARED_CLAIMS="$SHARED"
+  TARGET_FEATURE="alpha"
+  run_loop() {
+    take_over_by_other alpha m2
+    heartbeat_claim
+    RUN_STOP_REASON="$RUNNER_CLAIM_LOST"
+    return 0
+  }
+
+  run_claimed_loop >"$BATS_TEST_TMPDIR/out" 2>&1
+
+  [ "$RUN_STOP_REASON" = "taken-over-by m2" ]
+  [ "$(claims_remote_field alpha machine)" = "m2" ]
+}
+
+# === Claim refresher: heartbeat during a dispatch (#13) =====================
+#
+# A dispatch longer than the stale-after time used to leave its own claim
+# looking stale while the runner was still busy with it. A companion process
+# now heart-beats the claim while the container runs. These tests run a fake
+# container (a docker shim that lives for $FAKE_CONTAINER_SECONDS) under a
+# short stale-after and heartbeat interval, and look at the claim the way
+# another runner would: its verdict by claim_verdict on the Shared remote.
+
+# A docker shim standing in for the sandbox container: `docker run` records
+# its pid (as the cid, and in $FAKE_CONTAINER_PID_FILE), lives for
+# $FAKE_CONTAINER_SECONDS, then emits a clean result; `docker kill
+# --signal=SIG<X> <cid>` delivers SIG<X> to that pid.
+_install_fake_container() {
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  cat >"$BATS_TEST_TMPDIR/bin/docker" <<'DOCKEREOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  kill)
+    sig="${2#--signal=}"
+    kill "-${sig#SIG}" "$3" 2>/dev/null
+    exit 0
+    ;;
+esac
+while [ $# -gt 0 ]; do
+  [ "$1" = "--cidfile" ] && echo "$$" >"$2"
+  shift
+done
+echo "$$" >"$FAKE_CONTAINER_PID_FILE"
+trap 'exit 143' TERM
+end=$(( $(date +%s) + FAKE_CONTAINER_SECONDS ))
+while [ "$(date +%s)" -lt "$end" ]; do sleep 0.2; done
+printf '{"type":"result","subtype":"success","is_error":false,"result":"x","uuid":"u"}\n'
+exit 0
+DOCKEREOF
+  chmod +x "$BATS_TEST_TMPDIR/bin/docker"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+  export FAKE_CONTAINER_PID_FILE="$BATS_TEST_TMPDIR/container.pid"
+}
+
+# Host repo whose origin is a bare Shared remote, the runtime globals
+# run_sandbox_container reads, the fake container, and this runner (m1)
+# holding a freshly taken claim on `f`. Short knobs: a claim is stale 4s
+# after its last heartbeat; the refresher heart-beats every second.
+setup_refresher_test() {
+  unset RUNNER_SHARED_REMOTE RUNNER_FORMANN_SHA
+  export RUNNER_CLAIM_STALE_AFTER=4 RUNNER_CLAIM_HEARTBEAT_SECONDS=1
+  export FAKE_CONTAINER_SECONDS=9
+  SHARED_CLAIMS="$BATS_TEST_TMPDIR/claims.git"
+  git init --quiet --bare --initial-branch=main "$SHARED_CLAIMS"
+  HOST_REPO="$BATS_TEST_TMPDIR/repo"
+  git init --quiet --initial-branch=main "$HOST_REPO"
+  git -C "$HOST_REPO" -c user.email=t@t -c user.name=t commit --allow-empty --quiet -m init
+  git -C "$HOST_REPO" remote add origin "$SHARED_CLAIMS"
+  mkdir -p "$HOST_REPO/docs/formann/issue-tracker"
+  HOST_CHECKOUT="$HOST_REPO"
+  HOST_RUNNER_STATE="$BATS_TEST_TMPDIR"
+  NET_NAME=none
+  RUNNER_CONTAINER_REPO_PATH=/repo
+  RUNNER_CONTAINER_M2_PATH=/m2
+  MVN_VOLUME=vol
+  IMAGE_NAME=img
+  TOKEN=oauth
+  RUNNER_GIT_USER_NAME=Arne
+  RUNNER_GIT_USER_EMAIL=a@b.c
+  RUNNER_INTERRUPTED=0
+  RUNNER_KILL_GRACE_SECONDS=2
+  IN_FLIGHT_CID_FILE=""
+  RUNNER_DISABLE_TRANSPORT_RETRY=1
+  RUNNER_MACHINE="m1"
+  RUN_TS="20261108-120000"
+  RUNNER_CLAIM_LOST=""
+  CLAIM_HELD_FEATURE=""
+  CLAIM_HELD_SHA=""
+  CLAIM_REFRESHER_PID=""
+  CLAIM_REFRESHER_STATE=""
+  _install_fake_container
+  claim take f >/dev/null
+  [ "$CLAIM_RESULT" = "taken" ]
+  TAKEN_SHA="$CLAIM_HELD_SHA"
+}
+
+# The claim on `f` as another runner sees it now: free | held | stale.
+remote_claim_verdict() {
+  local msg=""
+  if git -C "$SHARED_CLAIMS" rev-parse --verify --quiet refs/formann/claims/f >/dev/null; then
+    msg="$(git -C "$SHARED_CLAIMS" log -1 --format=%B refs/formann/claims/f)"
+  fi
+  claim_verdict "$msg" "$(date +%s)" "$RUNNER_CLAIM_STALE_AFTER"
+}
+
+# Is pid $1 a live process? A zombie is not: an orphan that exited stays a
+# zombie until an init reaps it, and a container's pid 1 may never do.
+pid_alive() {
+  [ -n "$1" ] && kill -0 "$1" 2>/dev/null || return 1
+  if [ -r "/proc/$1/stat" ]; then
+    [ "$(sed 's/.*) //' "/proc/$1/stat" | cut -d' ' -f1)" != "Z" ]
+    return
+  fi
+  case "$(ps -o stat= -p "$1" 2>/dev/null)" in Z*) return 1 ;; esac
+  return 0
+}
+
+# Wait up to $2 seconds (in 0.1s steps) for pid $1 to be gone.
+wait_pid_gone() {
+  local i=0
+  while [ "$i" -lt $(( $2 * 10 )) ]; do
+    pid_alive "$1" || return 0
+    sleep 0.1
+    i=$(( i + 1 ))
+  done
+  ! pid_alive "$1"
+}
+
+@test "claim_heartbeat_seconds — default is stale-after / 3, rounded down; the knob overrides it" {
+  unset RUNNER_CLAIM_HEARTBEAT_SECONDS RUNNER_CLAIM_STALE_AFTER
+  [ "$(claim_heartbeat_seconds)" = "600" ]
+  RUNNER_CLAIM_STALE_AFTER=100
+  [ "$(claim_heartbeat_seconds)" = "33" ]
+  RUNNER_CLAIM_STALE_AFTER=2
+  [ "$(claim_heartbeat_seconds)" = "1" ]
+  RUNNER_CLAIM_HEARTBEAT_SECONDS=45
+  [ "$(claim_heartbeat_seconds)" = "45" ]
+}
+
+@test "check_claim_knobs (#13) — refuses a non-numeric RUNNER_CLAIM_HEARTBEAT_SECONDS" {
+  unset RUNNER_CLAIM_STALE_AFTER
+  RUNNER_CLAIM_HEARTBEAT_SECONDS="ten minutes"
+  trap - EXIT
+  run check_claim_knobs
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"runner: claim-knobs:"* ]]
+  [[ "$output" == *"RUNNER_CLAIM_HEARTBEAT_SECONDS"* ]]
+  [[ "$output" == *"ten minutes"* ]]
+  RUNNER_CLAIM_HEARTBEAT_SECONDS="-5"
+  run check_claim_knobs
+  [ "$status" -eq 2 ]
+}
+
+@test "check_claim_knobs (#13) — refuses a zero RUNNER_CLAIM_HEARTBEAT_SECONDS" {
+  unset RUNNER_CLAIM_STALE_AFTER
+  trap - EXIT
+  local v
+  for v in 0 00; do
+    RUNNER_CLAIM_HEARTBEAT_SECONDS="$v"
+    run check_claim_knobs
+    [ "$status" -eq 2 ] || fail "accepted '$v'"
+    [[ "$output" == *"runner: claim-knobs:"* ]]
+  done
+}
+
+@test "check_claim_knobs (#13) — refuses a heartbeat interval not below the stale-after time" {
+  RUNNER_CLAIM_STALE_AFTER=600
+  RUNNER_CLAIM_HEARTBEAT_SECONDS=600
+  trap - EXIT
+  run check_claim_knobs
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"must be below RUNNER_CLAIM_STALE_AFTER"* ]]
+}
+
+@test "check_claim_knobs (#13) — unset or a whole number below stale-after passes" {
+  unset RUNNER_CLAIM_HEARTBEAT_SECONDS RUNNER_CLAIM_STALE_AFTER
+  check_claim_knobs
+  RUNNER_CLAIM_HEARTBEAT_SECONDS=300
+  check_claim_knobs
+}
+
+@test "preflight (#13) — runs the claim knob check" {
+  declare -f preflight | grep -q 'check_claim_knobs'
+}
+
+@test "run_dispatch_container (#13) — a container outliving stale-after leaves the claim held at every point; the refresher is reaped and its sha adopted" {
+  setup_refresher_test
+  local samples="$BATS_TEST_TMPDIR/verdicts" stop="$BATS_TEST_TMPDIR/stop-observer"
+  : >"$samples"
+  # Another runner's view of the claim, sampled every half second.
+  ( while [ ! -f "$stop" ]; do remote_claim_verdict >>"$samples"; sleep 0.5; done ) &
+  local observer=$!
+
+  local started=$(( $(date +%s) ))
+  run_dispatch_container "f/01" "$BATS_TEST_TMPDIR/dispatch" >"$BATS_TEST_TMPDIR/out" 2>&1
+  local took=$(( $(date +%s) - started ))
+  : >"$stop"
+  wait "$observer"
+
+  # The dispatch outlived stale-after by a wide margin...
+  [ "$took" -ge $(( RUNNER_CLAIM_STALE_AFTER * 2 )) ] || fail "dispatch took only ${took}s"
+  # ...and the claim was held at every sample.
+  [ "$(wc -l <"$samples" | tr -d ' ')" -ge 10 ] || fail "too few samples: $(cat "$samples")"
+  [ "$(sort -u "$samples")" = "held" ] || fail "verdicts: $(sort "$samples" | uniq -c)"
+  # The refresher is gone and the runner adopted the sha it last wrote.
+  [ -z "$CLAIM_REFRESHER_PID" ]
+  [ "$CLAIM_HELD_FEATURE" = "f" ]
+  [ "$CLAIM_HELD_SHA" != "$TAKEN_SHA" ]
+  [ "$CLAIM_HELD_SHA" = "$(git -C "$SHARED_CLAIMS" rev-parse refs/formann/claims/f)" ]
+  # So the next between-dispatch heartbeat is ours, not a false takeover.
+  heartbeat_claim >>"$BATS_TEST_TMPDIR/out" 2>&1
+  [ "$CLAIM_RESULT" = "ok" ]
+  [ -z "$RUNNER_CLAIM_LOST" ]
+}
+
+@test "run_item_container (#13) — a post-implement step container is covered too" {
+  setup_refresher_test
+  export FAKE_CONTAINER_SECONDS=7
+  printf 'review\n' >"$BATS_TEST_TMPDIR/step.md"
+  local samples="$BATS_TEST_TMPDIR/verdicts" stop="$BATS_TEST_TMPDIR/stop-observer"
+  : >"$samples"
+  ( while [ ! -f "$stop" ]; do remote_claim_verdict >>"$samples"; sleep 0.5; done ) &
+  local observer=$!
+
+  run_item_container "f/01" "$BATS_TEST_TMPDIR/item" "$BATS_TEST_TMPDIR/step.md" >"$BATS_TEST_TMPDIR/out" 2>&1
+  : >"$stop"
+  wait "$observer"
+
+  [ "$(sort -u "$samples")" = "held" ] || fail "verdicts: $(sort "$samples" | uniq -c)"
+  [ -z "$CLAIM_REFRESHER_PID" ]
+}
+
+@test "run_dispatch_container (#13) — without the refresher the same container would leave the claim stale (control)" {
+  setup_refresher_test
+  export FAKE_CONTAINER_SECONDS=7
+  start_claim_refresher() { :; }
+  run_dispatch_container "f/01" "$BATS_TEST_TMPDIR/dispatch" >/dev/null 2>&1
+  [ "$(remote_claim_verdict)" = "stale" ]
+}
+
+@test "with_claim_refresher (#13) — no claim held: no refresher starts" {
+  setup_refresher_test
+  claim release f >/dev/null
+  [ -z "$CLAIM_HELD_FEATURE" ]
+  local marker="$BATS_TEST_TMPDIR/refresher-started"
+  claim_refresh_loop() { : >"$marker"; }
+  with_claim_refresher true
+  [ -z "$CLAIM_REFRESHER_PID" ]
+  [ ! -e "$marker" ]
+}
+
+@test "with_claim_refresher (#13) — a refresh the remote can't take is logged per failure; the dispatch goes on and the claim is still held" {
+  setup_refresher_test
+  git -C "$HOST_REPO" remote set-url origin "$BATS_TEST_TMPDIR/missing.git"
+  fake_dispatch() { sleep 3; return 7; }
+
+  local rc=0
+  with_claim_refresher fake_dispatch >"$BATS_TEST_TMPDIR/out" 2>&1 || rc=$?
+
+  [ "$rc" -eq 7 ]
+  local n
+  n="$(grep -c 'could not refresh the claim on f during the dispatch' "$BATS_TEST_TMPDIR/out")"
+  [ "$n" -ge 2 ] || fail "expected a log line per failed refresh, got $n: $(cat "$BATS_TEST_TMPDIR/out")"
+  [ "$CLAIM_HELD_FEATURE" = "f" ]
+  [ "$CLAIM_HELD_SHA" = "$TAKEN_SHA" ]
+  [ -z "$RUNNER_CLAIM_LOST" ]
+}
+
+# Another runner (m2) takes the claim on `f` over mid-dispatch. The take
+# lease can lose a race against the refresher's heartbeat, so retry.
+take_over_f_by_m2() {
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    take_over_by_other f m2 2>/dev/null && return 0
+    sleep 0.3
+  done
+  return 1
+}
+
+@test "run_loop (#13) — a takeover seen by the refresher mid-dispatch sets taken-over-by; the dispatch finishes and the loop stops on the feature" {
+  setup_heartbeat_loop_test
+  export RUNNER_CLAIM_HEARTBEAT_SECONDS=1
+  plant_queue 01 02 03
+  local finished="$BATS_TEST_TMPDIR/finished"
+  : >"$finished"
+  fake_container() {
+    sleep 1.5
+    take_over_f_by_m2 || { echo "takeover never landed" >&2; return 1; }
+    sleep 2.5
+    echo "$1" >>"$finished"
+  }
+  dispatch_one() {
+    echo "$1/$2" >>"$TEST_DISPATCHED_FILE"
+    local rest
+    rest="$(tail -n +2 "$TEST_QUEUE_FILE" 2>/dev/null || true)"
+    printf '%s\n' "$rest" >"$TEST_QUEUE_FILE"
+    [ -s "$TEST_QUEUE_FILE" ] || : >"$TEST_QUEUE_FILE"
+    with_claim_refresher fake_container "$1/$2"
+  }
+
+  run_loop >"$BATS_TEST_TMPDIR/out" 2>&1
+
+  [ "$RUN_STOP_REASON" = "taken-over-by m2" ]
+  # The dispatch in flight ran to its end (never killed); no further issue.
+  [ "$(cat "$finished")" = "f/01" ]
+  [ "$(dispatched_count)" = "1" ]
+  # The refresher saw it, stopped refreshing, and the claim is m2's.
+  grep -q 'lost the claim on f during the dispatch' "$BATS_TEST_TMPDIR/out"
+  [ "$(claims_remote_field f machine)" = "m2" ]
+  [ -z "$CLAIM_HELD_FEATURE" ]
+  [ -z "$CLAIM_REFRESHER_PID" ]
+  # Not released: the claim is left to its new holder.
+  claim_release_held >/dev/null
+  [ "$(claims_remote_field f machine)" = "m2" ]
+}
+
+# A runner process in the middle of a dispatch under its claim on `f`: the
+# real run_dispatch_container against the fake container, the drain's own
+# INT/TERM handler and EXIT trap. Records the refresher's pid in
+# $BATS_TEST_TMPDIR/refresher.pid. Prints the runner's pid once both the
+# container and the refresher run.
+start_dispatching_runner() {
+  export FAKE_CONTAINER_SECONDS="$1"
+  cat >"$BATS_TEST_TMPDIR/runner.sh" <<SCRIPT
+source "$RUNNER_SCRIPT"
+HOST_REPO="$HOST_REPO"; HOST_CHECKOUT="$HOST_CHECKOUT"; HOST_RUNNER_STATE="$HOST_RUNNER_STATE"
+NET_NAME=none; RUNNER_CONTAINER_REPO_PATH=/repo; RUNNER_CONTAINER_M2_PATH=/m2
+MVN_VOLUME=vol; IMAGE_NAME=img; TOKEN=oauth; RUNNER_GIT_USER_NAME=Arne; RUNNER_GIT_USER_EMAIL=a@b.c
+RUNNER_KILL_GRACE_SECONDS=2; RUNNER_DISABLE_TRANSPORT_RETRY=1; RUNNER_DISABLE_LIVENESS=1
+RUNNER_MACHINE=m1; RUN_TS=r1; RUN_DIR=""; RUN_MODE=drain; LOCK_HELD=0
+eval "orig_\$(declare -f claim_refresh_loop)"
+claim_refresh_loop() { sh -c 'echo \$PPID' >"$BATS_TEST_TMPDIR/refresher.pid"; orig_claim_refresh_loop "\$@"; }
+trap finalize_run EXIT
+trap handle_signal INT TERM
+claim take f >/dev/null
+rc=0
+run_dispatch_container f/01 "$BATS_TEST_TMPDIR/dispatch" || rc=\$?
+echo "dispatch returned \$rc"
+SCRIPT
+  rm -f "$FAKE_CONTAINER_PID_FILE" "$BATS_TEST_TMPDIR/refresher.pid"
+  # Job control on, so SIGINT reaches the runner as from a terminal (see
+  # claim_interrupt_runner).
+  set -m
+  bash "$BATS_TEST_TMPDIR/runner.sh" >"$BATS_TEST_TMPDIR/runner.out" 2>&1 &
+  RUNNER_PID=$!
+  set +m
+  local i
+  for i in $(seq 1 100); do
+    [ -s "$FAKE_CONTAINER_PID_FILE" ] && [ -s "$BATS_TEST_TMPDIR/refresher.pid" ] && break
+    sleep 0.1
+  done
+  [ -s "$FAKE_CONTAINER_PID_FILE" ] && [ -s "$BATS_TEST_TMPDIR/refresher.pid" ] \
+    || fail "runner never reached the dispatch: $(cat "$BATS_TEST_TMPDIR/runner.out")"
+  REFRESHER_PID="$(cat "$BATS_TEST_TMPDIR/refresher.pid")"
+  CONTAINER_PID="$(cat "$FAKE_CONTAINER_PID_FILE")"
+  pid_alive "$REFRESHER_PID" || fail "no refresher running"
+}
+
+# The runner-process tests drive their own claim; drop the in-process one.
+setup_refresher_process_test() {
+  setup_refresher_test
+  claim release f >/dev/null
+}
+
+teardown_dispatching_runner() {
+  kill -KILL "${CONTAINER_PID:-}" "${REFRESHER_PID:-}" "${RUNNER_PID:-}" 2>/dev/null || true
+}
+
+@test "claim refresher (#13) — a normal exit of the container leaves no refresher behind" {
+  setup_refresher_process_test
+  start_dispatching_runner 3
+  wait "$RUNNER_PID" || true
+  grep -q 'dispatch returned 0' "$BATS_TEST_TMPDIR/runner.out" || fail "$(cat "$BATS_TEST_TMPDIR/runner.out")"
+  wait_pid_gone "$REFRESHER_PID" 1 || { teardown_dispatching_runner; fail "refresher survived a normal exit"; }
+}
+
+@test "claim refresher (#13) — SIGTERM to the runner mid-dispatch: no refresher left behind, claim released" {
+  setup_refresher_process_test
+  start_dispatching_runner 60
+  kill -TERM "$RUNNER_PID"
+  wait "$RUNNER_PID" || true
+  wait_pid_gone "$REFRESHER_PID" 1 || { teardown_dispatching_runner; fail "refresher survived SIGTERM"; }
+  wait_pid_gone "$CONTAINER_PID" 1 || { teardown_dispatching_runner; fail "container survived SIGTERM"; }
+  [ "$(remote_claim_verdict)" = "free" ]
+}
+
+@test "claim refresher (#13) — SIGINT (Ctrl-C) to the runner mid-dispatch: no refresher left behind, claim released" {
+  setup_refresher_process_test
+  start_dispatching_runner 60
+  kill -INT "$RUNNER_PID"
+  wait "$RUNNER_PID" || true
+  wait_pid_gone "$REFRESHER_PID" 1 || { teardown_dispatching_runner; fail "refresher survived SIGINT"; }
+  wait_pid_gone "$CONTAINER_PID" 1 || { teardown_dispatching_runner; fail "container survived SIGINT"; }
+  [ "$(remote_claim_verdict)" = "free" ]
+}
+
+@test "claim refresher (#13) — the container killed mid-dispatch: the dispatch returns and no refresher is left behind" {
+  setup_refresher_process_test
+  start_dispatching_runner 60
+  kill -KILL "$CONTAINER_PID"
+  wait "$RUNNER_PID" || true
+  grep -q 'dispatch returned' "$BATS_TEST_TMPDIR/runner.out" || fail "$(cat "$BATS_TEST_TMPDIR/runner.out")"
+  wait_pid_gone "$REFRESHER_PID" 1 || { teardown_dispatching_runner; fail "refresher survived the container's death"; }
+}
+
+@test "claim refresher (#13) — a runner killed outright mid-dispatch stops refreshing: stale within stale-after plus one interval" {
+  setup_refresher_process_test
+  start_dispatching_runner 60
+  [ "$(remote_claim_verdict)" = "held" ]
+  local killed_at
+  kill -KILL "$RUNNER_PID"
+  killed_at="$(date +%s)"
+  wait "$RUNNER_PID" 2>/dev/null || true
+  # The refresher notices its runner is gone within one interval.
+  wait_pid_gone "$REFRESHER_PID" $(( RUNNER_CLAIM_HEARTBEAT_SECONDS + 2 )) \
+    || { teardown_dispatching_runner; fail "refresher outlived its runner"; }
+  # And the claim goes stale within stale-after plus one interval (plus the
+  # one-second resolution of the heartbeat stamp and of this clock).
+  local bound=$(( RUNNER_CLAIM_STALE_AFTER + RUNNER_CLAIM_HEARTBEAT_SECONDS + 2 ))
+  local verdict=""
+  while [ $(( $(date +%s) - killed_at )) -le "$bound" ]; do
+    verdict="$(remote_claim_verdict)"
+    [ "$verdict" = "stale" ] && break
+    sleep 0.2
+  done
+  teardown_dispatching_runner
+  [ "$verdict" = "stale" ] || fail "claim still $verdict ${bound}s after the kill"
 }

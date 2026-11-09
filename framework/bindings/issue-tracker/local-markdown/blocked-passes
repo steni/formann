@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+###
+### blocked-passes — local-markdown binding: count an issue's Blocked passes.
+###
+### Usage: blocked-passes <feature>/<NN>
+###
+### Prints one integer on stdout: the number of `Blocked` comments on the
+### issue since its latest `Implementation` comment (all `Blocked` comments
+### when it has none). A rework posts a new Implementation comment, which
+### resets the count. Reads the issue file per the "Read the issue" verb
+### (`.features/<feature>/issues/<NN>-<slug>.md`); comments are the
+### `### <Kind> — <date>` / `### <Kind> (n) — <date>` subsections of its
+### `## Comments` section. Fenced code blocks are skipped, so a heading
+### quoted inside a comment does not count.
+###
+### Tracker root resolution matches tracker-snapshot:
+###   1. SNAPSHOT_CHECKOUT_DIR — read the committed file at that repo's HEAD
+###      (the runner's view: classification reads committed state only).
+###   2. TRACKER_ROOT — explicit override used by tests.
+###   3. PWD-walk to the `.formann` ancestor's `.features/`.
+###
+### Exit codes: 0 success, 1 issue file not found / unreadable, 2 usage error.
+###
+### Bash 3.2 compatible (macOS default).
+###
+
+set -eu
+set -o pipefail
+
+if [ "$#" -ne 1 ]; then
+  echo "usage: blocked-passes <feature>/<NN>" >&2
+  exit 2
+fi
+
+ref="$1"
+feature="${ref%/*}"
+nn="${ref##*/}"
+if [ "$feature" = "$ref" ] || [ -z "$feature" ] || [ -z "$nn" ]; then
+  echo "blocked-passes: not an issue ref: '$ref' (expected <feature>/<NN>)" >&2
+  exit 2
+fi
+case "$nn" in
+  *[!0-9]*)
+    echo "blocked-passes: not an issue ref: '$ref' (expected <feature>/<NN>)" >&2
+    exit 2
+    ;;
+esac
+
+issue_content=""
+if [ -n "${SNAPSHOT_CHECKOUT_DIR:-}" ]; then
+  dir=".features/$feature/issues"
+  path="$(git -C "$SNAPSHOT_CHECKOUT_DIR" ls-tree --name-only HEAD "$dir/" 2>/dev/null \
+    | grep -E "^$dir/${nn}-[^/]*\.md\$" | head -n 1 || true)"
+  if [ -z "$path" ] || ! issue_content="$(git -C "$SNAPSHOT_CHECKOUT_DIR" show "HEAD:$path" 2>/dev/null)"; then
+    echo "blocked-passes: no committed issue file for '$ref' in $SNAPSHOT_CHECKOUT_DIR" >&2
+    exit 1
+  fi
+else
+  if [ -n "${TRACKER_ROOT:-}" ]; then
+    tracker_root="$TRACKER_ROOT"
+  else
+    walk_dir="$PWD"
+    tracker_root=""
+    while [ "$walk_dir" != "/" ]; do
+      if [ -e "$walk_dir/.formann" ]; then
+        tracker_root="$walk_dir/.features"
+        break
+      fi
+      walk_dir="$(dirname "$walk_dir")"
+    done
+    if [ -z "$tracker_root" ]; then
+      echo "blocked-passes: could not find .formann ancestor from $PWD; set TRACKER_ROOT to override" >&2
+      exit 2
+    fi
+  fi
+  file=""
+  for candidate in "$tracker_root/$feature/issues/${nn}-"*.md; do
+    [ -f "$candidate" ] && { file="$candidate"; break; }
+  done
+  if [ -z "$file" ]; then
+    echo "blocked-passes: no issue file for '$ref' under $tracker_root" >&2
+    exit 1
+  fi
+  issue_content="$(cat "$file")"
+fi
+
+printf '%s\n' "$issue_content" | awk '
+  { sub(/\r$/, "") }
+  /^```/ { fence = !fence; next }
+  fence { next }
+  /^## / { in_comments = ($0 == "## Comments"); next }
+  !in_comments { next }
+  /^### Implementation( \([0-9]+\))? — / { count = 0; next }
+  /^### Blocked( \([0-9]+\))? — / { count++ }
+  END { print count + 0 }
+'

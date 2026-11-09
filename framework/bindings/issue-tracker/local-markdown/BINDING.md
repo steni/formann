@@ -67,7 +67,7 @@ Write (or replace) the triage notes for this issue. Body-shaped: recording overw
 
 ### Comment with `<kind>`
 
-Append a comment to the issue's timeline. Timeline-shaped: append-only, history is preserved. The kind names the producing context — examples: `Implementation`, `Verification`, `Rework notes`, `Wontfix explanation`, `Post-mortem`, `Review (AFK gate)`, `Note`.
+Append a comment to the issue's timeline. Timeline-shaped: append-only, history is preserved. The kind names the producing context — examples: `Implementation`, `Verification`, `Rework notes`, `Wontfix explanation`, `Post-mortem`, `Review (AFK gate)`, `Blocked`, `Note`.
 
 **Local-markdown realization:**
 
@@ -77,6 +77,10 @@ Append a comment to the issue's timeline. Timeline-shaped: append-only, history 
 - Sub-blocks (Evidence, Findings, Decisions, Resolved scope, Verification summary) live as **bolded labels** — `**Evidence**`, `**Findings**`, etc. — inside the producing comment subsection. They are never `####` nested headings and never sibling sections of `## Comments`.
 - The body above `## Comments` is read-only after triage. Corrections and follow-ups go in a new comment. The only above-the-fold mutations permitted after triage are frontmatter field writes (Set the state, Set issue metadata) and the Triage Notes section (written and cleared by the Record triage notes verb only).
 - Commit the appended comment via a `tracker:` commit (see [Committing tracker changes](#committing-tracker-changes)). A comment posted alongside a status change is the same logical operation — both file edits land in one commit, not two.
+
+**On a feature's parent:** `comment-on-feature <feature> <Kind>` (body on stdin) appends the comment to the `## Comments` section of `.features/<feature>/PRD.md` (creating the section when missing), with the heading and same-day suffix above, and commits it as `tracker: <feature> — <Kind> on the feature`. It writes in `TRACKER_CHECKOUT_DIR` when set (the AFK runner passes its runner-checkout and propagates the commit like a dispatch's), else the `.formann` ancestor of `$PWD`. A PRD-less feature has no parent: exit `1`, nothing written. Exit `2` on a usage error.
+
+**Blocked pass count:** `blocked-passes <feature>/<NN>` prints the number of `### Blocked — <date>` (or `### Blocked (n) — <date>`) subsections of the issue file's `## Comments` section since its latest `### Implementation …` subsection — all of them when there is none. Headings inside fenced code blocks don't count. With `SNAPSHOT_CHECKOUT_DIR` set (as the AFK runner does) it reads the committed file at that checkout's HEAD, the same view `tracker-snapshot` uses. Exit codes: `0` success, `1` issue file not found, `2` usage error.
 
 #### Canonical example
 
@@ -165,6 +169,7 @@ Create a new feature: validate the slug, check for uniqueness, create the featur
 - If HEAD is not the project's main branch, warn the maintainer and confirm before branching.
 - If the working tree is dirty, ask the maintainer how to proceed before branching.
 - Create a git branch named with the feature slug from the current HEAD and switch to it.
+- Push the new branch to the **Shared remote** at once, with upstream tracking, so every machine sees the feature from the start (ADR-0011): `git push -u <shared-remote> <slug>`. The Shared remote is the remote named by `RUNNER_SHARED_REMOTE` when that is set, `origin` otherwise. When the repo has no remote of that name, skip the push (one-machine setup). A refused or failed push does not undo the feature: report git's error to the maintainer, who pushes the branch by hand.
 
 ### Create a standalone issue
 

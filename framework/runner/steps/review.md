@@ -49,6 +49,16 @@ The issue ref is appended to this prompt below the `---` separator at the end. I
 - **No push.** Don't push from the sandbox; the runner publishes the work.
 - **No other tracker writes.** The only tracker write in this step is one "Comment with Review (AFK runner)". Do not touch the PRD, do not move other issues, do not create new files.
 
+## When a dependency is unreachable
+
+If something this step needs from outside the run is unreachable — a consumer's service, a preview environment, a remote API — the step ends **Blocked**. An outage outside the run is not a defect in the code, so do not report it as a finding and do not fail.
+
+1. **Comment with Blocked** on the issue, naming the dependency and the error you got (the command and its output, trimmed to what shows the failure). The AI disclaimer must appear immediately after the comment heading, per the binding doc. This comment is the step's only tracker write — it replaces the step's usual comment and state change.
+2. **Change no state.** Leave the issue where it is.
+3. **End your final message with the line** `BLOCKED: <dependency>`, alone on the last line, where `<dependency>` is a short name for what was unreachable (for example `BLOCKED: preview-daemon`). Omit any `verdict:` line.
+
+The runner reads that line, leaves the issue's state alone, moves on to other work, and re-runs this step on a later pass. After three Blocked passes it leaves the issue for a human with the Blocked comments as the reason.
+
 ## On failure
 
 If the review-issue agent fails to produce output, or if you cannot classify the verdict from its output, do not record a half-baked result. Print a diagnostic on stderr and exit non-zero; the maintainer reads the log on return.

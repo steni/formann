@@ -127,9 +127,11 @@ Wraps the per-issue loop and walks every feature in the discovery output.
 │   [feature empty?] ──yes──► RUN_STOP_REASON = "completed"; stop           │
 │         │ no                                                              │
 │         ▼                                                                 │
-│   ensure_runner_checkout_on_branch(feature)  (lazy: inits from resolved   │
+│   ensure_runner_checkout_on_branch(feature)  (reads <shared>/<feature>;   │
+│                                                lazy: inits from resolved  │
 │                                                default branch's host tip  │
-│                                                if host has no ref yet)    │
+│                                                and pushes it, if no ref   │
+│                                                exists anywhere yet)       │
 │         │                                                                 │
 │   [fetch failed?] ──yes──► record skip:fetch-failed; next feature         │
 │         │ no                                                              │
@@ -190,17 +192,25 @@ Wraps the per-issue loop and walks every feature in the discovery output.
 │         │ yes → log "skipping aborted <ref> — rm <path> to resume"       │
 │         │       continue to next eligible ref                            │
 │         │ no  → ref = this ref; break                                    │
+│     (an AFK in-review ref with .runner-state/blocked/<feature>/<NN>,     │
+│      not Blocked earlier this run, is selectable too: a Blocked retry;   │
+│      a marker on a ref no longer in-review is cleared)                   │
 │     [ref still empty after all eligible refs checked?]                   │
 │         │ yes ──► RUN_STOP_REASON = "queue-empty"; stop                  │
 │         │ no                                                             │
 │         ▼                                                                │
 │   ensure_runner_checkout                (re-sync to chosen tip;          │
-│         │                                parking-ref when strictly ahead │
-│         │                                or diverged, else host branch;  │
+│         │                                select_sync_base: remote branch │
+│         │                                when strictly ahead of host and │
+│         │                                parking ref; else parking-ref   │
+│         │                                when strictly ahead or diverged,│
+│         │                                else host branch;               │
 │         │                                fetch + checkout + reset --hard │
 │         │                                + clean -fd; HEAD must match)   │
 │         ▼                                                                │
 │   dispatch_one(ref)  ───► see "dispatch_one" below                       │
+│     (Blocked retry: retry_blocked_walk(ref, step) instead — the walk     │
+│      from the marker's step; no /implement)                              │
 │         │  (returns 0/1; sets RUN_STOP_REASON on halt-class errors)      │
 │         ▼                                                                │
 │   [RUNNER_INTERRUPTED?] ──yes──► RUN_STOP_REASON = "interrupted"; stop   │
@@ -360,8 +370,10 @@ the classifier runs.
    │        │                            snapshot-failed-mid-dispatch:post-<label>; │
    │        │                            record FAIL; ret 1                    │
    │        ▼ yes                                                              │
-   │   action = classify_item_action(post status, item_rc)                     │
-   │        (status + exit code only; nonzero exit ─► fail)                    │
+   │   blocked = result ends `BLOCKED: <dep>` (item_rc 0 only);               │
+   │   passes  = read_blocked_passes(ref) when blocked (unreadable ─► 0)      │
+   │   action = classify_item_action(post status, item_rc, blocked, passes)   │
+   │        (nonzero exit ─► fail; blocked precedes status)                    │
    │             │                                                             │
    │        [action?]                                                          │
    │        │                                                                  │
@@ -373,6 +385,16 @@ the classifier runs.
    │        │          aborted, else technical); propagate (when commits;      │
    │        │          park error ─► propagation-error); record gate-failed    │
    │        │          / review-aborted; ret 1                                 │
+   │        │                                                                  │
+   │        ├─ blocked (passes < 3) ─► propagate (when commits; park error ─► │
+   │        │                   gate-failed, propagation-error, ret 1);        │
+   │        │                   write Blocked marker (step); record blocked    │
+   │        │                   (<dep>); ret 0 (no abort flag, no state change;│
+   │        │                   run moves on; next pass retries from the step) │
+   │        │                                                                  │
+   │        ├─ left-for-human (blocked, passes ≥ 3) ─► same, but clear the     │
+   │        │                   marker and record left-for-human (blocked:     │
+   │        │                   <dep>); ret 0                                  │
    │        │                                                                  │
    │        ├─ terminate-run ─► propagate (when commits); RUN_STOP_REASON =    │
    │        │                   runaway-halt(<ref>); record halt → runaway;    │
@@ -406,6 +428,9 @@ the classifier runs.
 | Step `stop-success`, propagate ok | `done` | 0 | no | no |
 | Walk exhausted (issue still `in-review`) | `left-for-human` | 0 | no | no |
 | Step `terminate-run` (issue back to `ready-for-agent`) | `halt → runaway` | 1 | `runaway-halt (<ref>)` | no |
+| Step `blocked` (`BLOCKED: <dep>`, fewer than three Blocked passes), propagate ok | `blocked (<dep>)` | 0 | no | no |
+| Step `left-for-human` (third Blocked pass), propagate ok | `left-for-human (blocked: <dep>)` | 0 | no | no |
+| Step `blocked`/`left-for-human`, propagate error | `gate-failed` | 1 | `propagation-error` | no |
 
 The two snapshot-failure rows bail before the classifier runs — an unreadable snapshot leaves the issue's state unknown — parking any committed work first so the next iteration's reset can't lose it. `snapshot-failed-mid-dispatch:<stage>` is transient: `run_single` overwrites it with `single-dispatch (…)`, and in loop / drain mode the next iteration re-snapshots and re-classifies, so it shows up in the per-iteration record but not in the terminal Stop reasons list below.
 

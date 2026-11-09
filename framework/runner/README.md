@@ -11,11 +11,146 @@ dispatching `/implement` per issue inside a sandboxed Docker container.
 
 `--model <id>` overrides the model for every dispatch in the run (implement stage and each post-implement walk item). An unknown id is rejected by the CLI inside the container and surfaces as a normal dispatch failure — the runner keeps no model whitelist. Without the flag, the `RUNNER_MODEL` environment variable (when set) supplies the model — export it in your shell profile to pin a default model for every run; `--model` still overrides it. When a model is chosen either way, it appears in the SUMMARY.md run line and `runner.log`; with neither, behavior is byte-identical to prior runs.
 
+Drain and loop mode also accept `--idle <seconds>`: instead of exiting when there is nothing left to do, the runner sleeps and starts a fresh pass — see [Idle loop](#idle-loop). It is refused with `--issue`.
+
 Every form also accepts `--no-caffeinate`. By default the runner holds a macOS wake assertion for the whole run (`caffeinate -i -s` tied to the runner pid, released automatically on any exit) so an unattended host doesn't idle-sleep or timer-throttle a multi-hour run — the flag skips it for operators who manage power assertions themselves. On hosts without `caffeinate` (non-macOS) the runner logs a note and continues; either way `runner.log` records whether an assertion was held.
 
 Drain mode stops on: every feature considered (`completed`); Ctrl-C (`interrupted`); or `tracker-snapshot --list` itself failing (`preflight-abort: discovery`).
 
 Narrowed modes stop on: queue empty; Ctrl-C (the in-flight container receives SIGTERM, then SIGKILL after `RUNNER_KILL_GRACE_SECONDS` if it lingers); or a mid-loop `tracker-snapshot` crash (`snapshot-failed`, exit 1). The full stop-reason vocabulary — including the pre-flight-phase stops — is enumerated below the per-issue table.
+
+## Idle loop
+
+`run-the-queue.sh --idle <seconds>` (with or without `--feature <slug>`) keeps the runner alive. Each **pass** is one drain (or one loop over the feature) exactly as a run without `--idle` would do it; when the pass ends — queue empty, every feature considered, a feature parked, or a tracker or fetch outage — the runner sleeps `<seconds>` and starts the next pass:
+
+- **Fresh state every pass.** Drain mode re-runs discovery (`tracker-snapshot --list`; on failure it keeps the previous list), and every feature is re-synced and re-snapshotted, so an issue made ready — or a feature created — while the runner slept is dispatched on the next pass, without a restart. Loop mode re-syncs the runner-checkout before its snapshot (a sync failure skips that pass).
+- **Blocked steps are re-run every pass.** A step that ended `blocked (<dependency>)` is re-run, from that step, on the next pass (never twice in one pass). The pass count is read from the tracker each time, so passes made by another machine count; the third leaves the issue for a human.
+- **One summary per pass.** A pass that dispatched anything writes `pass-<NNNN>/SUMMARY.md` in the run dir, and its per-issue artifacts land beside it, so a later pass never overwrites an earlier one's logs. A pass with nothing to do leaves no directory. The run's own `SUMMARY.md` ends with a `## Passes` index linking each pass.
+- **Stopping.** Ctrl-C or SIGTERM — during a dispatch or during the sleep (honoured within a second) — stops the runner with stop reason `interrupted`, exit 0, and the usual summary. A `propagation-error` or `runaway-halt` stops it with exit 1, as it would stop a single drain. A pre-flight failure exits 2 before the first pass.
+
+Without `--idle`, nothing changes: the runner makes one pass and exits.
+
+## Running as a service
+
+On an unattended machine, start the runner with `--idle` from the OS service manager so it starts with the machine and comes back after a crash. Both recipes below run it as **your user** (it needs your git credentials, your Docker access and your OAuth token), from the consumer repo root, restart it only when it exits non-zero, and append its terminal output to `.runner-state/service.log`. Each run still writes its own `runner.log` and `SUMMARY.md` under `.runner-state/runs/<ts>/`; `service.log` adds whatever happened before a run dir existed (a pre-flight abort, a crash).
+
+Replace `/path/to/consumer` with the consumer repo's absolute path, and set `PATH` to include `docker`, `git`, `jq` and (for the github-issues binding) `gh`. Add `RUNNER_FORMANN_DIR` (and `RUNNER_FORMANN_REF` if not `origin/main`) to the unit's environment so the service runs — and keeps updating — its own Formann; see [The Runner's Formann](#the-runners-formann). A crashed runner leaves its pidfile lock behind; the next start finds the owner gone and reclaims it.
+
+**macOS — launchd.** Save as `~/Library/LaunchAgents/dev.formann.runner.plist`. A LaunchAgent runs in your login session, so the Keychain entry holding the OAuth token is readable; the runner's own wake assertion keeps the machine awake while it runs.
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.formann.runner</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/path/to/consumer/.formann/runner/run-the-queue.sh</string>
+    <string>--idle</string>
+    <string>300</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/path/to/consumer</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>60</integer>
+  <key>ExitTimeOut</key>
+  <integer>60</integer>
+  <key>StandardOutPath</key>
+  <string>/path/to/consumer/.runner-state/service.log</string>
+  <key>StandardErrorPath</key>
+  <string>/path/to/consumer/.runner-state/service.log</string>
+</dict>
+</plist>
+```
+
+```sh
+mkdir -p /path/to/consumer/.runner-state
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.formann.runner.plist   # start now and at every login
+launchctl print gui/$(id -u)/dev.formann.runner                                    # state, pid, last exit code
+launchctl kickstart -k gui/$(id -u)/dev.formann.runner                             # restart (e.g. after pulling a new Formann)
+launchctl bootout gui/$(id -u)/dev.formann.runner                                  # stop (SIGTERM → interrupted) and unload
+```
+
+`KeepAlive` → `SuccessfulExit: false` restarts the runner after a non-zero exit (a crash, `propagation-error`, a pre-flight abort) but not after a clean stop; `ThrottleInterval` spaces restarts a minute apart. `bootout` sends SIGTERM, and `ExitTimeOut` gives an in-flight dispatch time to stop before launchd escalates to SIGKILL. A LaunchAgent starts at login: on a Mac that must run after a reboot with nobody at the screen, enable automatic login for that user.
+
+**Linux — systemd (user unit).** Save as `~/.config/systemd/user/formann-runner.service`:
+
+```ini
+[Unit]
+Description=Formann AFK runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/consumer
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/bin/bash /path/to/consumer/.formann/runner/run-the-queue.sh --idle 300
+Restart=on-failure
+RestartSec=60
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=60
+StandardOutput=append:/path/to/consumer/.runner-state/service.log
+StandardError=append:/path/to/consumer/.runner-state/service.log
+
+[Install]
+WantedBy=default.target
+```
+
+```sh
+mkdir -p /path/to/consumer/.runner-state
+sudo loginctl enable-linger "$USER"                # start your user units at boot, without a login
+systemctl --user daemon-reload
+systemctl --user enable --now formann-runner       # start now and at every boot
+systemctl --user status formann-runner             # state, pid, last exit code
+systemctl --user restart formann-runner            # restart (e.g. after pulling a new Formann)
+systemctl --user stop formann-runner               # stop (SIGTERM → interrupted)
+```
+
+`Restart=on-failure` restarts the runner after a non-zero exit or a kill, not after a clean stop; `RestartSec` spaces restarts a minute apart. `KillMode=mixed` sends SIGTERM to the runner alone, so it stops its in-flight container itself, and `TimeoutStopSec` bounds that before systemd sends SIGKILL. Your user must be in the `docker` group. The OAuth token must be readable without a desktop session: on a headless box with no unlocked GNOME Keyring, libsecret lookups fail, and the kernel keyring's `@s` session keyring does not survive into a service — store the token where the service can read it before relying on the unit (check with `systemctl --user start formann-runner` and `.runner-state/service.log`: a token failure is a `preflight-abort: oauth-token`).
+
+## The Runner's Formann
+
+The runner runs from a Formann checkout of its own, never from the one your interactive sessions read through `.formann`. At the start of every run — and, with `--idle`, before every pass after the first — it fast-forwards that checkout to a configured ref and runs the code there, so every machine runs the same Formann without anyone pulling on each one, and an update never changes skills under a live session.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `RUNNER_FORMANN_DIR` | _(unset)_ | Path of the runner's own Formann checkout: a **git clone** of the Formann remote, used by nothing else. Unset: the runner runs from wherever it was started, updates nothing, and records that checkout's sha as `<sha> (not self-updated: RUNNER_FORMANN_DIR is unset)`. |
+| `RUNNER_FORMANN_REF` | `origin/main` | `<remote>/<branch>` the checkout follows — upstream `main`, or your own integration branch (e.g. `fork/integration`, after `git -C "$RUNNER_FORMANN_DIR" remote add fork <url>`). |
+
+**Setting it up.** Clone the Formann remote somewhere of its own and point the runner at it — in the service unit's environment, or your shell profile:
+
+```sh
+git clone https://github.com/<owner>/formann.git ~/formann-runner     # the runner's Formann; never edit it
+export RUNNER_FORMANN_DIR=~/formann-runner
+export RUNNER_FORMANN_REF=origin/main                                 # or <remote>/<your-integration-branch>
+```
+
+Keep starting the runner as before (`.formann/runner/run-the-queue.sh`, or the service recipes above): the copy you start only updates the runner's checkout and then re-executes `$RUNNER_FORMANN_DIR/framework/runner/run-the-queue.sh` with the same arguments, so the drain runs the checkout's code. The sandbox still sees the consumer's `.formann` (read-only) for the skills it runs.
+
+**An rsync copy must become a clone.** A checkout copied from another machine with `rsync` (as on smia today) has no git history the runner can fast-forward — or carries the other machine's local state — and is refused as `not a git clone`. Replace it: move it aside, `git clone` the configured remote into `RUNNER_FORMANN_DIR`, and start the runner. Never edit the clone in place: carry your own changes on a branch of a remote and point `RUNNER_FORMANN_REF` at it.
+
+**What happens at each drain:**
+
+- **Fast-forward.** `formann_self_update` (`formann-update.sh`) fetches `<branch>` from `<remote>` and fast-forwards the checkout to it. When the sha moved, or the runner was started from another copy, the runner re-executes itself from the checkout before it takes the lock or any claim. In the idle loop a pass that finds the ref moved ends the run (stop reason `formann-updated`; summary, claims and lock released as usual) and the same process re-executes on the new code, which starts a fresh run.
+- **Refusal.** Local changes (modified, staged or untracked files), divergence (commits the ref lacks — the checkout is ahead of it or has diverged), a missing directory, a directory that is not a git clone, or a ref that cannot be fetched refuse the drain with the reason, before any claim is taken: at startup `preflight-abort: runner-formann` (exit 2; the reason is the line `runner: runner-formann: refusing to drain: <reason>` in `runner.log`); in the idle loop the pass is skipped as `formann-refused` and the runner tries again after the sleep. Reconcile the checkout by hand (`git -C "$RUNNER_FORMANN_DIR" status`, `reset --hard <remote>/<branch>` if the local state is not wanted) — the runner never discards it for you.
+- **Record.** The sha is the `formann:` line of the **Claim** and the `- Formann: <sha> (<ref>)` line of `SUMMARY.md` (every variant, including a pre-flight abort and each pass's summary), and `runner.log` opens with `runner: Formann <sha> (<ref>)`. A bad run points straight at the version that produced it.
 
 ## Per-run output
 
@@ -31,7 +166,8 @@ at `.runner-state/runs/<YYYYMMDD-HHMMSS>/` containing:
 | `<NN>.summary.md` / `<feature>/<NN>.summary.md` | The implement dispatch's readable closing message, extracted from the terminal `result` event — the skim-the-outcome artifact. This is what the SUMMARY table links. |
 | `<NN>.exit` / `<feature>/<NN>.exit` | Per-issue implement-dispatch exit code (a bare integer). |
 | `<NN>-<step>-<label>.{stdout.jsonl,stderr.log,summary.md}` (narrowed) / `<feature>/…` (drain) | The same three per-dispatch artifacts for each post-implement walk step, e.g. `01-01-review.stdout.jsonl` for the default single `review` step. One set per step that ran; absent when the implement stage failed and the walk never started. |
-| `SUMMARY.md` | Markdown end-of-run summary. Narrowed modes: feature heading + flat per-issue table. Drain mode: `# AFK runner — multi-feature drain` heading + per-feature sections (`## <feature> — drained` with nested per-issue table, or `## <feature> — skipped: <reason>` / `## <feature> — feature-snapshot-failed` one-liner). Pre-flight aborts replace the table with a single line naming the failing invariant. |
+| `pass-<NNNN>/` (`--idle` only) | One directory per pass that dispatched anything: its own `SUMMARY.md` (same shape as the run's), and that pass's per-issue artifacts (the rows above) inside it instead of directly in the run dir. |
+| `SUMMARY.md` | Markdown end-of-run summary. With `--idle`, it ends with a `## Passes` index linking every `pass-<NNNN>/SUMMARY.md`. Narrowed modes: feature heading + flat per-issue table. Drain mode: `# AFK runner — multi-feature drain` heading + per-feature sections (`## <feature> — drained` or `## <feature> — parked (Shared remote refused the fast-forward)` with nested per-issue table, or `## <feature> — skipped: <reason>` / `## <feature> — held-by <machine>` / `## <feature> — feature-snapshot-failed` one-liner; `## <feature> — taken-over-by <machine> (stopped after its current dispatch)` with the table of what it dispatched before). Pre-flight aborts replace the table with a single line naming the failing invariant. |
 
 Stdout while a run is in flight uses per-stage progress lines. A typical
 iteration produces four (implement starting/outcome, review starting/outcome):
@@ -112,6 +248,8 @@ combined-outcome column. The combined-outcome vocabulary is:
 | `window-exhausted` | The dispatch (implement or walk item — the abort flag's `dispatch:` field names the stage) still died usage-window-rejected after `RUNNER_WINDOW_RETRY_MAX_WAITS` window-waits. The quota is structurally insufficient for this dispatch, not a blip to `rm` and re-run. Runner writes a `type: window` abort flag and continues. |
 | `in-review` | AFK iteration interrupted between implement-finish and the start of the post-implement walk: implement landed `in-review`, the interrupt pre-empted the first walk step, and the iteration is recorded at its implement outcome. |
 | `FAIL` | Implement-stage failure (classifier verdict, container error, or parking-ref publish failure). Any `tracker:` work the dispatch did commit (notably the comment `/implement` posts on a bail) is still propagated to the host so it shows up on your branch when you return. |
+| `blocked (<dependency>)` | A post-implement step couldn't reach a dependency outside the run and ended `BLOCKED: <dependency>` after posting a Blocked comment. The issue keeps its state, no abort flag is written, and the run moves on to the next eligible issue; the next run (with `--idle`, the next pass) re-runs the walk from the blocked step (`.runner-state/blocked/<feature>/<NN>` names it), without re-running `/implement`. |
+| `left-for-human (blocked: <dependency>)` | The third Blocked pass (counted from the issue's Blocked comments since its latest Implementation comment). The issue is left for you with those comments as the reason. No abort flag. |
 | `halt → runaway` | A post-implement step drove the issue back to `ready-for-agent` (eligible) — a misconfigured manifest that would otherwise re-dispatch the same ref forever. The runner halts the entire run immediately. No abort flag (the issue is eligible, not stuck); the maintainer fixes the manifest. |
 
 The trailing `stop reason:` line varies by mode.
@@ -121,18 +259,26 @@ The trailing `stop reason:` line varies by mode.
 - `completed` — every feature in discovery output considered (the multi-feature analogue of single-feature mode's `queue-empty` at the run level).
 - `interrupted` — Ctrl-C during the outer loop.
 - `propagation-error` — parking-ref publish failed inside a feature loop; the entire drain halts (exit 1).
+- A feature whose Shared-remote push was refused is not a run-level stop: its section reads `## <feature> — parked (Shared remote refused the fast-forward)` and the drain continues with the next feature.
+- A feature another runner holds a **Claim** on is not a stop either: its section reads `## <feature> — held-by <machine>` and the drain continues with the next feature. A claim that can't be taken at all (Shared remote unreachable) reads `skipped: claim-failed`.
+- A feature whose claim another runner took over mid-drain stops after its current dispatch, its section reading `## <feature> — taken-over-by <machine> (stopped after its current dispatch)`; the drain continues with the next feature.
 - `preflight-abort: discovery` — `tracker-snapshot --list` exited non-zero or returned unparseable JSON.
 
 **Narrowed modes (`--feature`, `--issue`):**
 
 - `queue-empty` / `interrupted` / `snapshot-failed` / `propagation-error` — the per-issue loop's stop reasons (see "The dispatch loop" in `afk-runner.md`).
+- `publish-parked` (`--feature`) — the Shared remote refused a fast-forward; the work is on the parking ref and the loop stopped on the feature.
+- `held-by <machine>` (`--feature`) — another runner holds the feature's Claim; nothing was dispatched (with `--idle`, the next pass tries again). `claim-failed` — the claim couldn't be taken (Shared remote unreachable).
+- `taken-over-by <machine>` (`--feature`) — a heartbeat found the feature's claim taken over by another runner; the loop stopped after the dispatch in flight.
 - `feature-restricted (refused: <reason>)` (`--feature`) — `<reason>` is `unknown-feature` (slug not in discovery output).
 - `single-dispatch (success|failure)` (`--issue`); or `single-dispatch (refused: <reason>)` — `<reason>` is one of: HITL type, wrong status, unmet blockers, `unknown-feature`, `snapshot-failed`.
 
 **All modes — pre-flight-phase:**
 
 - `interrupted-during-preflight` — Ctrl-C arrived before the loop started.
-- `preflight-abort: <invariant>` — a pre-flight invariant tripped before the loop began.
+- `preflight-abort: <invariant>` — a pre-flight invariant tripped before the loop began. `preflight-abort: runner-formann` — the Runner's Formann could not be fast-forwarded to its ref (see [The Runner's Formann](#the-runners-formann)); nothing was locked or claimed.
+
+**With `--idle`, per pass:** `formann-refused` — the Runner's Formann update refused; the pass drained nothing and the runner tries again after the sleep. `formann-updated` — the ref moved; the run ends (exit 0) and the runner re-executes on the new Formann.
 
 ## Transport-class retry
 
@@ -196,7 +342,7 @@ Window-waits do not consume the transport-retry budget, and the transport attemp
 
 ## Default-branch resolution
 
-When a feature's branch doesn't exist on host yet, the runner lazy-initializes it from the repo's default branch — based on that branch's *current host tip*, fetched at sync time. The same resolution drives the lazy-init preserve-commits guard and the unborn-HEAD recovery. The default branch is resolved deliberately (`resolve_default_branch`), in precedence order:
+When a feature's branch exists on the Shared remote but not on host, the runner starts from the remote's branch (see *Publishing to the Shared remote*). When it doesn't exist anywhere yet, the runner lazy-initializes it from the repo's default branch — based on that branch's *current host tip*, fetched at sync time — and pushes it to the Shared remote at once. The same resolution drives the lazy-init preserve-commits guard and the unborn-HEAD recovery. The default branch is resolved deliberately (`resolve_default_branch`), in precedence order:
 
 1. `RUNNER_DEFAULT_BRANCH` — operator override.
 2. The host repo's own `refs/remotes/origin/HEAD` — when the host was cloned from a real upstream, this is the upstream's default branch.
@@ -210,6 +356,69 @@ Two sources are explicitly forbidden: the host's currently-checked-out branch an
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `RUNNER_DEFAULT_BRANCH` | (empty) | Override the resolved default branch; empty means auto-resolve per the precedence above |
+
+## Publishing to the Shared remote
+
+After every dispatch that commits, the host side of the runner fast-forwards the commit onto the **Shared remote**'s feature branch — after the parking ref and the host fast-forward, before the first post-implement step starts (ADR-0011). The push runs in the host repo with the host's git credentials; nothing changes in the sandbox. It is fast-forward only: never `--force`, never a `+` refspec.
+
+The `propagation` column of `SUMMARY.md` and the end-of-run table, and the per-dispatch progress line, lead with the publish state:
+
+| Indicator | Meaning |
+|-----------|---------|
+| `published → <remote>/<branch>` | The Shared remote's branch is at the dispatch's commit. |
+| `parked → runner/<branch>` | The push was refused (the remote branch has commits the runner lacks) or failed (auth, network — git's stderr is in `runner.log`). The remote is untouched; the work is on the parking ref; the runner stops on this feature. Listed under `## Unpulled parked work`. |
+| `local-only (propagated → host)` / `local-only (parked → runner/<branch>)` | The host repo has no remote of that name: nothing is pushed, and the parenthesised host outcome is exactly the one-machine behaviour. |
+
+**Starting from the Shared remote.** Before every dispatch the host repo reads `<remote>/<branch>` and the runner-checkout is synced to the most advanced of the Shared remote's branch, the host branch and the parking ref that the others are ancestors of. A feature begun on another machine therefore continues from its published tip, even on a machine that never had the branch. When the remote branch and the parking ref have diverged, the runner builds on the parking ref and the publish parks the feature. A feature branch the runner creates from the default branch, because it exists nowhere yet, is pushed to the Shared remote before the first dispatch. A Shared remote the host cannot reach fails the sync (`skip:fetch-failed` in drain mode); with no remote of that name, nothing is read or pushed.
+
+To recover from `parked`, bring the two chains together by hand — `git pull runner <branch>`, merge or rebase onto `<remote>/<branch>`, push — and re-run.
+
+**Knob:**
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `RUNNER_SHARED_REMOTE` | `origin` | Name of the host repo's git remote the runner publishes to. A name with no matching remote means `local-only`. |
+
+## Claims across machines
+
+Two runners on two machines never drain the same feature: before a feature's first dispatch (drain mode and `--feature`), the runner takes a **Claim** on it, a ref on the Shared remote, and releases it when the feature's drain ends (ADR-0011). `--issue` takes no claim.
+
+- **The claim ref.** `refs/formann/claims/<feature>` on the Shared remote, pointing at a parentless commit (empty tree) whose message reads `machine: <hostname>`, `run: <run id>`, `formann: <sha or unknown>`, `heartbeat: <UTC ISO-8601>`. Inspect one with `git fetch <remote> refs/formann/claims/<feature> && git log -1 FETCH_HEAD`.
+- **Take** is `git push --force-with-lease=refs/formann/claims/<feature>: <remote> <commit>:refs/formann/claims/<feature>` — the lease expects the ref absent, so of two runners starting the same second exactly one wins. The loser reads the claim and skips the feature: `held-by <machine>` in `SUMMARY.md`, and the drain moves on to the next eligible feature.
+- **Heartbeat.** Between dispatches — before each `/implement` dispatch, each post-implement step and each post-drain step — the holder replaces its claim commit with one carrying a fresh `heartbeat:`, a lease push on the sha it last wrote. A heartbeat that fails for a network reason is logged and tried again at the next heartbeat point; the drain goes on.
+- **Heartbeat during a dispatch.** While a dispatch runs — an `/implement` or post-implement container (including its retry waits) or a post-drain step — a companion process beside it heart-beats the claim every `RUNNER_CLAIM_HEARTBEAT_SECONDS` (default a third of the stale-after time, 600 s), so a dispatch longer than the stale-after time is never taken for a dead runner. It is started only when a claim is held and stopped on every way out of the dispatch: the container exiting, Ctrl-C or SIGTERM to the runner, the container being killed. A runner killed outright stops heart-beating with it: the companion notices its runner is gone within one interval, so the claim goes stale within stale-after plus one interval. A refresh that fails for a network reason is logged, once per failure, and tried again at the next interval; the dispatch goes on. A refresh that finds the claim taken over stops refreshing and marks the claim lost (see below) without touching the dispatch.
+- **Stale and takeover.** A claim whose heartbeat is more than `RUNNER_CLAIM_STALE_AFTER` seconds old (default 1800, thirty minutes) by the reader's own clock is stale; nobody writes "stale". A runner that finds a stale claim takes it over with a lease push on the stale claim's sha — logged and announced with a Note like a take (`taken-over-from <machine>`). A refused lease means the holder heart-beat meanwhile: the newcomer backs off as `held-by <machine>`. Of a takeover and a late heartbeat racing, exactly one wins.
+- **Lost claim.** A holder whose heartbeat lease is refused, and whose re-read shows another runner's claim, has lost it: it finishes the dispatch in flight (including that dispatch's remaining post-implement steps), takes no further issue on the feature, does not release the claim, and reports `taken-over-by <machine>` in `SUMMARY.md` (or as the `--feature` stop reason). Its last commit reaches the Shared remote by the Publisher's fast-forward, or parks. A takeover seen by the heartbeat during a dispatch is handled the same way once that dispatch ends.
+- **Release** is a lease delete on the sha the runner wrote. It runs when the feature's drain ends (after its post-drain phase, when there is one), however it ends, and again from the EXIT trap (`finalize_run`) — which every interrupt and abort reaches — for a claim still held. A release whose lease is refused (the ref moved) leaves the ref alone.
+- **The rule.** Every claim write is a lease push on the sha the writer last read; a refused lease is never retried as a plain or forced push. `claim.sh` is the only code that writes claim refs, from the host with the host's credentials.
+- **The Note.** On taking a claim, the runner posts a `Note` on the feature's parent through the binding's `comment-on-feature` script — which machine and run claimed it. It is information only: a Note that can't be posted is logged and the drain goes on. Under local-markdown the Note is a `tracker:` commit on the feature's `PRD.md`, propagated (and published) at once.
+- **No Shared remote:** no claims, no Note; the local lock is the only guard, as before. The local lock stays in every case.
+- `RUNNER_MACHINE` overrides the hostname recorded in the claim.
+
+A claim left behind by a runner that was killed outright (`kill -9`, power loss) goes stale thirty minutes after its last heartbeat, and the next runner to reach the feature takes it over. To free it sooner, delete it by hand — `git push <remote> :refs/formann/claims/<feature>`.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `RUNNER_CLAIM_STALE_AFTER` | `1800` | Seconds after its last heartbeat at which a claim is stale and may be taken over. |
+| `RUNNER_CLAIM_HEARTBEAT_SECONDS` | stale-after / 3 (`600`) | Seconds between heartbeats while a dispatch runs. Pre-flight (`claim-knobs`) refuses a value that is not a whole number above 0, or not below `RUNNER_CLAIM_STALE_AFTER`. |
+
+## Post-drain phase
+
+Once a feature has drained — no eligible issue left and none Blocked — and while the runner still holds the feature's Claim, it runs the host-side steps listed in `runner/post-drain.md`, then releases the claim. Use it for end-of-feature work that needs the host's credentials: reviewing the whole branch, opening a pull request. The manifest is optional; without it nothing changes.
+
+```
+# runner/post-drain.md — same line format as runner/manifest.md
+review-branch.md        # a prompt: claude -p on the host, feature slug appended
+scripts/open-pr.sh      # a command: run with the feature slug as $1 (and $RUNNER_FEATURE)
+```
+
+- Entries resolve against `runner/` first, then the framework's `steps/`; an invalid entry is `preflight-abort: post-drain-manifest`.
+- Steps run on the host, never in the sandbox, in the consumer root with the host's environment (git, `gh`, keychain). A command must be executable. `RUNNER_HOST_CLAUDE` names the `claude` binary for prompt steps (default `claude` on `PATH`).
+- The phase runs after a loop (drain mode or `--feature`) that dispatched and ended with an empty queue; `--issue` never runs it.
+- A step ends `ok`, `failed (exit N)` or — when its last non-blank output line is `BLOCKED: <dependency>` — `blocked (<dependency>)`. The phase stops at the first step that isn't `ok`. A failure writes the abort flag `.runner-state/aborted/<feature>/post-drain-<label>` (remove it to let the step run again); a Blocked step is re-run from where it stopped on the next pass.
+- Every step gets a progress line and a row in `SUMMARY.md`'s `## Post-drain` section.
+
+See "The post-drain phase" in `afk-runner.md` for the full contract.
 
 ## Resuming after a technical failure
 
@@ -300,7 +509,12 @@ contract*) for the term definitions.
 The runner classifies the step's outcome from the snapshot delta and the
 dispatch exit code (`classify_item_action` in `run-the-queue.sh`, called
 per walk step by `walk_post_implement_steps`) — it does not parse the
-verdict line. A terminal status (`done`) and an issue left at `in-review`
+verdict line. The one result line it does read is a closing
+`BLOCKED: <dependency>`: the step couldn't reach something outside the run.
+The runner then reads the issue's Blocked pass count through the binding's
+`blocked-passes` script (`docs/formann/issue-tracker/blocked-passes <ref>`)
+and records `blocked (<dependency>)`, or `left-for-human (blocked: …)` at
+the third pass. See "Blocked steps" in `afk-runner.md`. A terminal status (`done`) and an issue left at `in-review`
 both return 0 from `dispatch_one` (operational health is fine; the
 verdict is independent); a failed step returns 1 and writes an abort flag.
 

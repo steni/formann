@@ -8,11 +8,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- AFK runner runs a post-drain phase: host-side steps named in an optional consumer manifest
+  `runner/post-drain.md` (same format as `runner/manifest.md`; a `.md` entry is a prompt for the
+  host's `claude -p`, anything else a command given the feature slug), run once a feature has
+  drained and before its Claim is released — for a branch review or opening a pull request with
+  host credentials. Outcomes (`ok`, `failed`, `blocked`) go into the progress line and a
+  `## Post-drain` section of `SUMMARY.md`; a failed step writes the abort flag
+  `post-drain-<label>`, a Blocked one is re-run on the next pass. No manifest: nothing changes.
+- AFK runner keeps its own Formann checkout (`RUNNER_FORMANN_DIR`, a git clone, separate from the
+  sessions' `.formann`) and fast-forwards it to `RUNNER_FORMANN_REF` (default `origin/main`) at the
+  start of every run and every idle pass, re-executing itself from the updated checkout, so every
+  machine runs the same Formann without anyone pulling. Local changes, divergence, an rsync copy or
+  an unreachable ref refuse the drain with the reason (`preflight-abort: runner-formann`; idle pass
+  `formann-refused`) before any claim is taken. The sha is recorded in the Claim and `SUMMARY.md`.
+- AFK runner heart-beats its Claim between dispatches (before each `/implement` and each
+  post-implement step). A claim without a heartbeat for thirty minutes (`RUNNER_CLAIM_STALE_AFTER`,
+  default 1800 s, judged by each reader's own clock) is stale and is taken over with a lease push on
+  its sha, so a crashed runner no longer holds a feature forever. A runner whose claim was taken over
+  finishes its current dispatch, stops on the feature, and reports `taken-over-by <machine>`.
+- AFK runner takes a Claim on each feature it drains — the ref `refs/formann/claims/<feature>`
+  on the Shared remote, taken with a lease push that expects it absent — so two runners on two
+  machines never drain the same feature. A feature another runner holds is skipped (`held-by
+  <machine>` in `SUMMARY.md`) and the next one drained; the claim is released when the drain
+  ends, including on interrupt. Taking a claim posts an informational `Note` on the feature's
+  parent through each binding's new `comment-on-feature` script. No Shared remote: no claims.
+- AFK runner publishes every dispatch's commit to the Shared remote's feature branch (from the
+  host, fast-forward only) before the post-implement steps run. `RUNNER_SHARED_REMOTE` names the
+  remote (default `origin`); a refused push parks the work and stops the runner on that feature.
+  The `propagation` column reads `published`, `parked` or `local-only`.
+- AFK runner starts a feature from the Shared remote's branch when that is ahead of the host
+  branch and parking ref, or the only copy, so a feature begun on one machine continues on
+  another. A feature branch the runner creates from the default branch is pushed to the Shared
+  remote before the first dispatch, and both bindings' "Create a feature" push the new branch.
 - AFK runner gives each consumer repo its own sandbox image and rebuilds it when
   the repo's `runner/` changes. `RUNNER_IMAGE_NAME` overrides the image name.
 - AFK runner passes the output of an optional, consumer-owned `runner/sandbox-env` into every
   dispatch container, beside the binding's env. It can add variables but never replace one the
   runner or the binding sets, nor set any `ANTHROPIC_*` or `CLAUDE_CODE_*` variable.
+- A post-implement step that can't reach a dependency outside the run (a consumer's service, a
+  preview environment) can end Blocked: it posts a `Blocked` comment and ends with
+  `BLOCKED: <dependency>`. The runner leaves the issue's state alone, writes no abort flag, shows
+  `blocked (<dependency>)` and moves on. The next run re-runs the walk from the blocked step,
+  without re-running `/implement`, and the third Blocked pass leaves the issue for a human. The
+  pass count is read from the tracker through each binding's new `blocked-passes` script.
+- AFK runner `--idle <seconds>` (drain and `--feature` modes): instead of exiting when nothing is
+  left to do, the runner sleeps and starts a fresh pass, dispatching work that became ready
+  meanwhile and re-running steps that ended Blocked on the previous pass. Each pass that dispatched
+  anything writes `pass-<NNNN>/SUMMARY.md`; SIGINT/SIGTERM stops it cleanly. The runner README
+  has launchd and systemd recipes for running it as a service.
 - Module maps: a one-page structural description of an area of code (modules,
   responsibilities, primary flow, structural claims with their checks), kept as the
   `README.md` beside the code. Contract in `framework/domain.md`; term in `GLOSSARY.md`.
@@ -29,6 +72,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Agent briefs and issue slices name modules by their names in the PRD's module table.
 
 ### Fixed
+- Runner Dockerfile template installs Node.js 22 (NodeSource `setup_22.x`) instead of 20. On Node 20,
+  npm quietly installed the last Claude Code whose `engines` still allowed it (2.1.197), too old for
+  Opus 5.5, so every dispatch failed with an API 400. The install layer now compares `claude
+  --version` with `npm view @anthropic-ai/claude-code version` and fails the image build, naming
+  both versions and the Node version, if they differ. **Migration:** the installer never overwrites
+  an existing `runner/Dockerfile`, so existing consumers must refresh theirs: delete
+  `runner/Dockerfile` and re-run `installer/install.sh` (or, if you have customised it, port the
+  Node / Claude CLI `RUN` layer from `installer/templates/Dockerfile` by hand). The changed file
+  changes the image's build-context hash, so the runner rebuilds the image on its next dispatch.
+- AFK runner keeps its Claim fresh while a dispatch runs, not only between dispatches: a companion
+  process heart-beats it every `RUNNER_CLAIM_HEARTBEAT_SECONDS` (default a third of the stale-after
+  time, 600 s) for the life of each `/implement` or post-implement container and each post-drain
+  step, so a dispatch longer than thirty minutes is no longer taken over by another runner while it
+  is still being worked. The companion is stopped on every way out of the dispatch, and stops on its
+  own when its runner is killed outright; a takeover it sees stops the feature after the dispatch in
+  flight. Pre-flight (`claim-knobs`) refuses a heartbeat interval that is not a whole number above 0
+  or not below the stale-after time.
+- AFK runner puts the runner-checkout's `origin` back to the host repo before every sync and logs
+  the repair, so a dispatch that rewrote or removed the remote to push can no longer halt the next
+  run with `preflight-abort: runner-checkout`. Every dispatch is told that the runner publishes
+  its commits and that it must not push or change remotes.
 - AFK dispatches can no longer end their turn waiting on a background build: background Bash is disabled in the sandbox and foreground Bash may run for up to an hour.
 
 ## [0.6.0] - 2026-08-20

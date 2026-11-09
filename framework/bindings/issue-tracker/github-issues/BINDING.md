@@ -298,7 +298,7 @@ docs/formann/issue-tracker/body-edit <N> "Triage Notes" /dev/null
 
 ### Comment with `<kind>`
 
-Append a comment to the issue's timeline. Timeline-shaped: append-only, history is preserved. The kind names the producing context — examples: `Implementation`, `Verification`, `Rework notes`, `Wontfix explanation`, `Post-mortem`, `Review (AFK gate)`, `Note`.
+Append a comment to the issue's timeline. Timeline-shaped: append-only, history is preserved. The kind names the producing context — examples: `Implementation`, `Verification`, `Rework notes`, `Wontfix explanation`, `Post-mortem`, `Review (AFK gate)`, `Blocked`, `Note`.
 
 **GitHub-issues realization:** Construct the comment content and pass it inline via `--body` with a quoted heredoc:
 
@@ -365,6 +365,10 @@ The third call illustrates why the regex must match both un-suffixed (` — <dat
 
 **Web-UI comments:** Comments posted through the GitHub web UI that do not carry the `### <Kind> — <date>` heading are treated as unstructured notes. Nothing breaks — the comment-timeline reader ignores them for kind-classification purposes; they remain visible in the timeline.
 
+**On a feature's parent:** `comment-on-feature <slug> <Kind>` (body on stdin) posts on the feature's parent issue, located as **Read the feature** does (the one open issue labelled `formann:feature` and `formann:slug:<slug>`), with the heading and same-day suffix above. It prints `#N`. The AFK runner posts its claim `Note` through it. Exit codes: `0` posted, `1` no open parent or a slug collision, `2` usage error, `3` API failure after retries.
+
+**Blocked pass count:** `blocked-passes <ref>` (`#N` or `N`) prints the number of `Blocked` comments since the issue's latest `Implementation` comment — all of them when there is none. It reads the timeline through **Read the issue** (`gh issue view <N> --json comments`) and classifies each comment by its first line only (`### Blocked — <date>` or `### Blocked (n) — <date>`), so a heading quoted further down a comment never counts. The AFK runner calls it after a step ends `BLOCKED: <dependency>`. Exit codes: `0` success, `2` usage error, `3` API failure after retries.
+
 ### Create a feature
 
 Create a new feature: validate the slug, check for uniqueness, create the slug label on demand, publish the parent issue, and set up the feature branch. This is `/to-prd`'s entry point and the first verb that writes to GitHub. One logical operation performed in four steps, with a pre-flight slug-length check before any API call.
@@ -424,6 +428,7 @@ The title goes in GitHub's native title field. The PRD content goes in the issue
 - If HEAD is not the project's main branch, warn the maintainer and confirm before branching.
 - If the working tree is dirty with anything other than the grill's own `GLOSSARY.md` / `docs/adr/` edits, ask the maintainer how to proceed before branching. The grill's edits are expected here: they come along onto the new branch and become its first commit.
 - Create a git branch named with the feature slug from the current HEAD and switch to it.
+- Push the new branch to the **Shared remote** at once, with upstream tracking, so every machine sees the feature from the start (ADR-0011): `git push -u <shared-remote> <slug>`. The Shared remote is the remote named by `RUNNER_SHARED_REMOTE` when that is set, `origin` otherwise. When the repo has no remote of that name, skip the push (one-machine setup). A refused or failed push does not undo the feature: report git's error to the maintainer, who pushes the branch by hand.
 
 This step is binding-agnostic and follows the same convention as the local-markdown binding.
 

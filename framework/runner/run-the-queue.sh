@@ -6,6 +6,22 @@
 #   run-the-queue.sh [--model <id>] [--no-caffeinate] --feature <slug>       # loop mode — one feature
 #   run-the-queue.sh [--model <id>] [--no-caffeinate] --issue <feature>/<NN> # single-dispatch mode
 #
+# `--idle <seconds>` (drain and loop modes only) keeps the runner alive: when
+# a pass finds nothing to do it sleeps <seconds> and starts a fresh pass
+# (re-discovering features, re-syncing, re-snapshotting) instead of exiting.
+# Each pass re-runs the steps that ended Blocked on the previous pass, and
+# writes its own `pass-<NNNN>/SUMMARY.md` when it dispatched anything; the
+# run's SUMMARY.md indexes the passes. SIGINT/SIGTERM — during a dispatch or
+# during the sleep — stops cleanly with stop reason `interrupted`. Without
+# `--idle` the runner drains once and exits, as before.
+#
+# With RUNNER_FORMANN_DIR set, the runner first fast-forwards its own Formann
+# checkout there to RUNNER_FORMANN_REF (`<remote>/<branch>`, default
+# `origin/main`) and re-executes from it (see "Runner's Formann" below); a
+# refusal is `preflight-abort: runner-formann`. With --idle each later pass
+# repeats the update: `formann-refused` skips the pass, `formann-updated` ends
+# the run, which then re-executes on the new code.
+#
 # `--model <id>` overrides the model for every dispatch in the run (implement
 # and each walk item). An unknown id is rejected by the CLI inside the
 # container and surfaces as a normal dispatch failure. Without the flag,
@@ -34,16 +50,28 @@
 # `tracker-snapshot` call, so issues unblocked mid-run by an earlier
 # success become selectable without restarting.
 #
+# Once a feature has drained (drain mode and --feature), the runner runs the
+# consumer's optional post-drain steps (`runner/post-drain.md`) on the host,
+# still under the feature's Claim, then releases it — see post-drain.sh.
+#
 # Stop reasons (drain mode):
 #   - `completed`             — every discovery slug considered.
 #   - `interrupted`           — Ctrl-C during the outer loop.
 #   - `propagation-error`     — parking-ref publish failed inside a feature loop.
 #   - `runaway-halt (<ref>)`  — post-implement step pushed issue back to eligible.
 #   - `preflight-abort: discovery` — `tracker-snapshot --list` failed.
+#   A feature another runner holds a Claim on (claim.sh) is skipped with a
+#   `held-by <machine>` row; not a stop. A feature whose claim another runner
+#   took over mid-drain stops after the dispatch in flight with a
+#   `taken-over-by <machine>` row; not a stop either.
 #
 # Stop reasons (narrowed modes):
 #   - `queue-empty` / `interrupted` / `snapshot-failed` / `propagation-error`.
 #   - `runaway-halt (<ref>)`  — post-implement step pushed issue back to eligible.
+#   - `held-by <machine>` / `claim-failed` (--feature) — the feature's Claim
+#     is another runner's, or could not be taken.
+#   - `taken-over-by <machine>` (--feature) — a heartbeat found the claim
+#     taken over; the loop stopped after the dispatch in flight.
 #   - `feature-restricted (refused: <reason>)` (--feature).
 #   - `single-dispatch (success|failure|refused: <reason>)` (--issue).
 #
@@ -76,6 +104,20 @@ source "$HERE/resolve-manifest.sh"
 # which the progress-line formatters below also use.
 # shellcheck source=liveness.sh
 source "$HERE/liveness.sh"
+# claim.sh provides the Claim module (claim take|release, claim_verdict):
+# the runner's hold on the feature it drains, a ref on the Shared remote.
+# shellcheck source=claim.sh
+source "$HERE/claim.sh"
+# formann-update.sh provides the Runner's Formann updater
+# (formann_self_update): the runner's own Formann checkout, fast-forwarded to
+# the configured ref before every drain.
+# shellcheck source=formann-update.sh
+source "$HERE/formann-update.sh"
+# post-drain.sh provides the Post-drain phase (check_post_drain_manifest,
+# maybe_run_post_drain, format_post_drain_section): host-side steps run once a
+# feature has drained, before its Claim is released.
+# shellcheck source=post-drain.sh
+source "$HERE/post-drain.sh"
 
 # === Configuration =========================================================
 
@@ -177,15 +219,32 @@ next_eligible_ref() {
     <<<"$snapshot_json"
 }
 
+# Blocked passes at which a Blocked step stops being retried and the issue is
+# left for a human (issue #3; PRD user story 33).
+RUNNER_BLOCKED_PASS_LIMIT=3
+
 # Classify the per-item control-flow action after a post-implement step runs.
 # Inputs:
 #   $1 — post-item status string (already extracted from the snapshot by the
 #         caller; NOT a snapshot JSON blob)
 #   $2 — Dispatch exit code
+#   $3 — blocked: `true` when the step's result ended `BLOCKED: <dependency>`
+#         (optional; default `false`)
+#   $4 — blocked-passes: the issue's Blocked pass count read from the tracker,
+#         including this pass (optional; a missing or non-integer value counts
+#         as 0)
 #
 # Output (stdout): exactly one of `stop-success`, `continue`, `terminate-run`,
-# or `fail`.
+# `blocked`, `left-for-human`, or `fail`. Guards, in order:
 #
+#   fail           — nonzero exit (a BLOCKED: line does not soften a failed
+#                    dispatch).
+#   blocked        — exit 0, blocked, passes < 3: stop the walk for this
+#                    issue, change no state, write no abort flag; a later
+#                    pass re-runs it.
+#   left-for-human — exit 0, blocked, passes >= 3: the same outcome as a walk
+#                    exhausted at in-review (no abort flag).
+#   Status-based actions apply only when not blocked:
 #   stop-success   — exit 0 AND status is done, wontfix, or empty (github-issues
 #                    binding closes the work-item parent on done, so absence is
 #                    the binding-native signal for done).
@@ -201,10 +260,20 @@ next_eligible_ref() {
 #
 # Pure logic — no I/O beyond stdin/stdout. Sourceable from bats.
 classify_item_action() {
-  local status="$1" exit_code="$2"
+  local status="$1" exit_code="$2" blocked="${3:-false}" passes="${4:-0}"
 
   if [ "$exit_code" != "0" ]; then
     echo "fail"
+    return 0
+  fi
+
+  if [ "$blocked" = "true" ]; then
+    case "$passes" in ''|*[!0-9]*) passes=0 ;; esac
+    if [ "$passes" -ge "$RUNNER_BLOCKED_PASS_LIMIT" ]; then
+      echo "left-for-human"
+    else
+      echo "blocked"
+    fi
     return 0
   fi
 
@@ -413,34 +482,147 @@ extract_result_summary() {
   return 0
 }
 
-# Pre-dispatch sync-base selector. Pure function — takes a pre-computed
-# parking-ref relation and returns which tip the runner-checkout should sync
-# to before each dispatch.
+# The dependency a step named in its closing `BLOCKED: <dependency>` line, or
+# empty. The line must be the last non-blank line of the terminal `result`
+# event's text (the step contract: "end your final message with the line").
+# Surrounding whitespace is trimmed; an empty dependency is not Blocked.
+# Fail-safe: any parse surprise yields empty.
 #
-# Input:
-#   $1 — parking_rel: absent | equal | ahead | behind | diverged
-#          absent   — parking ref doesn't exist yet (no prior runner output)
-#          equal    — parking ref tip equals host's branch tip
-#          ahead    — parking ref tip is strictly ahead of host's branch tip
-#          behind   — host's branch tip is strictly ahead of parking ref tip
-#          diverged — neither tip is an ancestor of the other
+# Pure — reads only the named file. Sourceable from bats.
+blocked_dependency() {
+  local stream_file="$1"
+  local result_line
+  result_line="$(_terminal_result_line "$stream_file")"
+  [ -n "$result_line" ] || return 0
+  printf '%s' "$result_line" | jq -r '
+    (.result // "") | if type == "string" then . else "" end
+    | split("\n") | map(sub("[[:space:]]+$"; "")) | map(select(length > 0))
+    | (last // "")
+    | (capture("^BLOCKED:[[:space:]]*(?<dep>.*)$").dep // "")
+  ' 2>/dev/null || true
+}
+
+# The issue's Blocked pass count, read from the tracker through the active
+# binding's `blocked-passes` script on the role surface (Blocked comments
+# since the issue's latest Implementation comment — see each binding's
+# BINDING.md). Reads committed state in the runner-checkout, the same view
+# take_snapshot classifies from. Prints the integer; returns 1 (with a
+# stderr diagnostic) when the script is absent, fails, or prints no integer.
 #
-# Output (stdout): host-branch | parking-ref
-#
-# Rules: absent → host-branch; equal → host-branch; ahead → parking-ref;
-#        behind → host-branch; diverged → parking-ref.
-# Rationale for diverged → parking-ref: the runner's chain is authoritative;
-# the maintainer reconciles via `git pull runner <feature>`.
-select_sync_base() {
-  local parking_rel="${1:-}"
-  case "$parking_rel" in
-    absent|equal|behind) echo "host-branch" ;;
-    ahead|diverged)      echo "parking-ref" ;;
-    *)
-      echo "runner: select_sync_base: unknown relation '$parking_rel'" >&2
+# Args: $1 = binding-native ref.
+read_blocked_passes() {
+  local ref="$1"
+  local script="$HOST_REPO/docs/formann/issue-tracker/blocked-passes"
+  if [ ! -x "$script" ]; then
+    echo "runner: blocked-passes: $script not found or not executable" >&2
+    return 1
+  fi
+  local rc=0 out
+  out="$(SNAPSHOT_CHECKOUT_DIR="$HOST_CHECKOUT" "$script" "$ref")" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "runner: blocked-passes exited non-zero ($rc) for $ref" >&2
+    return 1
+  fi
+  case "$out" in
+    ''|*[!0-9]*)
+      echo "runner: blocked-passes printed no count for $ref" >&2
       return 1
       ;;
   esac
+  printf '%s\n' "$out"
+}
+
+# Pre-dispatch sync-base selector (#5). Pure function — takes pre-computed
+# relations and returns which tip the runner-checkout should sync to before
+# each dispatch.
+#
+# Inputs (each: absent | equal | behind | ahead | diverged):
+#   $1 — remote_rel:  the Shared remote's branch relative to the host branch
+#   $2 — parking_rel: the parking ref relative to the host branch
+#          absent   — the ref doesn't exist
+#          equal    — its tip equals the host branch's tip
+#          behind   — the host branch is strictly ahead of it
+#          ahead    — it is strictly ahead of the host branch
+#          diverged — neither tip is an ancestor of the other
+#        An absent host branch is the empty history: every present ref is
+#        `ahead` of it.
+#   $3 — remote_to_parking (optional): the remote branch relative to the
+#        parking ref, same vocabulary. Read only when both $1 and $2 are
+#        ahead/diverged — the one case the host-relative pair cannot order.
+#
+# Output (stdout): remote-branch | host-branch | parking-ref
+#
+# Rule: the most advanced ref that the others are ancestors of wins.
+#   - parking ref ahead/diverged, remote not: parking-ref (the runner's chain
+#     is authoritative; a diverged chain parks at publish time, #2).
+#   - remote ahead, parking ref not: remote-branch.
+#   - both ahead/diverged: remote-branch only when the remote is strictly
+#     ahead of the parking ref ($3 = ahead); otherwise parking-ref. The
+#     parking ref is force-updated by the next propagation, so building on a
+#     remote that lacks its commits would discard them; parking-ref never
+#     does, and the ff-only publish parks the feature if the two diverged.
+#   - neither ahead/diverged: host-branch (including a diverged remote:
+#     local work is never dropped; publish parks instead).
+select_sync_base() {
+  local remote_rel="${1:-}" parking_rel="${2:-}" remote_to_parking="${3:-}"
+  local rel
+  for rel in "$remote_rel" "$parking_rel"; do
+    case "$rel" in
+      absent|equal|behind|ahead|diverged) ;;
+      *)
+        echo "runner: select_sync_base: unknown relation '$rel'" >&2
+        return 1
+        ;;
+    esac
+  done
+  case "$remote_to_parking" in
+    ''|absent|equal|behind|ahead|diverged) ;;
+    *)
+      echo "runner: select_sync_base: unknown relation '$remote_to_parking'" >&2
+      return 1
+      ;;
+  esac
+  case "$parking_rel" in
+    ahead|diverged)
+      case "$remote_rel" in
+        ahead|diverged)
+          if [ "$remote_to_parking" = "ahead" ]; then
+            echo "remote-branch"
+          else
+            echo "parking-ref"
+          fi
+          ;;
+        *) echo "parking-ref" ;;
+      esac
+      ;;
+    *)
+      if [ "$remote_rel" = "ahead" ]; then
+        echo "remote-branch"
+      else
+        echo "host-branch"
+      fi
+      ;;
+  esac
+}
+
+# Relation of one ref tip to a base tip, in select_sync_base's vocabulary.
+# An empty base is the empty history (every present tip is `ahead`).
+# Args: $1 = repo, $2 = base tip (may be empty), $3 = tip (may be empty).
+ref_relation() {
+  local repo="$1" base="$2" tip="$3"
+  if [ -z "$tip" ]; then
+    echo "absent"
+  elif [ -z "$base" ]; then
+    echo "ahead"
+  elif [ "$tip" = "$base" ]; then
+    echo "equal"
+  elif git -C "$repo" merge-base --is-ancestor "$tip" "$base" 2>/dev/null; then
+    echo "behind"
+  elif git -C "$repo" merge-base --is-ancestor "$base" "$tip" 2>/dev/null; then
+    echo "ahead"
+  else
+    echo "diverged"
+  fi
 }
 
 # Select the next feature the outer drain loop should consider. Analogue
@@ -622,8 +804,9 @@ format_window_giveup_line() {
 # and a trailing `stop reason: <reason>` line. The `issue` column shows the
 # binding-native `ref`; `feature` and `nn` are ignored for this view. Column
 # widths size to the longest entry, bounded below by the header label widths.
-# The `propagation` column shows `propagated → host`, `parked → runner/<f>`,
-# or `-` when propagation was not reached.
+# The `propagation` column shows the `propagate_feature` indicator
+# (`published → …`, `parked → runner/<f>`, `local-only (…)`), or `-` when
+# propagation was not reached.
 format_end_of_run_table() {
   local stop_reason="$1"
   # `length()` returns bytes on byte-mode awk (BSD awk in non-UTF-8 locales,
@@ -687,15 +870,18 @@ format_end_of_run_table() {
 # `<NN>.summary.md` for each colon-separated suffix in `step_logs` (e.g.
 # `01-review`, `01-review-and-gate:02-fix:03-review-and-gate`);
 # `propagation` is the indicator string from `propagate_feature` —
-# `propagated → host`, `parked → runner/<branch>`, or empty). The
+# `published → <remote>/<branch>`, `parked → runner/<branch>`,
+# `local-only (…)`, or empty). The
 # `propagation` column shows the indicator verbatim, or `-` when empty.
 # An end-of-run "## Unpulled parked work" section follows the table whenever
 # any dispatch parked; it is omitted entirely when no dispatch parked.
 # `end_state` is the verb used in the run line — "ended" or "interrupted".
 # Optional $7 = model id (when set, appended to the run line as ", model: <id>").
+# Optional $8 = the Runner's Formann label (when set, a "- Formann: <label>"
+# line follows the run line).
 format_summary_md() {
   local feature="$1" ts="$2" start_clock="$3" end_clock="$4" end_state="$5" stop_reason="$6" \
-        model="${7:-}"
+        model="${7:-}" formann="${8:-}"
   # Capture once so the table awk and the parked-work aggregator both see the
   # same records without the caller having to materialize them twice.
   local records
@@ -705,6 +891,9 @@ format_summary_md() {
     printf -- '- Run: %s (started %s, %s %s, model: %s)\n' "$ts" "$start_clock" "$end_state" "$end_clock" "$model"
   else
     printf -- '- Run: %s (started %s, %s %s)\n' "$ts" "$start_clock" "$end_state" "$end_clock"
+  fi
+  if [ -n "$formann" ]; then
+    printf -- '- Formann: %s\n' "$formann"
   fi
   printf -- '- Stop reason: %s\n\n' "$stop_reason"
   printf '| issue | outcome | duration | propagation | logs |\n'
@@ -743,24 +932,28 @@ format_summary_md() {
 #
 # Input lines (one record per line) — encounter order is preserved:
 #   F|<feature>|drained
+#   F|<feature>|parked        (drain stopped: the Shared remote refused a push)
 #   F|<feature>|skipped:<reason>
 #   F|<feature>|feature-snapshot-failed
 #   I|<feature>|<nn>|<ref>|<outcome>|<duration>|<review_present>|<attempt_count>|<propagation>
 #
-# `I` rows belong to the most recent preceding `F|<slug>|drained` section.
+# `I` rows belong to the most recent preceding `F|<slug>|drained` or
+# `F|<slug>|parked` section.
 # `step_logs` is a colon-separated list of walk-step log suffixes (e.g. `01-review`)
 # alongside `<ref>.summary.md`. `propagation` is the indicator string from
-# `propagate_feature` — `propagated → host`, `parked → runner/<branch>`,
-# or empty. Summary paths in multi-feature mode embed the feature segment of the
+# `propagate_feature` — `published → <remote>/<branch>`,
+# `parked → runner/<branch>`, `local-only (…)`, or empty. Summary paths in multi-feature mode embed the feature segment of the
 # ref (`<feature>/<NN>.summary.md`) so per-issue artifacts don't collide across
 # features that share `<NN>`. The `propagation` column shows the indicator
 # verbatim, or `-` when empty; an end-of-run "## Unpulled parked work"
 # section follows when any dispatch parked, and is omitted entirely when no
 # dispatch parked.
 # Optional $6 = model id (when set, appended to the run line as ", model: <id>").
+# Optional $7 = the Runner's Formann label (when set, a "- Formann: <label>"
+# line follows the run line).
 format_multi_feature_summary_md() {
   local ts="$1" start_clock="$2" end_clock="$3" end_state="$4" stop_reason="$5" \
-        model="${6:-}"
+        model="${6:-}" formann="${7:-}"
   # Capture once so the per-feature renderer and `format_parked_ledger` both
   # see the same records.
   local records
@@ -770,6 +963,9 @@ format_multi_feature_summary_md() {
     printf -- '- Run: %s (started %s, %s %s, model: %s)\n' "$ts" "$start_clock" "$end_state" "$end_clock" "$model"
   else
     printf -- '- Run: %s (started %s, %s %s)\n' "$ts" "$start_clock" "$end_state" "$end_clock"
+  fi
+  if [ -n "$formann" ]; then
+    printf -- '- Formann: %s\n' "$formann"
   fi
   printf -- '- Stop reason: %s\n\n' "$stop_reason"
   printf '%s' "$records" | awk -F'|' '
@@ -798,6 +994,21 @@ format_multi_feature_summary_md() {
         emit_table_header();
         in_drained = 1;
         in_table = 1;
+      }
+      else if (outcome == "parked") {
+        printf "## %s — parked (Shared remote refused the fast-forward)\n\n", feature;
+        emit_table_header();
+        in_drained = 1;
+        in_table = 1;
+      }
+      else if (substr(outcome, 1, 14) == "taken-over-by ") {
+        printf "## %s — %s (stopped after its current dispatch)\n\n", feature, outcome;
+        emit_table_header();
+        in_drained = 1;
+        in_table = 1;
+      }
+      else if (substr(outcome, 1, 8) == "held-by ") {
+        printf "## %s — %s\n\n", feature, outcome;
       }
       else if (outcome == "feature-snapshot-failed") {
         printf "## %s — feature-snapshot-failed\n\n", feature;
@@ -841,7 +1052,9 @@ format_multi_feature_summary_md() {
 # Pure aggregator for the parked-work ledger. Reads dispatch records
 # (`feature|nn|ref|label|duration|review_present|attempt_count|propagation`)
 # on stdin and emits the "## Unpulled parked work" SUMMARY.md section when
-# one or more dispatches have `propagation == parked`. Emits nothing when no
+# one or more dispatches left work only on the parking ref (`propagation`
+# contains `parked → runner/` — a refused Shared-remote push, or a refused
+# host fast-forward under `local-only`). Emits nothing when no
 # dispatch parked. Groups by feature; counts per-feature parked dispatches.
 # Called by `format_summary_md` and `format_multi_feature_summary_md` so the
 # end-of-run section's shape lives in exactly one place.
@@ -853,7 +1066,7 @@ format_multi_feature_summary_md() {
 #   …one line per feature with at least one parked dispatch…
 format_parked_ledger() {
   awk -F'|' '
-    NF >= 8 && $8 ~ /^parked/ {
+    NF >= 8 && $8 ~ /parked → runner\// {
       if (!(($1) in parked)) { order[++n] = $1 }
       parked[$1]++
     }
@@ -872,13 +1085,18 @@ format_parked_ledger() {
 
 # SUMMARY.md content for a pre-flight abort. Replaces the per-issue
 # table with a single line naming the failing invariant.
+# Optional $6 = the Runner's Formann label (when set, a "- Formann: <label>"
+# line follows the run line).
 format_preflight_summary_md() {
-  local feature="$1" ts="$2" start_clock="$3" abort_clock="$4" invariant="$5"
+  local feature="$1" ts="$2" start_clock="$3" abort_clock="$4" invariant="$5" formann="${6:-}"
   if [ -z "$feature" ]; then
     feature="(undetermined)"
   fi
   printf '# AFK runner — %s\n\n' "$feature"
   printf -- '- Run: %s (started %s, aborted %s)\n' "$ts" "$start_clock" "$abort_clock"
+  if [ -n "$formann" ]; then
+    printf -- '- Formann: %s\n' "$formann"
+  fi
   printf -- '- Stop reason: preflight-abort: %s\n\n' "$invariant"
   printf 'Pre-flight invariant `%s` failed before the loop began. See `runner.log` for details.\n' "$invariant"
 }
@@ -946,6 +1164,70 @@ write_abort_flag() {
     "$flag_type" "$dispatch" "$at" "$exit_code" "$rel_log" >"$abort_feature_dir/$nn"
 }
 
+# === Blocked-step markers ==================================================
+#
+# A step that ends Blocked (below the pass limit) leaves a marker at
+# `<host>/.runner-state/blocked/<feature>/<nn>` naming the step. Run
+# selection reads it to re-run the walk from that step on a later run without
+# re-running /implement. The marker only decides *what* to retry; the pass
+# count always comes from the tracker (read_blocked_passes), so a runner on
+# another machine continues the same count. Not an abort flag: it never stops
+# an issue from being dispatched.
+#
+# File shape (one `key: value` per line):
+#   step: <manifest item label>
+#   dependency: <dependency>
+#   at: <UTC timestamp>
+#
+# All three helpers are no-ops (empty read) when HOST_BLOCKED_DIR is unset.
+
+# Args: $1=feature  $2=nn  $3=step label  $4=dependency
+write_blocked_marker() {
+  local feature="$1" nn="$2" step="$3" dep="$4"
+  [ -n "${HOST_BLOCKED_DIR:-}" ] || return 0
+  mkdir -p "$HOST_BLOCKED_DIR/$feature"
+  printf 'step: %s\ndependency: %s\nat: %s\n' \
+    "$step" "$dep" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >"$HOST_BLOCKED_DIR/$feature/$nn"
+}
+
+# Args: $1=feature  $2=nn
+clear_blocked_marker() {
+  local feature="$1" nn="$2"
+  [ -n "${HOST_BLOCKED_DIR:-}" ] || return 0
+  rm -f "$HOST_BLOCKED_DIR/$feature/$nn"
+}
+
+# Print the step label a marker names, or nothing when there is no marker.
+# Args: $1=feature  $2=nn
+blocked_marker_step() {
+  local feature="$1" nn="$2"
+  [ -n "${HOST_BLOCKED_DIR:-}" ] || return 0
+  local f="$HOST_BLOCKED_DIR/$feature/$nn"
+  [ -f "$f" ] || return 0
+  sed -n 's/^step: //p' "$f" | head -n 1
+}
+
+# Issues whose walk ended Blocked during this pass (`<feature>/<nn>`, one per
+# line). A Blocked issue is retried on the next pass, never twice in one pass.
+# Without --idle a run is one pass, so the next pass is the next run; with
+# --idle, run_idle clears this at the start of every pass.
+RUN_BLOCKED_THIS_RUN=""
+
+# Print the step to retry for an issue, or nothing when it is not a Blocked
+# retry. A retry is an AFK issue at in-review with a Blocked marker that did
+# not end Blocked earlier in this run. The caller checks abort flags.
+#
+# Args: $1=feature  $2=nn  $3=status  $4=type
+blocked_retry_step() {
+  local feature="$1" nn="$2" status="$3" type="$4"
+  [ "$status" = "in-review" ] || return 0
+  [ "$type" = "AFK" ] || return 0
+  if printf '%s\n' "$RUN_BLOCKED_THIS_RUN" | grep -Fxq -- "$feature/$nn"; then
+    return 0
+  fi
+  blocked_marker_step "$feature" "$nn"
+}
+
 # === Per-run state =========================================================
 #
 # Globals describing the in-flight run. Set early (so even pre-flight
@@ -965,7 +1247,7 @@ RUN_PREFLIGHT_INVARIANT=""
 RUN_DISPATCHES=()
 # Per-feature outcome records for drain mode (bash 3.2 friendly array of
 # `feature|outcome` strings, in encounter order). `outcome` is one of
-# `drained`, `skip:<reason>`, `feature-snapshot-failed` (see the gate
+# `drained`, `parked`, `skip:<reason>`, `feature-snapshot-failed` (see the gate
 # evaluator). Single-feature / single-issue modes don't populate this.
 RUN_FEATURE_OUTCOMES=()
 # Per-issue artifact layout. `flat` (default — single-feature / single-issue
@@ -975,10 +1257,20 @@ RUN_FEATURE_OUTCOMES=()
 RUN_LOG_LAYOUT="flat"
 RUNNER_TEE_PID=""
 RUNNER_LOG_FIFO=""
-RUNNER_LAST_PROPAGATION=""   # 'propagated → host' | 'parked → runner/<branch>' | '' (set by propagate_feature)
+RUNNER_LAST_PROPAGATION=""   # 'published → <remote>/<branch>' | 'parked → runner/<branch>' | 'local-only (<host indicator>)' | '' (set by propagate_feature)
+RUNNER_PUBLISH_PARKED=0      # 1 when propagate_feature's Shared-remote push was refused; stops the loop on the feature
+RUNNER_CLAIM_LOST=""          # 'taken-over-by <machine>' once a heartbeat found the claim taken over (heartbeat_claim); stops the loop on the feature after the dispatch in flight
 RUN_SWEPT_REFS=()     # parking refs deleted by sweep_stale_parking_refs; populated during pre-flight
 DISCOVERY_JSON=""     # populated by check_discovery pre-flight invariant
 RESOLVED_MANIFEST=""  # populated by check_manifest pre-flight invariant; tab-delimited label<TAB>path pairs
+# Idle loop (--idle) state. RUN_PASS_DIR is where the current pass's per-issue
+# artifacts land (`<run-dir>/pass-<NNNN>`); empty without --idle, so dispatches
+# write to RUN_DIR as before. RUN_PASSES is the pass index (`n|stop reason|
+# dispatch count` strings) that finalize_run renders into SUMMARY.md.
+RUN_PASS=0
+RUN_PASS_DIR=""
+RUN_PASSES=()
+RUN_IDLE_PASSES=0     # passes that dispatched nothing (no pass dir written)
 
 # Set RUN_TS / RUN_DIR / RUN_START_CLOCK and create the per-run dir under
 # `<host>/.runner-state/runs/<ts>/`. Idempotent within a run; no-op if
@@ -1016,6 +1308,10 @@ start_runner_log_capture() {
   # also writing to runner.log.
   tee "$RUN_DIR/runner.log" <"$RUNNER_LOG_FIFO" &
   RUNNER_TEE_PID=$!
+  # Keep the original stdout/stderr on fds 7/8, so a re-exec after a Formann
+  # update (finalize_run → runner_formann_reexec) hands the new process the
+  # operator's terminal (or the service log), not this run's closed fifo.
+  exec 7>&1 8>&2
   exec >"$RUNNER_LOG_FIFO" 2>&1
 }
 
@@ -1026,7 +1322,12 @@ start_runner_log_capture() {
 # Called as the last step of `finalize_run`, after every other write.
 stop_runner_log_capture() {
   if [ -z "${RUNNER_TEE_PID:-}" ]; then return 0; fi
-  exec >&- 2>&-
+  if [ "${1:-}" = "--restore" ]; then
+    exec >&7 2>&8
+  else
+    exec >&- 2>&-
+  fi
+  exec 7>&- 8>&-
   wait "$RUNNER_TEE_PID" 2>/dev/null || true
   rm -f "$RUNNER_LOG_FIFO"
   RUNNER_TEE_PID=""
@@ -1079,7 +1380,7 @@ start_wake_assertion() {
 # `attempt_count` (default 1) is the data hook for the retry slice; the
 # formatters render `(N attempts)` only when N > 1, so it is silent here.
 # `propagation` is the value of $RUNNER_LAST_PROPAGATION at record time —
-# `propagated → host`, `parked → runner/<branch>`, or empty when propagation
+# the `propagate_feature` indicator (`published → …`, `parked → …`, `local-only (…)`), or empty when propagation
 # was not reached.
 record_dispatch() {
   local feature="$1" nn="$2" ref="$3" label="$4" duration="$5" review="${6:-}" \
@@ -1098,7 +1399,7 @@ print_dispatch_records() {
 }
 
 # Append a per-feature outcome record (drain mode). `outcome` is one of
-# `drained`, `skip:<reason>`, or `feature-snapshot-failed`.
+# `drained`, `parked`, `skip:<reason>`, or `feature-snapshot-failed`.
 record_feature_outcome() {
   local feature="$1" outcome="$2"
   RUN_FEATURE_OUTCOMES+=("$feature|$outcome")
@@ -1106,7 +1407,7 @@ record_feature_outcome() {
 
 # Emit the interleaved F/I record stream that `format_multi_feature_summary_md`
 # consumes. Walks per-feature outcomes in encounter order; for each drained
-# feature, appends the matching `RUN_DISPATCHES` rows (those whose ref's
+# (or parked) feature, appends the matching `RUN_DISPATCHES` rows (those whose ref's
 # feature segment equals the feature). Skipped / feature-snapshot-failed
 # features contribute only the F record.
 print_multi_feature_records() {
@@ -1116,7 +1417,9 @@ print_multi_feature_records() {
     feature="${rec%%|*}"
     outcome="${rec#*|}"
     printf 'F|%s|%s\n' "$feature" "$outcome"
-    if [ "$outcome" = "drained" ] && [ "${#RUN_DISPATCHES[@]}" -gt 0 ]; then
+    if { [ "$outcome" = "drained" ] || [ "$outcome" = "parked" ] \
+          || [ "${outcome#taken-over-by }" != "$outcome" ]; } \
+        && [ "${#RUN_DISPATCHES[@]}" -gt 0 ]; then
       local d_rec d_feature
       for d_rec in "${RUN_DISPATCHES[@]}"; do
         d_feature="${d_rec%%|*}"
@@ -1141,6 +1444,9 @@ finalize_run() {
   # own reap, make sure no renderer outlives the run and no painted line
   # survives. No-op in the normal flow.
   stop_liveness_renderer
+  # Likewise the claim refresher — before the claim release below, so the
+  # release leases on the sha it last wrote.
+  stop_claim_refresher
 
   if [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ]; then
     local end_clock
@@ -1148,7 +1454,7 @@ finalize_run() {
     if [ -n "$RUN_PREFLIGHT_INVARIANT" ]; then
       format_preflight_summary_md \
         "$RUN_FEATURE" "$RUN_TS" "$RUN_START_CLOCK" "$end_clock" \
-        "$RUN_PREFLIGHT_INVARIANT" >"$RUN_DIR/SUMMARY.md"
+        "$RUN_PREFLIGHT_INVARIANT" "$(runner_formann_label)" >"$RUN_DIR/SUMMARY.md"
       printf '\nstop reason: preflight-abort: %s\n' "$RUN_PREFLIGHT_INVARIANT"
     else
       local end_state="ended"
@@ -1161,11 +1467,11 @@ finalize_run() {
       if [ "$RUN_MODE" = "drain" ]; then
         print_multi_feature_records | format_multi_feature_summary_md \
           "$RUN_TS" "$RUN_START_CLOCK" "$end_clock" \
-          "$end_state" "$stop_reason" "${ARG_MODEL:-}" >"$RUN_DIR/SUMMARY.md"
+          "$end_state" "$stop_reason" "${ARG_MODEL:-}" "$(runner_formann_label)" >"$RUN_DIR/SUMMARY.md"
       else
         print_dispatch_records | format_summary_md \
           "$RUN_FEATURE" "$RUN_TS" "$RUN_START_CLOCK" "$end_clock" \
-          "$end_state" "$stop_reason" "${ARG_MODEL:-}" >"$RUN_DIR/SUMMARY.md"
+          "$end_state" "$stop_reason" "${ARG_MODEL:-}" "$(runner_formann_label)" >"$RUN_DIR/SUMMARY.md"
       fi
     fi
     # Append swept parking refs section when at least one ref was swept. Both
@@ -1174,9 +1480,25 @@ finalize_run() {
     if [ "${#RUN_SWEPT_REFS[@]}" -gt 0 ]; then
       format_swept_refs_section >>"$RUN_DIR/SUMMARY.md"
     fi
+    if [ -z "$RUN_PREFLIGHT_INVARIANT" ]; then
+      format_post_drain_section >>"$RUN_DIR/SUMMARY.md"
+    fi
+    if [ -n "${ARG_IDLE:-}" ] && [ -z "$RUN_PREFLIGHT_INVARIANT" ]; then
+      format_passes_section >>"$RUN_DIR/SUMMARY.md"
+    fi
   fi
 
+  # A claim still held here means the drain did not reach its own release
+  # (interrupt, abort): release it so the next runner needn't wait it out.
+  claim_release_held
   release_lock
+  # A later idle pass found the Runner's Formann moved: this run has ended
+  # cleanly (summary written, claim and lock released); the updated runner
+  # takes over in this same process.
+  if [ "${RUNNER_FORMANN_REEXEC_PENDING:-0}" -eq 1 ] && [ "$rc" -eq 0 ]; then
+    stop_runner_log_capture --restore
+    runner_formann_reexec
+  fi
   # Drain runner.log before exiting so the operator never sees a
   # truncated tail. Must come after every other print — once this
   # returns, stdout/stderr are closed.
@@ -1190,6 +1512,7 @@ ARG_ISSUE_REF=""
 ARG_FEATURE=""
 ARG_MODEL=""
 ARG_NO_CAFFEINATE=0
+ARG_IDLE=""           # --idle <seconds>; empty = drain once and exit
 RUN_MODE=""           # "single" | "loop" | "drain", set by parse_args
 ISSUE_FEATURE=""
 ISSUE_NN=""
@@ -1235,8 +1558,20 @@ parse_args() {
         ARG_NO_CAFFEINATE=1
         shift
         ;;
+      --idle)
+        if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+          echo "runner: --idle requires an argument" >&2
+          exit 2
+        fi
+        if [[ ! "$2" =~ ^[1-9][0-9]*$ ]]; then
+          echo "runner: --idle must be a whole number of seconds > 0, got: $2" >&2
+          exit 2
+        fi
+        ARG_IDLE="$2"
+        shift 2
+        ;;
       -h|--help)
-        sed -n '2,64p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+        sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
         exit 0
         ;;
       *)
@@ -1254,6 +1589,10 @@ parse_args() {
     ISSUE_FEATURE="${BASH_REMATCH[1]}"
     ISSUE_NN="${BASH_REMATCH[2]}"
     RUN_MODE="single"
+    if [ -n "$ARG_IDLE" ]; then
+      echo "runner: --idle applies to drain and --feature modes, not --issue" >&2
+      exit 2
+    fi
   elif [ -n "$ARG_FEATURE" ]; then
     RUN_MODE="loop"
   else
@@ -1346,6 +1685,7 @@ resolve_host_repo() {
   HOST_CHECKOUT="$HOST_REPO/$RUNNER_CHECKOUT_PATH"
   HOST_RUNS="$HOST_REPO/$RUNNER_RUNS_PATH"
   HOST_ABORT_DIR="$HOST_REPO/$RUNNER_ABORT_PATH"
+  HOST_BLOCKED_DIR="$HOST_REPO/$RUNNER_BLOCKED_PATH"
 }
 
 # === Pre-flight ============================================================
@@ -1472,6 +1812,41 @@ resolve_default_branch() {
   return 1
 }
 
+# Put the runner-checkout's `origin` back to the host repo (#4, upstream
+# jervell/formann#96). The checkout is mounted read-write into the sandbox, so a
+# dispatch that tried to push could rewrite `origin` (one set it to the GitHub
+# URL and pushed), remove it, or give it a separate push URL. Every sync below
+# fetches from `origin` and must fetch from host, so a rewritten remote halted
+# the next run with `preflight-abort: runner-checkout`. Run before every sync,
+# whatever the previous dispatch left; one runner.log line (stderr) per repair,
+# silence when `origin` is already right. Only `origin` is repaired: other
+# remotes a dispatch added are never fetched by the runner.
+reset_runner_checkout_origin() {
+  local current push_url
+  if ! current="$(git -C "$HOST_CHECKOUT" remote get-url origin 2>/dev/null)"; then
+    if ! git -C "$HOST_CHECKOUT" remote add origin "$HOST_REPO" >&2; then
+      echo "runner: reset_runner_checkout_origin: git remote add origin $HOST_REPO failed" >&2
+      return 1
+    fi
+    echo "runner: runner-checkout origin was '(missing)'; reset to $HOST_REPO" >&2
+  elif [ "$current" != "$HOST_REPO" ]; then
+    if ! git -C "$HOST_CHECKOUT" remote set-url origin "$HOST_REPO" >&2; then
+      echo "runner: reset_runner_checkout_origin: git remote set-url origin $HOST_REPO failed" >&2
+      return 1
+    fi
+    echo "runner: runner-checkout origin was '$current'; reset to $HOST_REPO" >&2
+  fi
+  push_url="$(git -C "$HOST_CHECKOUT" config --get-all remote.origin.pushurl 2>/dev/null | paste -sd ' ' -)"
+  if [ -n "$push_url" ]; then
+    if ! git -C "$HOST_CHECKOUT" config --unset-all remote.origin.pushurl >&2; then
+      echo "runner: reset_runner_checkout_origin: git config --unset-all remote.origin.pushurl failed" >&2
+      return 1
+    fi
+    echo "runner: runner-checkout origin push URL was '$push_url'; cleared" >&2
+  fi
+  return 0
+}
+
 # 2b. Runner-checkout is synced to the named branch's tip on host.
 #     Branch-parameterized: the runner-checkout is a single clone that
 #     gets branch-switched per drained feature inside the drain loop.
@@ -1488,6 +1863,11 @@ ensure_runner_checkout_on_branch() {
   local branch="$1"
   if [ -z "$branch" ]; then
     echo "runner: ensure_runner_checkout_on_branch: empty branch" >&2
+    return 1
+  fi
+
+  # Every git fetch below reads `origin`; repair it first (#4).
+  if ! reset_runner_checkout_origin; then
     return 1
   fi
 
@@ -1558,14 +1938,43 @@ ensure_runner_checkout_on_branch() {
   host_tip="$(git -C "$HOST_REPO" rev-parse --verify "refs/heads/$branch" 2>/dev/null || true)"
   parking_tip="$(git -C "$HOST_REPO" rev-parse --verify "refs/remotes/runner/$branch" 2>/dev/null || true)"
 
-  if [ -z "$host_tip" ] && [ -z "$parking_tip" ]; then
-    # Neither the host branch nor a parking ref exists yet — first dispatch
-    # for a slug whose branch was never pre-created on host. Initialize the
-    # runner-checkout's branch from the default branch's *current host tip*:
-    # resolve the default deliberately (resolve_default_branch, #77), fetch it
-    # at sync time, and base the new branch on the fresh tracking ref. The
-    # first propagation's `<slug>:<slug>` refspec is create-on-missing and
-    # will create refs/heads/<slug> on host.
+  # The Shared remote's branch (#5, ADR-0011). The host repo reads it (with
+  # the host's credentials) into refs/remotes/<shared-remote>/<branch>; the
+  # runner-checkout later fetches it from host, like the parking ref. A host
+  # repo without the remote keeps the one-machine behaviour. ls-remote first
+  # tells "branch absent on the remote" from "remote unreachable": the latter
+  # fails the sync (the caller records fetch-failed), since building without
+  # knowing the remote's tip could start a feature twice.
+  local shared_remote="${RUNNER_SHARED_REMOTE:-origin}" shared_url remote_tip=""
+  shared_url="$(git -C "$HOST_REPO" remote get-url "$shared_remote" 2>/dev/null || true)"
+  if [ -n "$shared_url" ]; then
+    local ls_out ls_rc=0
+    ls_out="$(GIT_TERMINAL_PROMPT=0 git -C "$HOST_REPO" ls-remote --heads \
+        "$shared_remote" "refs/heads/$branch" 2>&1)" || ls_rc=$?
+    if [ "$ls_rc" -ne 0 ]; then
+      printf 'runner: ensure_runner_checkout_on_branch: cannot read %s/%s from the Shared remote:\n%s\n' \
+        "$shared_remote" "$branch" "$ls_out" >&2
+      return 1
+    fi
+    remote_tip="$(printf '%s\n' "$ls_out" | awk -v r="refs/heads/$branch" '$2 == r { print $1; exit }')"
+    if [ -n "$remote_tip" ]; then
+      if ! GIT_TERMINAL_PROMPT=0 git -C "$HOST_REPO" fetch --quiet "$shared_remote" \
+          "+refs/heads/$branch:refs/remotes/$shared_remote/$branch" >&2; then
+        echo "runner: ensure_runner_checkout_on_branch: cannot read $shared_remote/$branch from the Shared remote: fetch failed" >&2
+        return 1
+      fi
+      remote_tip="$(git -C "$HOST_REPO" rev-parse --verify "refs/remotes/$shared_remote/$branch" 2>/dev/null || true)"
+    fi
+  fi
+
+  if [ -z "$host_tip" ] && [ -z "$parking_tip" ] && [ -z "$remote_tip" ]; then
+    # The branch is missing everywhere — first dispatch for a slug whose
+    # branch was never created. Initialize the runner-checkout's branch from
+    # the default branch's *current host tip*: resolve the default
+    # deliberately (resolve_default_branch, #77), fetch it at sync time, and
+    # base the new branch on the fresh tracking ref. The first propagation's
+    # `<slug>:<slug>` refspec is create-on-missing and will create
+    # refs/heads/<slug> on host; the Shared remote gets it right here.
     local default_branch
     if ! default_branch="$(resolve_default_branch)"; then
       echo "runner: ensure_runner_checkout_on_branch: default-branch resolution failed (lazy init for $branch)" >&2
@@ -1602,54 +2011,73 @@ ensure_runner_checkout_on_branch() {
       echo "runner: ensure_runner_checkout_on_branch: git reset --hard origin/$default_branch (lazy init) failed" >&2
       return 1
     fi
+    # Push the new branch to the Shared remote at once (#5), from the host
+    # with the host's credentials, so it is visible to every machine before
+    # the first dispatch. No `+`, no `--force`: the remote branch was absent
+    # a moment ago, and a branch that appeared since is never overwritten.
+    if [ -n "$shared_url" ]; then
+      local new_tip push_stderr push_rc=0
+      new_tip="$(git -C "$HOST_CHECKOUT" rev-parse --verify HEAD)"
+      push_stderr="$(GIT_TERMINAL_PROMPT=0 git -C "$HOST_REPO" push --quiet \
+          "$shared_remote" "${new_tip}:refs/heads/${branch}" 2>&1)" || push_rc=$?
+      if [ "$push_rc" -ne 0 ]; then
+        printf 'runner: ensure_runner_checkout_on_branch: could not push the new branch %s to %s/%s:\n%s\n' \
+          "$branch" "$shared_remote" "$branch" "$push_stderr" >&2
+        return 1
+      fi
+      echo "runner: created $branch from $default_branch and pushed it to $shared_remote/$branch" >&2
+    fi
   else
-    local parking_rel sync_verdict
-    if [ -z "$parking_tip" ]; then
-      parking_rel="absent"
-    elif [ "$parking_tip" = "$host_tip" ]; then
-      parking_rel="equal"
-    elif git -C "$HOST_REPO" merge-base --is-ancestor "$parking_tip" "$host_tip" 2>/dev/null; then
-      # parking tip is ancestor of host tip → host is strictly ahead
-      parking_rel="behind"
-    elif git -C "$HOST_REPO" merge-base --is-ancestor "$host_tip" "$parking_tip" 2>/dev/null; then
-      # host tip is ancestor of parking tip → parking ref is strictly ahead
-      parking_rel="ahead"
-    else
-      parking_rel="diverged"
+    local parking_rel remote_rel remote_to_parking sync_verdict
+    parking_rel="$(ref_relation "$HOST_REPO" "$host_tip" "$parking_tip")"
+    remote_rel="$(ref_relation "$HOST_REPO" "$host_tip" "$remote_tip")"
+    remote_to_parking="$(ref_relation "$HOST_REPO" "$parking_tip" "$remote_tip")"
+    if [ -z "$parking_tip" ]; then remote_to_parking="absent"; fi
+
+    if ! sync_verdict="$(select_sync_base "$remote_rel" "$parking_rel" "$remote_to_parking")"; then
+      return 1
     fi
 
-    sync_verdict="$(select_sync_base "$parking_rel")"
-
-    if [ "$sync_verdict" = "host-branch" ]; then
-      if ! git -C "$HOST_CHECKOUT" fetch --quiet origin "$branch" >&2; then
-        echo "runner: ensure_runner_checkout_on_branch: git fetch origin $branch failed" >&2
-        return 1
-      fi
-      if ! git -C "$HOST_CHECKOUT" checkout --quiet -B "$branch" "origin/$branch" >&2; then
-        echo "runner: ensure_runner_checkout_on_branch: git checkout -B $branch failed" >&2
-        return 1
-      fi
-      if ! git -C "$HOST_CHECKOUT" reset --quiet --hard "origin/$branch" >&2; then
-        echo "runner: ensure_runner_checkout_on_branch: git reset --hard origin/$branch failed" >&2
-        return 1
-      fi
-    else
-      # parking-ref verdict: fetch the parking-ref's objects from host into the
-      # runner-checkout (the runner-checkout's origin fetch won't carry them),
-      # then sync to the parking-ref tip so successive dispatches chain linearly.
-      if ! git -C "$HOST_CHECKOUT" fetch --quiet "$HOST_REPO" \
-          "refs/remotes/runner/$branch:refs/remotes/host-parking/$branch" >&2; then
-        echo "runner: ensure_runner_checkout_on_branch: fetch parking-ref tip from host failed" >&2
-        return 1
-      fi
-      if ! git -C "$HOST_CHECKOUT" checkout --quiet -B "$branch" "$parking_tip" >&2; then
-        echo "runner: ensure_runner_checkout_on_branch: git checkout -B $branch $parking_tip failed" >&2
-        return 1
-      fi
-      if ! git -C "$HOST_CHECKOUT" reset --quiet --hard "$parking_tip" >&2; then
-        echo "runner: ensure_runner_checkout_on_branch: git reset --hard $parking_tip failed" >&2
-        return 1
-      fi
+    local base_ref base_tip
+    case "$sync_verdict" in
+      host-branch)
+        if ! git -C "$HOST_CHECKOUT" fetch --quiet origin "$branch" >&2; then
+          echo "runner: ensure_runner_checkout_on_branch: git fetch origin $branch failed" >&2
+          return 1
+        fi
+        base_ref="origin/$branch"
+        base_tip="origin/$branch"
+        ;;
+      parking-ref)
+        # Fetch the parking-ref's objects from host into the runner-checkout
+        # (the runner-checkout's origin fetch won't carry them), then sync to
+        # the parking-ref tip so successive dispatches chain linearly.
+        if ! git -C "$HOST_CHECKOUT" fetch --quiet "$HOST_REPO" \
+            "refs/remotes/runner/$branch:refs/remotes/host-parking/$branch" >&2; then
+          echo "runner: ensure_runner_checkout_on_branch: fetch parking-ref tip from host failed" >&2
+          return 1
+        fi
+        base_ref="$parking_tip"
+        base_tip="$parking_tip"
+        ;;
+      remote-branch)
+        # The Shared remote's branch, as just read into host.
+        if ! git -C "$HOST_CHECKOUT" fetch --quiet "$HOST_REPO" \
+            "+refs/remotes/$shared_remote/$branch:refs/remotes/host-shared/$branch" >&2; then
+          echo "runner: ensure_runner_checkout_on_branch: fetch $shared_remote/$branch from host failed" >&2
+          return 1
+        fi
+        base_ref="$remote_tip"
+        base_tip="$remote_tip"
+        ;;
+    esac
+    if ! git -C "$HOST_CHECKOUT" checkout --quiet -B "$branch" "$base_ref" >&2; then
+      echo "runner: ensure_runner_checkout_on_branch: git checkout -B $branch $base_ref failed" >&2
+      return 1
+    fi
+    if ! git -C "$HOST_CHECKOUT" reset --quiet --hard "$base_tip" >&2; then
+      echo "runner: ensure_runner_checkout_on_branch: git reset --hard $base_tip failed" >&2
+      return 1
     fi
   fi
 
@@ -1713,6 +2141,36 @@ check_retry_knobs() {
   case "$RUNNER_WINDOW_RETRY_MAX_WAITS" in
     ''|*[!0-9]*) fail_invariant "retry-knobs" \
       "RUNNER_WINDOW_RETRY_MAX_WAITS must be a whole number, got '$RUNNER_WINDOW_RETRY_MAX_WAITS'";;
+  esac
+}
+
+# 0b. Claim heartbeat knob sanity. RUNNER_CLAIM_HEARTBEAT_SECONDS (unset:
+#     stale-after / 3) is the claim refresher's sleep between heartbeats
+#     during a dispatch: 0 would heartbeat in a tight loop, a non-number
+#     would make every `sleep` fail at once (the same tight loop), and a
+#     value not below the stale-after time would let a live claim go stale
+#     between two heartbeats. Refuse up front.
+check_claim_knobs() {
+  local hb="${RUNNER_CLAIM_HEARTBEAT_SECONDS:-}"
+  [ -n "$hb" ] || return 0
+  case "$hb" in
+    *[!0-9]*) fail_invariant "claim-knobs" \
+      "RUNNER_CLAIM_HEARTBEAT_SECONDS must be a whole number of seconds > 0, got '$hb'";;
+  esac
+  if [ "$((10#$hb))" -eq 0 ]; then
+    fail_invariant "claim-knobs" \
+      "RUNNER_CLAIM_HEARTBEAT_SECONDS must be a whole number of seconds > 0, got '$hb'"
+  fi
+  local stale
+  stale="$(claim_stale_after)"
+  case "$stale" in
+    ''|*[!0-9]*) ;;
+    *)
+      if [ "$((10#$hb))" -ge "$((10#$stale))" ]; then
+        fail_invariant "claim-knobs" \
+          "RUNNER_CLAIM_HEARTBEAT_SECONDS ($hb) must be below RUNNER_CLAIM_STALE_AFTER ($stale), or a live claim goes stale between heartbeats"
+      fi
+      ;;
   esac
 }
 
@@ -1816,6 +2274,7 @@ retrieve_oauth_token() {
 preflight() {
   acquire_lock
   check_retry_knobs                      # invariant 0: env knob sanity
+  check_claim_knobs                      # invariant 0b: claim heartbeat knob
   check_discovery                        # invariant 1: tracker-snapshot --list
   ensure_runner_remote                   # invariant 1b: runner remote
   if ! ensure_runner_checkout_exists >&2; then  # invariant 2a (clone-existence)
@@ -1847,6 +2306,7 @@ preflight() {
   check_docker_daemon                    # invariant 3
   ensure_image                           # invariant 4
   check_manifest                         # invariant 4b (post-implement manifest)
+  check_post_drain_manifest              # invariant 4c (post-drain manifest, optional)
   if [ "$RUN_MODE" != "drain" ]; then
     ensure_mvn_cache                     # invariant 5
   fi
@@ -1897,6 +2357,11 @@ handle_signal() {
   # line, so the interrupt leaves no half-painted text behind.
   if [ -n "${LIVENESS_PID:-}" ]; then
     kill -TERM "$LIVENESS_PID" 2>/dev/null || true
+  fi
+  # Stop the claim refresher; stop_claim_refresher reaps it once the
+  # dispatch has wound down.
+  if [ -n "${CLAIM_REFRESHER_PID:-}" ]; then
+    kill -TERM "$CLAIM_REFRESHER_PID" 2>/dev/null || true
   fi
   if [ -n "$IN_FLIGHT_CID_FILE" ] && [ -s "$IN_FLIGHT_CID_FILE" ]; then
     local cid
@@ -1955,6 +2420,72 @@ stop_liveness_renderer() {
   kill -TERM "$LIVENESS_PID" 2>/dev/null || true
   wait "$LIVENESS_PID" 2>/dev/null || true
   LIVENESS_PID=""
+}
+
+# === Claim refresher spawn/reap ============================================
+#
+# Between dispatches heartbeat_claim refreshes the held claim; while one runs
+# (a sandbox container, its window/transport retry waits, a post-drain step)
+# a companion process does, every claim_heartbeat_seconds — claim_refresh_loop
+# in claim.sh. Armed and disarmed around the dispatch by with_claim_refresher,
+# like the liveness renderer around a container. Reaped on every way out:
+# the dispatch returning, handle_signal (Ctrl-C / SIGTERM), and finalize_run.
+
+CLAIM_REFRESHER_PID=""
+CLAIM_REFRESHER_STATE=""
+
+# Spawn the companion when a claim is held; a no-op otherwise (no Shared
+# remote, --issue, claim already lost) or when one is already running.
+start_claim_refresher() {
+  [ -n "${CLAIM_HELD_FEATURE:-}" ] || return 0
+  [ -z "$CLAIM_REFRESHER_PID" ] || return 0
+  CLAIM_REFRESHER_STATE="$(mktemp "${TMPDIR:-/tmp}/formann-claim-refresh.XXXXXX")" || {
+    CLAIM_REFRESHER_STATE=""
+    echo "[$(now_clock)] runner: could not start the claim heartbeat for the dispatch; the claim is refreshed between dispatches only"
+    return 0
+  }
+  claim_refresh_loop "$CLAIM_HELD_FEATURE" "$(claim_heartbeat_seconds)" \
+    "$CLAIM_REFRESHER_STATE" "$$" </dev/null &
+  CLAIM_REFRESHER_PID=$!
+}
+
+# Reap the companion, then adopt what it recorded: the claim sha it last
+# wrote (so the next between-dispatch heartbeat leases on it), or the
+# takeover it saw — the same lost-claim state heartbeat_claim sets, so the
+# loop stops on the feature after this dispatch.
+stop_claim_refresher() {
+  if [ -n "$CLAIM_REFRESHER_PID" ]; then
+    kill -TERM "$CLAIM_REFRESHER_PID" 2>/dev/null || true
+    wait "$CLAIM_REFRESHER_PID" 2>/dev/null || true
+    CLAIM_REFRESHER_PID=""
+  fi
+  [ -n "$CLAIM_REFRESHER_STATE" ] || return 0
+  local state=""
+  [ -s "$CLAIM_REFRESHER_STATE" ] && state="$(head -n 1 "$CLAIM_REFRESHER_STATE")"
+  rm -f "$CLAIM_REFRESHER_STATE" "$CLAIM_REFRESHER_STATE.tmp"
+  CLAIM_REFRESHER_STATE=""
+  case "$state" in
+    held\ *)
+      [ -n "${CLAIM_HELD_FEATURE:-}" ] && CLAIM_HELD_SHA="${state#held }"
+      ;;
+    lost-to\ *)
+      CLAIM_HELD_FEATURE=""
+      CLAIM_HELD_SHA=""
+      RUNNER_CLAIM_LOST="taken-over-by ${state#lost-to }"
+      ;;
+  esac
+  return 0
+}
+
+# Run "$@" (a dispatch) with the claim refresher armed around it; returns
+# its exit status. Runs in the current shell, so the dispatch's globals stay
+# visible to the caller.
+with_claim_refresher() {
+  local rc=0
+  start_claim_refresher
+  "$@" || rc=$?
+  stop_claim_refresher
+  return "$rc"
 }
 
 # Pre-flight-aware INT/TERM handler. Installed before `preflight` so a
@@ -2559,8 +3090,13 @@ RUNNER_DISPATCH_ENV=(
 # execution-context facts ONLY. No task imperatives ("commit", "set state"):
 # those differ per step and some steps forbid them (review must NOT change
 # state; gate transitions only on a clean verdict). Each step's own prompt owns
-# what it does; this only tells the agent the turn will not be resumed.
-RUNNER_DISPATCH_PREAMBLE="This is a one-shot headless dispatch: a single claude -p turn with no /loop or scheduler runtime. No scheduled wakeup, cross-turn timer or background-task notification will fire here — if you stop and wait to be resumed, nothing resumes you and the dispatch ends where it is, and whatever you had not finished is lost. Background Bash is disabled in this dispatch: builds and tests run in the foreground and you wait for them to finish (long commands may take a timeout of up to an hour). Carry out what this dispatch asks within this run; do not defer it behind a wakeup, a background task or a later check-in."
+# what it does; this only tells the agent the turn will not be resumed — and
+# that the runner, not the agent, publishes the commits (#4, upstream
+# jervell/formann#96): the sandbox cannot push, and an agent that rewrote the
+# runner-checkout's remote to do it broke the next sync. "Commit your work"
+# is conditional on there being work to commit — a step that must not commit
+# (review) has none, so the sentence does not contradict it.
+RUNNER_DISPATCH_PREAMBLE="This is a one-shot headless dispatch: a single claude -p turn with no /loop or scheduler runtime. No scheduled wakeup, cross-turn timer or background-task notification will fire here — if you stop and wait to be resumed, nothing resumes you and the dispatch ends where it is, and whatever you had not finished is lost. Background Bash is disabled in this dispatch: builds and tests run in the foreground and you wait for them to finish (long commands may take a timeout of up to an hour). Carry out what this dispatch asks within this run; do not defer it behind a wakeup, a background task or a later check-in. The runner publishes this dispatch's commits after the dispatch ends: commit your work and stop there — do not push, and do not add, remove or change git remotes."
 
 # Implement-dispatch wrapper: hands `claude -p "/implement <ref>"` to the
 # sandbox via the transport-retry layer, in streamed structured-event mode.
@@ -2571,7 +3107,7 @@ run_dispatch_container() {
   local ref="$1" log_base="$2"
   local model_args=()
   [ -n "${ARG_MODEL:-}" ] && model_args=(--model "$ARG_MODEL")
-  with_window_retry "$log_base" run_sandbox_container \
+  with_claim_refresher with_window_retry "$log_base" run_sandbox_container \
     claude -p "/implement $ref" --output-format stream-json --verbose --dangerously-skip-permissions \
     --append-system-prompt "$RUNNER_DISPATCH_PREAMBLE" \
     --disallowed-tools "${RUNNER_DISALLOWED_DISPATCH_TOOLS[@]}" \
@@ -2588,7 +3124,7 @@ run_item_container() {
   prompt_text="$(cat "$prompt_path")"$'\n'"$ref"
   local model_args=()
   [ -n "${ARG_MODEL:-}" ] && model_args=(--model "$ARG_MODEL")
-  with_window_retry "$log_base" run_sandbox_container \
+  with_claim_refresher with_window_retry "$log_base" run_sandbox_container \
     claude -p "$prompt_text" --output-format stream-json --verbose --dangerously-skip-permissions \
     --append-system-prompt "$RUNNER_DISPATCH_PREAMBLE" \
     --disallowed-tools "${RUNNER_DISALLOWED_DISPATCH_TOOLS[@]}" \
@@ -2625,7 +3161,8 @@ Fix with: git remote remove runner
 
 # Publish the feature branch to the per-feature parking ref
 # (`refs/remotes/runner/<branch>` on host), then attempt a best-effort
-# host fast-forward (`refs/heads/<branch>`).  Does not run `symbolic-ref`
+# host fast-forward (`refs/heads/<branch>`), then fast-forward the Shared
+# remote's feature branch (ADR-0011).  Does not run `symbolic-ref`
 # before the fast-forward attempt; post-refusal classification reads it to
 # distinguish HEAD-on-target from non-ff refusal.
 #
@@ -2636,10 +3173,23 @@ Fix with: git remote remove runner
 #   --update-head-ok.  Git's own refusal (HEAD-on-target or non-ff) is the
 #   parked-only trigger — the runner does not model "am I on-branch?".
 #
+# Step 3 (publish): push the parking-ref tip to
+#   `<shared-remote>/<branch>` from the host repo, with the host's
+#   credentials — fast-forward only, never `--force`, never a `+` refspec.
+#   The Shared remote is named by $RUNNER_SHARED_REMOTE (default `origin`).
+#   A host repo with no remote of that name skips the step (`local-only`).
+#   A refused push (the remote branch has commits not in the dispatch's
+#   chain) or any other push error (auth, network — git's stderr goes to
+#   runner.log) leaves the work on the parking ref and sets
+#   RUNNER_PUBLISH_PARKED=1, which stops the loop on this feature.
+#
 # On return 0, RUNNER_LAST_PROPAGATION is set to the human-readable indicator
-# that ends up in the SUMMARY column and the per-dispatch progress line:
-#   'propagated → host'           — both steps succeeded (propagated-to-host)
-#   'parked → runner/<branch>'    — step 1 ok, step 2 refused (parked-only)
+# that ends up in the SUMMARY column and the per-dispatch progress line. Its
+# first word is the publish state:
+#   'published → <remote>/<branch>'       — step 3 pushed the commit
+#   'parked → runner/<branch>'            — step 3 refused or failed
+#   'local-only (propagated → host)'      — no Shared remote; step 2 ok
+#   'local-only (parked → runner/<branch>)' — no Shared remote; step 2 refused
 # and the same indicator is printed to stdout.
 #
 # On return 1 (error), RUNNER_LAST_PROPAGATION is cleared to ''.
@@ -2678,12 +3228,12 @@ MSG
   # Capture stderr so we can surface true errors (lock contention, FS
   # error, etc.) to runner.log without printing the noisy diagnostic on
   # every expected refusal.  `|| rc=$?` keeps set -e happy on non-zero.
+  local host_indicator
   local step2_stderr step2_rc=0
   step2_stderr="$(git -C "$HOST_REPO" fetch --quiet "$HOST_CHECKOUT" \
       "${branch}:${branch}" 2>&1)" || step2_rc=$?
   if [ "$step2_rc" -eq 0 ]; then
-    RUNNER_LAST_PROPAGATION="propagated → host"
-    printf '[%s] %s\n' "$(now_clock)" "$RUNNER_LAST_PROPAGATION"
+    host_indicator="propagated → host"
   else
     # Two refusal modes are expected and self-evidently safe:
     #   - HEAD-on-target: host has the target branch checked out.
@@ -2707,9 +3257,44 @@ MSG
       printf 'runner: unexpected step-2 fetch failure for branch %s:\n%s\n' \
         "$branch" "$step2_stderr" >&2
     fi
-    RUNNER_LAST_PROPAGATION="parked → runner/${branch}"
-    printf '[%s] %s (git pull runner %s)\n' "$(now_clock)" "$RUNNER_LAST_PROPAGATION" "$branch"
+    host_indicator="parked → runner/${branch}"
   fi
+
+  # Step 3: publish to the Shared remote — fast-forward only, from the host.
+  local shared_remote="${RUNNER_SHARED_REMOTE:-origin}"
+  RUNNER_PUBLISH_PARKED=0
+  if ! git -C "$HOST_REPO" remote get-url "$shared_remote" >/dev/null 2>&1; then
+    RUNNER_LAST_PROPAGATION="local-only (${host_indicator})"
+  else
+    local publish_sha publish_stderr publish_rc=0
+    publish_sha="$(git -C "$HOST_REPO" rev-parse --verify "${parking_ref}^{commit}")"
+    # No `+`, no `--force`: git refuses a non-fast-forward on its own, which
+    # is the divergence guard. GIT_TERMINAL_PROMPT=0 keeps a missing
+    # credential from hanging the run on an interactive prompt.
+    publish_stderr="$(GIT_TERMINAL_PROMPT=0 git -C "$HOST_REPO" push --quiet \
+        "$shared_remote" "${publish_sha}:refs/heads/${branch}" 2>&1)" || publish_rc=$?
+    if [ "$publish_rc" -eq 0 ]; then
+      RUNNER_LAST_PROPAGATION="published → ${shared_remote}/${branch}"
+    else
+      cat >&2 <<MSG
+runner: publish refused — could not fast-forward '${shared_remote}/${branch}' to ${publish_sha}.
+git said:
+${publish_stderr}
+The work is on the parking ref 'runner/${branch}'; the runner stops on this
+feature until you reconcile (e.g. git pull runner ${branch}, merge or rebase
+onto ${shared_remote}/${branch}, push).
+MSG
+      RUNNER_PUBLISH_PARKED=1
+      RUNNER_LAST_PROPAGATION="parked → runner/${branch}"
+    fi
+  fi
+
+  case "$RUNNER_LAST_PROPAGATION" in
+    *"parked → runner/"*)
+      printf '[%s] %s (git pull runner %s)\n' "$(now_clock)" "$RUNNER_LAST_PROPAGATION" "$branch" ;;
+    *)
+      printf '[%s] %s\n' "$(now_clock)" "$RUNNER_LAST_PROPAGATION" ;;
+  esac
 }
 
 # Sweep stale parking refs from the host repo. Called once per run, from
@@ -2918,9 +3503,11 @@ capture_dispatch_core_files() {
 # For each item: dispatch in the sandbox, propagate committed work by commit
 # delta, snapshot, classify with classify_item_action, and react.
 #
-# The walk stops as soon as the issue reaches a terminal state (stop-success)
-# or a failure occurs. If the list is exhausted with the issue still at
-# in-review, the outcome is a neutral "left-for-human" with no abort flag.
+# The walk stops as soon as the issue reaches a terminal state (stop-success),
+# a failure occurs, or a step ends `BLOCKED: <dependency>` (blocked — state
+# untouched, no abort flag, return 0; left-for-human at the third Blocked
+# pass). If the list is exhausted with the issue still at in-review, the
+# outcome is a neutral "left-for-human" with no abort flag.
 #
 # Args:
 #   $1  = feature
@@ -2934,6 +3521,15 @@ capture_dispatch_core_files() {
 #   $9  = impl_duration (seconds, accumulated into iter_duration)
 #   $10 = impl_attempts
 #   $11 = resolved_manifest (tab-delimited label<TAB>path, one per line)
+#   $12 = start_label (optional) — re-run the walk from this manifest item,
+#         skipping the items before it (a Blocked retry). Skipped items keep
+#         their manifest position in the step-log names. Empty = from the
+#         first item.
+#
+# Blocked markers: a `blocked` outcome writes the issue's Blocked marker
+# naming the step (write_blocked_marker); any other classified outcome, and
+# an exhausted manifest, clears it. Issues that end Blocked are added to
+# RUN_BLOCKED_THIS_RUN so the same run does not retry them.
 #
 # Side effects: record_dispatch called exactly once; write_abort_flag on
 # gate-failed/review-aborted; RUN_STOP_REASON set on propagation-error or
@@ -2949,6 +3545,7 @@ walk_post_implement_steps() {
   local post_implement_json="$7"
   local impl_label="$8" impl_duration="$9" impl_attempts="${10}"
   local resolved_manifest="${11}"
+  local start_label="${12:-}"
 
   local total_item_seconds=0
   local total_attempts="$impl_attempts"
@@ -2965,11 +3562,20 @@ walk_post_implement_steps() {
     total_items=$(( total_items + 1 ))
   done <<< "$resolved_manifest"
 
+  local skipping=0
+  [ -n "$start_label" ] && skipping=1
+
   while IFS=$'\t' read -r item_label item_path; do
     [ -z "$item_label" ] && continue
 
-    any_item_ran=1
     step_idx=$(( step_idx + 1 ))
+    if [ "$skipping" -eq 1 ]; then
+      if [ "$item_label" != "$start_label" ]; then
+        continue
+      fi
+      skipping=0
+    fi
+    any_item_ran=1
     local step_suffix
     step_suffix="$(printf '%02d' "$step_idx")-$item_label"
     if [ -z "$step_logs" ]; then
@@ -2983,6 +3589,10 @@ walk_post_implement_steps() {
     local item_start_clock
     item_start_clock="$(now_clock)"
     format_progress_start "$item_start_clock" "$ref" "$item_label"
+
+    # Between dispatches: refresh the claim. A lost claim doesn't stop the
+    # walk in flight; run_loop stops the feature once it returns.
+    heartbeat_claim
 
     # Capture HEAD before dispatch to detect a commit delta.
     local pre_item_head
@@ -3057,10 +3667,71 @@ walk_post_implement_steps() {
     post_item_status="$(jq -r --arg r "$ref" \
       '(.issues[] | select(.ref == $r) | .status) // empty' <<<"$post_item_json")"
 
+    # Blocked: a clean step whose closing line is `BLOCKED: <dependency>`.
+    # The pass count (this pass's Blocked comment included) comes from the
+    # tracker, so a runner on another machine continues the same count. `|`
+    # is the dispatch-record delimiter, so it is replaced in the name.
+    local item_blocked=false item_blocked_dep="" item_blocked_passes=0
+    if [ "$item_rc" = "0" ]; then
+      item_blocked_dep="$(blocked_dependency "$item_log_base.stdout.jsonl")"
+      if [ -n "$item_blocked_dep" ]; then
+        item_blocked=true
+        item_blocked_dep="${item_blocked_dep//|//}"
+        if ! item_blocked_passes="$(read_blocked_passes "$ref")"; then
+          echo "runner: walk_post_implement_steps: could not read the Blocked pass count for '$ref'; counting this pass as below the limit" >&2
+          item_blocked_passes=0
+        fi
+      fi
+    fi
+
     local item_action
-    item_action="$(classify_item_action "$post_item_status" "$item_rc")"
+    item_action="$(classify_item_action "$post_item_status" "$item_rc" \
+      "$item_blocked" "$item_blocked_passes")"
+
+    # Only a `blocked` outcome keeps (rewrites) the marker; every other
+    # outcome means the step got past its dependency or the issue moved on.
+    if [ "$item_action" != "blocked" ]; then
+      clear_blocked_marker "$feature" "$nn"
+    fi
 
     case "$item_action" in
+      blocked|left-for-human)
+        # A dependency outside the run was unreachable. The issue keeps its
+        # state and gets no abort flag; the walk stops here for this issue
+        # and the run moves on. Below the pass limit the Blocked marker names
+        # this step, and a later run re-runs the walk from it
+        # (retry_blocked_walk); at the limit the issue is left for a human, the Blocked
+        # comments on its timeline being the reason. The step's commit (its
+        # Blocked comment, under local-markdown) is propagated either way.
+        local blocked_progress_label blocked_combined_label
+        if [ "$item_action" = "blocked" ]; then
+          blocked_progress_label="blocked ($item_blocked_dep)"
+          blocked_combined_label="blocked ($item_blocked_dep)"
+        else
+          blocked_progress_label="left-for-human (blocked: $item_blocked_dep, $item_blocked_passes passes)"
+          blocked_combined_label="left-for-human (blocked: $item_blocked_dep)"
+        fi
+        format_progress_outcome "$(now_clock)" "$ref" "$item_label" "$blocked_progress_label" "$item_duration"
+        if [ "$item_has_runner_commits" -eq 1 ]; then
+          if ! propagate_feature "$feature"; then
+            local halt_duration
+            halt_duration=$(( $(date +%s) - item_started_at + impl_duration + total_item_seconds - item_duration ))
+            format_progress_outcome "$(now_clock)" "$ref" "$item_label" "halt → gate-failed" "$item_duration"
+            record_dispatch "$feature" "$nn" "$ref" "gate-failed" "$halt_duration" "$step_logs" "$total_attempts"
+            RUN_STOP_REASON="propagation-error"
+            return 1
+          fi
+        fi
+        if [ "$item_action" = "blocked" ]; then
+          write_blocked_marker "$feature" "$nn" "$item_label" "$item_blocked_dep"
+          RUN_BLOCKED_THIS_RUN="${RUN_BLOCKED_THIS_RUN:+$RUN_BLOCKED_THIS_RUN
+}$feature/$nn"
+        fi
+        record_dispatch "$feature" "$nn" "$ref" "$blocked_combined_label" \
+          "$iter_duration" "$step_logs" "$total_attempts"
+        return 0
+        ;;
+
       stop-success)
         format_progress_outcome "$(now_clock)" "$ref" "$item_label" "clean → done" "$item_duration"
         if [ "$item_has_runner_commits" -eq 1 ]; then
@@ -3151,6 +3822,13 @@ walk_post_implement_steps() {
             return 1
           fi
         fi
+        # The Shared remote refused this step's commit: stop the walk here
+        # (the issue stays at in-review) so run_loop stops on the feature.
+        if [ "$RUNNER_PUBLISH_PARKED" -eq 1 ]; then
+          record_dispatch "$feature" "$nn" "$ref" "left-for-human" \
+            "$iter_duration" "$step_logs" "$total_attempts"
+          return 0
+        fi
         ;;
     esac
   done <<< "$resolved_manifest"
@@ -3160,6 +3838,7 @@ walk_post_implement_steps() {
   # intentionally left at in-review for the maintainer; "left-for-human"
   # is the correct combined outcome for both cases (no abort flag).
   # step_logs is empty when no items ran (implement-only); non-empty otherwise.
+  clear_blocked_marker "$feature" "$nn"
   record_dispatch "$feature" "$nn" "$ref" "left-for-human" \
     "$(( impl_duration + total_item_seconds ))" "$step_logs" "$total_attempts"
   return 0
@@ -3171,9 +3850,11 @@ walk_post_implement_steps() {
 # dispatch snapshot. Mutates only files under the run dir; classifier
 # verdict is derived from snapshots taken in the runner-checkout.
 #
-# Sets $RUNNER_LAST_PROPAGATION to `propagated → host` or
-# `parked → runner/<branch>` on the success path (empty on failure or
-# when no propagation occurred). Return code: 0 = success, 1 = failure.
+# Sets $RUNNER_LAST_PROPAGATION to the `propagate_feature` indicator
+# (`published → …`, `parked → runner/<branch>`, `local-only (…)`) on the
+# success path (empty on failure or when no propagation occurred). When the
+# Shared remote refuses the implement commit (RUNNER_PUBLISH_PARKED=1) the
+# post-implement walk is not started. Return code: 0 = success, 1 = failure.
 # On a parking-ref publish error, also sets
 # RUN_STOP_REASON="propagation-error" so run_loop breaks the loop; a
 # post-implement step that pushes the issue back to an eligible state sets
@@ -3218,6 +3899,11 @@ dispatch_one() {
   fi
 
   # === Implement stage =====================================================
+  # A fresh implement starts a fresh walk (and posts a new Implementation
+  # comment, which resets the Blocked count), so any Blocked marker left
+  # from an earlier walk is obsolete.
+  clear_blocked_marker "$feature" "$nn"
+
   local started_at start_clock
   started_at=$(date +%s)
   start_clock="$(now_clock)"
@@ -3406,12 +4092,81 @@ dispatch_one() {
     return 0
   fi
 
+  # The Shared remote refused the implement commit: its feature branch moved
+  # under us. The post-implement steps may rely on fetching the commit by ref
+  # from the Shared remote, so do not start them; the work stays on the
+  # parking ref and run_loop stops on this feature (RUNNER_PUBLISH_PARKED).
+  if [ "$RUNNER_PUBLISH_PARKED" -eq 1 ]; then
+    record_dispatch "$feature" "$nn" "$ref" "$impl_label" "$impl_duration" "" "$impl_attempts"
+    return 0
+  fi
+
   walk_post_implement_steps \
     "$feature" "$nn" "$ref" \
     "$run_dir" "$log_dir" "$log_basename" \
     "$post_implement_json" \
     "$impl_label" "$impl_duration" "$impl_attempts" \
     "$RESOLVED_MANIFEST"
+}
+
+# Re-run the post-implement walk of an issue whose walk ended Blocked on an
+# earlier run, starting from the blocked step. /implement is NOT re-run: its
+# new Implementation comment would reset the Blocked count. The step posts a
+# fresh Blocked comment if the dependency is still down, and the walk reads
+# the count from the tracker as on any pass — so the third pass, on whichever
+# machine runs it, leaves the issue for a human.
+#
+# A marker naming a step no longer in the manifest re-runs the whole walk.
+# Writes `<NN>.summary.md` (a note that this run retried the walk) so the
+# SUMMARY.md row's implement link resolves.
+#
+# Return code and stop-reason side effects mirror dispatch_one's walk.
+#
+# Args: $1=feature  $2=nn  $3=run_dir  $4=step label (from the marker)
+retry_blocked_walk() {
+  local feature="$1" nn="$2" run_dir="$3" step="$4"
+
+  local log_dir log_basename
+  if [ "$RUN_LOG_LAYOUT" = "nested" ]; then
+    log_dir="$run_dir/$feature"
+  else
+    log_dir="$run_dir"
+  fi
+  log_basename="$nn"
+  mkdir -p "$log_dir"
+
+  local pre_json ref
+  if ! pre_json="$(take_snapshot "$feature")"; then
+    echo "runner: retry_blocked_walk: tracker-snapshot failed for feature '$feature' issue '$nn'" >&2
+    RUN_STOP_REASON="snapshot-failed-mid-dispatch:pre"
+    record_dispatch "$feature" "$nn" "(unresolved)" "FAIL" 0
+    return 1
+  fi
+  if ! ref="$(binding_native_ref "$feature" "$nn" "$pre_json")"; then
+    RUN_STOP_REASON="snapshot-failed-mid-dispatch:pre"
+    record_dispatch "$feature" "$nn" "(unresolved)" "FAIL" 0
+    return 1
+  fi
+
+  local start_label="$step" label _path found=0
+  while IFS=$'\t' read -r label _path; do
+    [ "$label" = "$step" ] && { found=1; break; }
+  done <<< "$RESOLVED_MANIFEST"
+  if [ "$found" -eq 0 ]; then
+    echo "runner: retry_blocked_walk: blocked step '$step' is not in the manifest; re-running the whole walk for $ref" >&2
+    start_label=""
+  fi
+
+  echo "[$(now_clock)] $ref retrying Blocked walk from ${start_label:-the first step}"
+  printf 'Blocked retry: this run re-ran the post-implement walk from `%s`; /implement was not re-run.\n' \
+    "${start_label:-the first step}" >"$log_dir/$log_basename.summary.md"
+
+  walk_post_implement_steps \
+    "$feature" "$nn" "$ref" \
+    "$run_dir" "$log_dir" "$log_basename" \
+    "$pre_json" \
+    "in-review" 0 1 \
+    "$RESOLVED_MANIFEST" "$start_label"
 }
 
 # === Run entry points ======================================================
@@ -3427,12 +4182,14 @@ dispatch_one() {
 # named ref before calling dispatch_one. On refusal, prints a diagnostic
 # naming the reason (HITL type, wrong status, blockers unmet, ref
 # missing from feature), sets RUN_STOP_REASON, and returns 2 — the same
-# exit code argparse uses for input-validation rejections.
+# exit code argparse uses for input-validation rejections. A named ref that
+# is a Blocked retry (blocked_retry_step) is accepted and re-runs its walk
+# from the blocked step via retry_blocked_walk.
 run_single() {
   # Feature-level refusal (unknown-feature) was already enforced by
   # `check_feature_eligibility` in preflight; only the per-ref eligibility
   # gate (HITL, wrong status, blockers, missing) is left to resolve here.
-  local snap entry reason detail
+  local snap entry reason detail retry_step=""
   if ! snap="$(take_snapshot "$ISSUE_FEATURE")"; then
     echo "runner: single-dispatch refused: tracker-snapshot failed for feature '$ISSUE_FEATURE'" >&2
     RUN_STOP_REASON="single-dispatch (refused: snapshot-failed)"
@@ -3451,7 +4208,12 @@ run_single() {
     entry_type="$(jq -r '.type // empty' <<<"$entry")"
     entry_status="$(jq -r '.status // empty' <<<"$entry")"
     entry_eligible="$(jq -r '.eligible // false' <<<"$entry")"
+    retry_step="$(blocked_retry_step "$ISSUE_FEATURE" "$ISSUE_NN" "$entry_status" "$entry_type")"
     if [ "$entry_eligible" = "true" ]; then
+      reason=""
+      retry_step=""
+    elif [ -n "$retry_step" ]; then
+      # A Blocked retry: re-run the walk from the blocked step.
       reason=""
     elif [ "$entry_type" != "AFK" ]; then
       reason="HITL"
@@ -3477,7 +4239,11 @@ run_single() {
   fi
 
   local rc=0
-  dispatch_one "$ISSUE_FEATURE" "$ISSUE_NN" "$RUN_DIR" || rc=$?
+  if [ -n "$retry_step" ]; then
+    retry_blocked_walk "$ISSUE_FEATURE" "$ISSUE_NN" "$RUN_DIR" "$retry_step" || rc=$?
+  else
+    dispatch_one "$ISSUE_FEATURE" "$ISSUE_NN" "$RUN_DIR" || rc=$?
+  fi
   if [ "$rc" -eq 0 ]; then
     RUN_STOP_REASON="single-dispatch (success)"
   else
@@ -3489,7 +4255,9 @@ run_single() {
 # Loop entry — drains $TARGET_FEATURE's eligible queue sequentially.
 # Eligibility is recomputed every iteration by re-snapshotting the
 # runner-checkout's HEAD, so an issue unblocked mid-run by an earlier
-# success becomes selectable without restarting the runner. Stop
+# success becomes selectable without restarting the runner. A Blocked retry
+# from an earlier run is selectable alongside eligible issues, in source
+# order, and re-runs its walk from the blocked step (retry_blocked_walk). Stop
 # conditions: queue empty, Ctrl-C. Per-issue failures log + continue
 # (no runner-side comment posted on the issue — the failed `/implement`
 # posts its own). RUN_DIR was created in main().
@@ -3525,11 +4293,28 @@ run_loop() {
     # skip line with the rm recipe for each aborted one). The abort flag path
     # uses `nn` from the snapshot — never derived from the binding-native ref —
     # so local-markdown and github-issues flags share the same layout.
-    local ref="" nn_sel=""
+    #
+    # A Blocked retry (an AFK issue at in-review whose walk ended Blocked on
+    # an earlier run — see blocked_retry_step) is selectable in the same
+    # source-order pass; it re-runs the walk from the blocked step instead of
+    # dispatching /implement. A marker on an issue no longer at in-review is
+    # obsolete and is cleared.
+    local ref="" nn_sel="" retry_step=""
     local abort_feature_dir="$HOST_ABORT_DIR/$TARGET_FEATURE"
-    local candidate_ref candidate_nn abort_flag
-    while IFS=$'\t' read -r candidate_ref candidate_nn; do
+    local candidate_ref candidate_nn candidate_eligible candidate_status candidate_type
+    local abort_flag candidate_retry
+    while IFS=$'\t' read -r candidate_ref candidate_nn candidate_eligible candidate_status candidate_type; do
       [ -z "$candidate_ref" ] && continue
+      candidate_retry=""
+      if [ "$candidate_eligible" != "true" ]; then
+        if [ "$candidate_status" != "in-review" ] \
+            && [ -n "$(blocked_marker_step "$TARGET_FEATURE" "$candidate_nn")" ]; then
+          clear_blocked_marker "$TARGET_FEATURE" "$candidate_nn"
+        fi
+        candidate_retry="$(blocked_retry_step "$TARGET_FEATURE" "$candidate_nn" \
+          "$candidate_status" "$candidate_type")"
+        [ -n "$candidate_retry" ] || continue
+      fi
       abort_flag="$abort_feature_dir/$candidate_nn"
       if [ -f "$abort_flag" ]; then
         echo "[$(now_clock)] runner: skipping aborted $candidate_ref — rm $abort_flag to resume"
@@ -3537,12 +4322,23 @@ run_loop() {
       fi
       ref="$candidate_ref"
       nn_sel="$candidate_nn"
+      retry_step="$candidate_retry"
       break
-    done < <(jq -r '.issues[] | select(.eligible == true) | "\(.ref)\t\(.nn)"' <<<"$snap")
+    done < <(jq -r '.issues[]
+      | "\(.ref)\t\(.nn)\t\(.eligible == true)\t\(if (.status // "") == "" then "-" else .status end)\t\(if (.type // "") == "" then "-" else .type end)"' <<<"$snap")
 
     if [ -z "$ref" ]; then
       echo "[$(now_clock)] runner: queue empty — no eligible issues remain in '$TARGET_FEATURE'"
       RUN_STOP_REASON="queue-empty"
+      return 0
+    fi
+
+    # Between dispatches: refresh the claim. A claim another runner took
+    # over means no further issue on this feature.
+    heartbeat_claim
+    if [ -n "$RUNNER_CLAIM_LOST" ]; then
+      echo "[$(now_clock)] runner: '$TARGET_FEATURE' was $RUNNER_CLAIM_LOST; taking no further issue on it"
+      RUN_STOP_REASON="$RUNNER_CLAIM_LOST"
       return 0
     fi
 
@@ -3558,8 +4354,14 @@ run_loop() {
     fi
 
     RUNNER_LAST_PROPAGATION=""
+    RUNNER_PUBLISH_PARKED=0
     local dispatch_rc=0
-    dispatch_one "$TARGET_FEATURE" "$nn_sel" "$RUN_DIR" || dispatch_rc=$?
+    local dispatch_dir="${RUN_PASS_DIR:-$RUN_DIR}"
+    if [ -n "$retry_step" ]; then
+      retry_blocked_walk "$TARGET_FEATURE" "$nn_sel" "$dispatch_dir" "$retry_step" || dispatch_rc=$?
+    else
+      dispatch_one "$TARGET_FEATURE" "$nn_sel" "$dispatch_dir" || dispatch_rc=$?
+    fi
 
     # If Ctrl-C arrived during the dispatch, exit immediately.
     if [ "$RUNNER_INTERRUPTED" -eq 1 ]; then
@@ -3583,9 +4385,60 @@ run_loop() {
         return 1 ;;
     esac
 
+    # Publish refused: the Shared remote's feature branch has commits the
+    # runner lacks. Stop this feature only — continuing would build on a
+    # chain the Shared remote will keep refusing. Drain mode moves on to
+    # the next feature.
+    if [ "$RUNNER_PUBLISH_PARKED" -eq 1 ]; then
+      echo "[$(now_clock)] runner: Shared remote refused '$TARGET_FEATURE' — work parked on runner/$TARGET_FEATURE; stopping this feature"
+      RUN_STOP_REASON="publish-parked"
+      return 0
+    fi
+
+    # Claim lost during the dispatch's walk (a heartbeat between its steps
+    # was refused): the dispatch has finished; take no further issue.
+    if [ -n "$RUNNER_CLAIM_LOST" ]; then
+      echo "[$(now_clock)] runner: '$TARGET_FEATURE' was $RUNNER_CLAIM_LOST during $ref; stopping this feature"
+      RUN_STOP_REASON="$RUNNER_CLAIM_LOST"
+      return 0
+    fi
+
     # Make `set -e` happy — dispatch_rc is consumed, not propagated.
     : "$dispatch_rc"
   done
+}
+
+# Loop mode (--feature) under the feature's claim: take it before the first
+# dispatch, release it when the loop ends. A feature another runner holds
+# stops the pass with stop reason `held-by <machine>` (with --idle, the next
+# pass tries again). No Shared remote: plain run_loop.
+run_claimed_loop() {
+  if ! claim_shared_remote_present; then
+    local rc=0 dispatches_before
+    dispatches_before="$(feature_dispatch_count "$TARGET_FEATURE")"
+    run_loop || rc=$?
+    maybe_run_post_drain "$TARGET_FEATURE" "$RUN_STOP_REASON" "$dispatches_before"
+    return "$rc"
+  fi
+  if ! claim take "$TARGET_FEATURE" >/dev/null; then
+    echo "[$(now_clock)] runner: could not claim '$TARGET_FEATURE' (see above); not draining it"
+    RUN_STOP_REASON="claim-failed"
+    return 0
+  fi
+  case "$CLAIM_RESULT" in
+    held-by\ *)
+      echo "[$(now_clock)] runner: '$TARGET_FEATURE' is $CLAIM_RESULT; not draining it"
+      RUN_STOP_REASON="$CLAIM_RESULT"
+      return 0
+      ;;
+  esac
+  announce_claim "$TARGET_FEATURE"
+  local rc=0 dispatches_before
+  dispatches_before="$(feature_dispatch_count "$TARGET_FEATURE")"
+  run_loop || rc=$?
+  maybe_run_post_drain "$TARGET_FEATURE" "$RUN_STOP_REASON" "$dispatches_before"
+  claim_release_held
+  return "$rc"
 }
 
 # Drain entry — bare invocation. Walks every feature in discovery order,
@@ -3676,11 +4529,42 @@ drain_one_feature() {
   # Queue check: ≥1 eligible non-aborted ref. Uses the same predicate as
   # the per-issue loop's selection so the verdict matches what `run_loop`
   # would compute.
-  if ! feature_has_dispatchable_ref "$feature" "$snap"; then
+  # A post-drain step left Blocked by an earlier pass is work too: the
+  # feature is claimed and its post-drain phase re-run from that step.
+  if ! feature_has_dispatchable_ref "$feature" "$snap" \
+      && { [ -z "$RESOLVED_POST_DRAIN" ] || [ -z "$(post_drain_pending_step "$feature")" ]; }; then
     echo "[$(now_clock)] runner: skipping $feature — queue-empty"
     record_feature_outcome "$feature" "skip:queue-empty"
     return 0
   fi
+
+  # Claim the feature on the Shared remote before its first dispatch. A
+  # feature another runner holds is skipped; the drain moves on. No Shared
+  # remote: no claims, the local lock alone guards the run.
+  if claim_shared_remote_present; then
+    if ! claim take "$feature" >/dev/null; then
+      echo "[$(now_clock)] runner: skipping $feature — claim-failed"
+      record_feature_outcome "$feature" "skip:claim-failed"
+      return 0
+    fi
+    case "$CLAIM_RESULT" in
+      held-by\ *)
+        echo "[$(now_clock)] runner: skipping $feature — $CLAIM_RESULT"
+        record_feature_outcome "$feature" "$CLAIM_RESULT"
+        return 0
+        ;;
+    esac
+    announce_claim "$feature"
+  fi
+
+  drain_claimed_feature "$feature"
+  claim_release_held
+}
+
+# The part of drain_one_feature that runs under the feature's claim (when
+# there is one); drain_one_feature releases the claim however it returns.
+drain_claimed_feature() {
+  local feature="$1"
 
   # Materialize the mvn cache lazily for this feature. A cache miss here
   # is rare (`ensure-mvn-cache.sh` is idempotent and only fails on docker
@@ -3696,12 +4580,17 @@ drain_one_feature() {
   # mid-feature snapshot crash, we record `feature-snapshot-failed` instead
   # of `drained` so the SUMMARY narrates the failure correctly.
   local saved_stop_reason="$RUN_STOP_REASON"
+  local dispatches_before
+  dispatches_before="$(feature_dispatch_count "$feature")"
   RUN_STOP_REASON=""
   set +e
   run_loop
   set -e
 
   local inner_reason="$RUN_STOP_REASON"
+  # The feature has drained: run its post-drain phase on the host, still
+  # under the claim (drain_one_feature releases it afterwards).
+  maybe_run_post_drain "$feature" "$inner_reason" "$dispatches_before"
   # The outer drain loop owns the run-level stop reason. Restore whatever
   # was set before we entered the per-feature loop so a mid-drain run_loop
   # stop (queue-empty, snapshot-failed) doesn't leak as the run's final
@@ -3730,6 +4619,17 @@ drain_one_feature() {
       # crash before any per-issue work landed).
       record_feature_outcome "$feature" "feature-snapshot-failed"
       ;;
+    publish-parked)
+      # The Shared remote refused a fast-forward inside this feature's loop.
+      # The feature stops; the drain continues with the next one.
+      record_feature_outcome "$feature" "parked"
+      ;;
+    taken-over-by\ *)
+      # Another runner took the claim over while this one drained: the
+      # dispatch in flight finished, no further issue was taken, and the
+      # claim (no longer ours) is not released. The drain moves on.
+      record_feature_outcome "$feature" "$inner_reason"
+      ;;
     fetch-failed)
       # Per-iteration `ensure_runner_checkout` failure inside the per-issue
       # loop (the wrapper soft-fails in drain mode rather than aborting the
@@ -3743,21 +4643,114 @@ drain_one_feature() {
   esac
 }
 
+# Log a claim just taken (CLAIM_RESULT `taken` or `taken-over-from
+# <machine>`) and announce it with the tracker Note. Clears any lost-claim
+# state from an earlier feature or pass.
+announce_claim() {
+  local feature="$1"
+  RUNNER_CLAIM_LOST=""
+  case "$CLAIM_RESULT" in
+    taken-over-from\ *)
+      echo "[$(now_clock)] runner: took over the stale claim on $feature (${CLAIM_RESULT#taken-over-from }'s heartbeat is older than $(claim_stale_after)s) on $(claim_shared_remote) ($(claim_ref "$feature"))"
+      ;;
+    *)
+      echo "[$(now_clock)] runner: claimed $feature on $(claim_shared_remote) ($(claim_ref "$feature"))"
+      ;;
+  esac
+  post_claim_note "$feature" "$CLAIM_RESULT"
+}
+
+# Refresh the held claim's heartbeat, between dispatches (before each
+# /implement dispatch and before each post-implement step). No claim held
+# (no Shared remote, --issue, or already lost): nothing to do.
+#   ok        → the claim's heartbeat is fresh.
+#   lost-to X → another runner took it over: RUNNER_CLAIM_LOST becomes
+#               `taken-over-by X`; the claim is not ours to release.
+#   error     → remote unreachable: logged, tried again at the next point;
+#               the drain goes on.
+heartbeat_claim() {
+  [ -n "${CLAIM_HELD_FEATURE:-}" ] || return 0
+  local feature="$CLAIM_HELD_FEATURE"
+  claim heartbeat "$feature" >/dev/null || true
+  case "$CLAIM_RESULT" in
+    ok) ;;
+    lost-to\ *)
+      RUNNER_CLAIM_LOST="taken-over-by ${CLAIM_RESULT#lost-to }"
+      echo "[$(now_clock)] runner: lost the claim on $feature — $RUNNER_CLAIM_LOST; finishing the dispatch in flight, then stopping this feature"
+      ;;
+    *)
+      echo "[$(now_clock)] runner: could not refresh the claim on $feature (see above); trying again at the next heartbeat"
+      ;;
+  esac
+  return 0
+}
+
+# Announce a taken claim on the tracker: a `Note` on the feature's parent,
+# through the binding's `comment-on-feature` script on the role surface
+# (the "Comment with `<kind>`" verb). Information only — the claim ref is
+# the lock — so every failure here is logged and the drain goes on.
+#
+# A binding that keeps its tracker in git (local-markdown) commits the Note
+# into the runner-checkout; that commit is propagated at once, so the
+# per-dispatch re-sync doesn't wipe it.
+post_claim_note() {
+  local feature="$1" how="${2:-taken}"
+  local script="$HOST_REPO/docs/formann/issue-tracker/comment-on-feature"
+  if [ ! -x "$script" ]; then
+    echo "[$(now_clock)] runner: no comment-on-feature script on the role surface; claim Note not posted"
+    return 0
+  fi
+  local head_before head_after machine body
+  head_before="$(git -C "$HOST_CHECKOUT" rev-parse --verify --quiet HEAD 2>/dev/null || true)"
+  local verb="Claimed"
+  case "$how" in
+    taken-over-from\ *) verb="Taken over from \`${how#taken-over-from }\` (its claim was stale)" ;;
+  esac
+  machine="$(claim_machine)"
+  body="$(cat <<NOTE
+> *This was generated by the AFK runner.*
+
+${verb} by the runner on \`${machine}\` (run \`${RUN_TS:-unknown}\`, Formann \`${RUNNER_FORMANN_SHA:-unknown}\`). The claim is the ref \`$(claim_ref "$feature")\` on the Shared remote; this comment is information, never the lock. It is released when the drain ends.
+NOTE
+)"
+  if ! ( cd "$HOST_REPO" && printf '%s\n' "$body" \
+      | TRACKER_CHECKOUT_DIR="$HOST_CHECKOUT" "$script" "$feature" "Note" ) >/dev/null; then
+    echo "[$(now_clock)] runner: could not post the claim Note on $feature (see above); draining anyway"
+    return 0
+  fi
+  echo "[$(now_clock)] runner: posted the claim Note on $feature"
+  head_after="$(git -C "$HOST_CHECKOUT" rev-parse --verify --quiet HEAD 2>/dev/null || true)"
+  if [ -n "$head_after" ] && [ "$head_after" != "$head_before" ]; then
+    if ! propagate_feature "$feature"; then
+      echo "[$(now_clock)] runner: the claim Note's commit could not be propagated; draining anyway"
+    fi
+    RUNNER_LAST_PROPAGATION=""
+    RUNNER_PUBLISH_PARKED=0
+  fi
+  return 0
+}
+
 # Per-feature queue-shape probe. Returns 0 if the snapshot has at least
-# one eligible ref without an abort flag, 1 otherwise. Mirrors the
-# selection logic in `run_loop`'s top-of-iteration block. Uses `nn` from
-# the snapshot for abort flag lookup — binding-agnostic.
+# one eligible ref, or one Blocked retry (blocked_retry_step), without an
+# abort flag; 1 otherwise. Mirrors the selection logic in `run_loop`'s
+# top-of-iteration block. Uses `nn` from the snapshot for abort flag
+# lookup — binding-agnostic.
 feature_has_dispatchable_ref() {
   local feature="$1" snap="$2"
   local abort_dir="$HOST_ABORT_DIR/$feature"
-  local candidate_ref candidate_nn
-  while IFS=$'\t' read -r candidate_ref candidate_nn; do
+  local candidate_ref candidate_nn candidate_eligible candidate_status candidate_type
+  while IFS=$'\t' read -r candidate_ref candidate_nn candidate_eligible candidate_status candidate_type; do
     [ -z "$candidate_ref" ] && continue
+    if [ "$candidate_eligible" != "true" ] \
+        && [ -z "$(blocked_retry_step "$feature" "$candidate_nn" "$candidate_status" "$candidate_type")" ]; then
+      continue
+    fi
     if [ -f "$abort_dir/$candidate_nn" ]; then
       continue
     fi
     return 0
-  done < <(jq -r '.issues[] | select(.eligible == true) | "\(.ref)\t\(.nn)"' <<<"$snap")
+  done < <(jq -r '.issues[]
+    | "\(.ref)\t\(.nn)\t\(.eligible == true)\t\(if (.status // "") == "" then "-" else .status end)\t\(if (.type // "") == "" then "-" else .type end)"' <<<"$snap")
   return 1
 }
 
@@ -3777,12 +4770,319 @@ ensure_mvn_cache_for() {
   return 0
 }
 
+# === Idle loop (--idle) ====================================================
+#
+# With `--idle <seconds>` the runner is long-lived: `run_idle` repeats a pass
+# (one run_drain or run_loop) and, between passes, sleeps <seconds>. Every
+# pass after the first refreshes what a fresh run would see — drain mode
+# re-runs discovery (so a feature created while the runner slept is
+# considered), loop mode re-syncs the runner-checkout (so a local-markdown
+# issue made ready on the host is seen by the snapshot) — and clears
+# RUN_BLOCKED_THIS_RUN, so a step that ended Blocked on the previous pass is
+# re-run. The Blocked pass count is still read from the tracker, never from
+# the runner.
+#
+# Each pass that dispatched anything writes `<run-dir>/pass-<NNNN>/SUMMARY.md`
+# (its per-issue logs land beside it) and its records are cleared, so the run
+# directory of a long-lived runner stays readable. Passes that dispatched
+# nothing leave no directory; they are only counted in SUMMARY.md's
+# "## Passes" index (format_passes_section).
+#
+# Stops: an interrupt (SIGINT/SIGTERM, during a pass or the sleep) returns 0
+# with RUN_STOP_REASON="interrupted"; a propagation error or the runaway guard
+# return 1 with that pass's stop reason, exactly as a single pass would.
+# Every other pass outcome (queue empty, a tracker or fetch outage, a parked
+# feature) sleeps and tries again.
+
+# One sleep tick. Its own function so tests can drive the sleep without
+# waiting on the wall clock.
+idle_sleep_tick() { sleep 1; }
+
+# Sleep for $1 seconds in one-second ticks, against a wall-clock deadline (a
+# throttled or suspended host must not stretch the wait — issue #80), and
+# return early as soon as RUNNER_INTERRUPTED is set. Bash runs the
+# SIGINT/SIGTERM trap when the foreground `sleep` tick returns, so an
+# interrupt during the sleep is honoured within a second.
+idle_sleep() {
+  local seconds="$1"
+  local deadline
+  deadline=$(( $(runner_epoch_now) + seconds ))
+  while [ "${RUNNER_INTERRUPTED:-0}" -eq 0 ] \
+      && [ "$(runner_epoch_now)" -lt "$deadline" ]; do
+    idle_sleep_tick
+  done
+}
+
+# Re-run discovery for a later drain pass. Soft: on failure the previous
+# DISCOVERY_JSON is kept (a tracker outage must not stop a long-lived
+# runner) and the failure is logged.
+refresh_discovery() {
+  local rc=0 result
+  result="$(TRACKER_ROOT="$HOST_REPO/.features" \
+    bash "$HOST_REPO/docs/formann/issue-tracker/tracker-snapshot" --list)" || rc=$?
+  if [ "$rc" -ne 0 ] \
+      || ! jq -e 'if type == "array" then . else error end' >/dev/null 2>&1 <<<"$result"; then
+    echo "[$(now_clock)] runner: discovery failed (tracker-snapshot --list exited $rc); keeping the previous feature list"
+    return 1
+  fi
+  DISCOVERY_JSON="$result"
+}
+
+# Before every pass after the first: pick up what changed while the runner
+# slept. Returns 1 when the pass should be skipped (the Runner's Formann
+# refused its update or moved — see refresh_runner_formann — or loop mode
+# could not sync its runner-checkout); the caller records the pass and
+# sleeps, or ends the run to re-execute.
+prepare_idle_pass() {
+  refresh_runner_formann || return 1
+  case "$RUN_MODE" in
+    drain)
+      refresh_discovery || true
+      ;;
+    loop)
+      if ! ensure_runner_checkout_on_branch "$TARGET_FEATURE" >&2; then
+        echo "[$(now_clock)] runner: could not sync the runner-checkout for '$TARGET_FEATURE'; skipping this pass"
+        RUN_STOP_REASON="fetch-failed"
+        return 1
+      fi
+      ;;
+  esac
+  return 0
+}
+
+# Close the current pass: write its SUMMARY.md when it dispatched anything,
+# append it to the pass index, and clear its records.
+finish_idle_pass() {
+  local n="$RUN_PASS" stop="${RUN_STOP_REASON:-unknown}"
+  local count="${#RUN_DISPATCHES[@]}"
+  if [ "$count" -gt 0 ] || [ "${#RUN_POST_DRAIN[@]}" -gt 0 ]; then
+    mkdir -p "$RUN_PASS_DIR"
+    local end_state="ended"
+    [ "${RUNNER_INTERRUPTED:-0}" -eq 1 ] && end_state="interrupted"
+    if [ "$RUN_MODE" = "drain" ]; then
+      print_multi_feature_records | format_multi_feature_summary_md \
+        "$RUN_TS pass $n" "$RUN_PASS_START_CLOCK" "$(now_clock)" \
+        "$end_state" "$stop" "${ARG_MODEL:-}" "$(runner_formann_label)" >"$RUN_PASS_DIR/SUMMARY.md"
+    else
+      print_dispatch_records | format_summary_md \
+        "$RUN_FEATURE" "$RUN_TS pass $n" "$RUN_PASS_START_CLOCK" "$(now_clock)" \
+        "$end_state" "$stop" "${ARG_MODEL:-}" "$(runner_formann_label)" >"$RUN_PASS_DIR/SUMMARY.md"
+    fi
+    format_post_drain_section >>"$RUN_PASS_DIR/SUMMARY.md"
+    RUN_PASSES+=("$n|$stop|$count")
+  else
+    [ -d "$RUN_PASS_DIR" ] && rmdir "$RUN_PASS_DIR" 2>/dev/null || true
+    RUN_IDLE_PASSES=$(( RUN_IDLE_PASSES + 1 ))
+  fi
+  RUN_DISPATCHES=()
+  RUN_FEATURE_OUTCOMES=()
+  RUN_POST_DRAIN=()
+}
+
+# SUMMARY.md's "## Passes" index (--idle only): one line per pass that
+# dispatched anything, linking its own SUMMARY.md, then the idle-pass count.
+format_passes_section() {
+  printf '\n## Passes\n\n'
+  printf -- '- %d pass(es) in total; %d found nothing to do.\n' \
+    "$RUN_PASS" "$RUN_IDLE_PASSES"
+  if [ "${#RUN_PASSES[@]}" -eq 0 ]; then return 0; fi
+  local rec n stop count name
+  for rec in "${RUN_PASSES[@]}"; do
+    n="${rec%%|*}"; rec="${rec#*|}"
+    stop="${rec%|*}"; count="${rec##*|}"
+    name="$(printf 'pass-%04d' "$n")"
+    printf -- '- [pass %d](%s/SUMMARY.md): %d dispatch(es), stop reason: %s\n' \
+      "$n" "$name" "$count" "$stop"
+  done
+}
+
+RUN_PASS_START_CLOCK=""
+
+# Args: $1 = the pass function (run_drain | run_loop).
+run_idle() {
+  local pass_fn="$1"
+  while :; do
+    if [ "${RUNNER_INTERRUPTED:-0}" -eq 1 ]; then
+      echo "[$(now_clock)] runner: interrupted; not starting the next pass"
+      RUN_STOP_REASON="interrupted"
+      return 0
+    fi
+
+    RUN_PASS=$(( RUN_PASS + 1 ))
+    RUN_PASS_DIR="$RUN_DIR/$(printf 'pass-%04d' "$RUN_PASS")"
+    RUN_PASS_START_CLOCK="$(now_clock)"
+    RUN_BLOCKED_THIS_RUN=""
+    RUN_STOP_REASON=""
+    echo "[$(now_clock)] runner: pass $RUN_PASS"
+
+    local rc=0 run_pass=1
+    if [ "$RUN_PASS" -gt 1 ]; then
+      prepare_idle_pass || run_pass=0
+    fi
+    if [ "$run_pass" -eq 1 ]; then
+      "$pass_fn" || rc=$?
+    fi
+    finish_idle_pass
+
+    if [ "${RUNNER_FORMANN_REEXEC_PENDING:-0}" -eq 1 ]; then
+      echo "[$(now_clock)] runner: ending the run to re-execute on Formann $RUNNER_FORMANN_NEXT_SHA"
+      return 0
+    fi
+    if [ "${RUNNER_INTERRUPTED:-0}" -eq 1 ]; then
+      RUN_STOP_REASON="interrupted"
+      return 0
+    fi
+    case "$RUN_STOP_REASON" in
+      propagation-error|runaway-halt*)
+        echo "[$(now_clock)] runner: pass $RUN_PASS stopped on $RUN_STOP_REASON; leaving the idle loop"
+        return 1 ;;
+    esac
+    : "$rc"
+
+    echo "[$(now_clock)] runner: pass $RUN_PASS ended ($RUN_STOP_REASON); sleeping ${ARG_IDLE}s"
+    idle_sleep "$ARG_IDLE"
+  done
+}
+
+# === Runner's Formann ======================================================
+#
+# The runner runs from a Formann checkout of its own ($RUNNER_FORMANN_DIR, a
+# git clone), never from the one the consumer's sessions read through
+# `.formann`. Before every drain it fast-forwards that checkout to
+# $RUNNER_FORMANN_REF (formann-update.sh) and, when the code it is running is
+# not the checkout's current code — the sha moved, or it was started from
+# another copy such as `.formann/runner/run-the-queue.sh` — re-executes
+# itself from `$RUNNER_FORMANN_DIR/framework/runner/run-the-queue.sh` with the
+# same arguments, so the drain runs the new code. A refusal (local changes,
+# divergence, no clone, fetch failure) stops the drain before any claim is
+# taken: pre-flight abort `runner-formann` at startup, a skipped pass
+# (`formann-refused`) in the idle loop.
+#
+# Without RUNNER_FORMANN_DIR the runner is unmanaged: it runs from wherever
+# it was started, updates nothing, and records that checkout's sha.
+#
+# RUNNER_FORMANN_SHA is the sha this process's runner code came from; the
+# claim (claim.sh) and SUMMARY.md record it.
+
+RUNNER_ARGV=()                    # main's arguments, for the re-exec
+RUNNER_FORMANN_SHA=""
+RUNNER_FORMANN_MANAGED=0          # 1 when RUNNER_FORMANN_DIR is set
+RUNNER_FORMANN_REFUSAL=""         # the startup refusal's reason; main aborts pre-flight on it
+RUNNER_FORMANN_REEXEC_PENDING=0   # 1 once an idle pass found the Formann moved; finalize_run re-executes
+RUNNER_FORMANN_NEXT_SHA=""
+
+# The runner script inside the Runner's Formann.
+runner_formann_script() {
+  printf '%s/framework/runner/run-the-queue.sh\n' "$RUNNER_FORMANN_DIR"
+}
+
+# True when this process's code is the Runner's Formann's (HERE is its
+# framework/runner directory, symlinks resolved).
+runner_formann_runs_here() {
+  local mine theirs
+  mine="$(cd "$HERE" 2>/dev/null && pwd -P)" || return 1
+  theirs="$(cd "$RUNNER_FORMANN_DIR/framework/runner" 2>/dev/null && pwd -P)" || return 1
+  [ "$mine" = "$theirs" ]
+}
+
+# The SUMMARY.md label: `<sha> (<ref>)`, or the unmanaged form. Empty before
+# start_runner_formann has run (tests that drive the formatters directly).
+runner_formann_label() {
+  [ -n "$RUNNER_FORMANN_SHA" ] || return 0
+  if [ "$RUNNER_FORMANN_MANAGED" -eq 1 ]; then
+    printf '%s (%s)\n' "$RUNNER_FORMANN_SHA" "$(formann_update_ref)"
+  else
+    printf '%s (not self-updated: RUNNER_FORMANN_DIR is unset)\n' "$RUNNER_FORMANN_SHA"
+  fi
+}
+
+# Replace this process with the Runner's Formann's runner, same arguments.
+# RUNNER_FORMANN_REEXEC tells the new process the update already ran.
+runner_formann_reexec() {
+  local sha="${RUNNER_FORMANN_NEXT_SHA:-$RUNNER_FORMANN_SHA}" script
+  script="$(runner_formann_script)"
+  echo "[$(now_clock)] runner: re-executing from the Runner's Formann at $sha ($script)" >&2
+  export RUNNER_FORMANN_REEXEC="$sha"
+  exec bash "$script" ${RUNNER_ARGV[@]+"${RUNNER_ARGV[@]}"}
+}
+
+# Startup: update the Runner's Formann and re-execute from it when needed.
+# Returns 0 in every case it stays in this process; on refusal it sets
+# RUNNER_FORMANN_REFUSAL (main turns that into a pre-flight abort once the
+# run dir exists).
+start_runner_formann() {
+  if [ -z "${RUNNER_FORMANN_DIR:-}" ]; then
+    RUNNER_FORMANN_MANAGED=0
+    RUNNER_FORMANN_SHA="$(formann_checkout_sha "$HERE")"
+    return 0
+  fi
+  RUNNER_FORMANN_MANAGED=1
+
+  if [ -n "${RUNNER_FORMANN_REEXEC:-}" ]; then
+    local handed="$RUNNER_FORMANN_REEXEC"
+    unset RUNNER_FORMANN_REEXEC
+    if runner_formann_runs_here; then
+      RUNNER_FORMANN_SHA="$handed"
+      return 0
+    fi
+    # Never loop: a re-exec that didn't land in the checkout refuses.
+    RUNNER_FORMANN_REFUSAL="re-executed, but not running from $RUNNER_FORMANN_DIR/framework/runner"
+    return 0
+  fi
+
+  local before out
+  before="$(formann_checkout_sha "$RUNNER_FORMANN_DIR")"
+  if ! out="$(formann_self_update 2>&1)"; then
+    RUNNER_FORMANN_REFUSAL="$(printf '%s\n' "$out" | sed -n 's/^formann-update: //p' | tail -n 1)"
+    [ -n "$RUNNER_FORMANN_REFUSAL" ] || RUNNER_FORMANN_REFUSAL="$out"
+    return 0
+  fi
+  RUNNER_FORMANN_SHA="${out##*$'\n'}"
+  if [ "$RUNNER_FORMANN_SHA" != "$before" ]; then
+    echo "[$(now_clock)] runner: Runner's Formann fast-forwarded $before → $RUNNER_FORMANN_SHA ($(formann_update_ref))" >&2
+  fi
+  if [ "$RUNNER_FORMANN_SHA" != "$before" ] || ! runner_formann_runs_here; then
+    RUNNER_FORMANN_NEXT_SHA="$RUNNER_FORMANN_SHA"
+    runner_formann_reexec
+  fi
+  return 0
+}
+
+# Idle loop, before every pass after the first: update the Runner's Formann
+# again. Returns 1 to skip the pass — with RUN_STOP_REASON `formann-refused`
+# when the update refused (the runner keeps idling on the code it runs, and
+# drains nothing until the checkout is reconciled), or `formann-updated` when
+# the sha moved (RUNNER_FORMANN_REEXEC_PENDING: run_idle ends the run and
+# finalize_run re-executes on the new code). Unmanaged: always 0.
+refresh_runner_formann() {
+  [ "$RUNNER_FORMANN_MANAGED" -eq 1 ] || return 0
+  local out sha
+  if ! out="$(formann_self_update 2>&1)"; then
+    echo "[$(now_clock)] runner: refusing this pass — $(printf '%s\n' "$out" | sed -n 's/^formann-update: //p' | tail -n 1)"
+    RUN_STOP_REASON="formann-refused"
+    return 1
+  fi
+  sha="${out##*$'\n'}"
+  if [ "$sha" != "$RUNNER_FORMANN_SHA" ]; then
+    echo "[$(now_clock)] runner: Runner's Formann fast-forwarded $RUNNER_FORMANN_SHA → $sha ($(formann_update_ref))"
+    RUNNER_FORMANN_NEXT_SHA="$sha"
+    RUNNER_FORMANN_REEXEC_PENDING=1
+    RUN_STOP_REASON="formann-updated"
+    return 1
+  fi
+  return 0
+}
+
 # === Main ==================================================================
 
 main() {
   set -euo pipefail
+  RUNNER_ARGV=("$@")
   parse_args "$@"
   resolve_host_repo
+  # Before the run dir, the lock and any claim: bring the Runner's Formann to
+  # its ref, and re-execute from it when this isn't its current code.
+  start_runner_formann
   # Set TARGET_FEATURE and RUN_FEATURE before setup_run_dir so the per-run
   # dir and SUMMARY.md always know the feature context (single/loop only).
   case "$RUN_MODE" in
@@ -3803,12 +5103,16 @@ main() {
   # still runs the trap.
   trap finalize_run EXIT
   trap handle_preflight_signal INT TERM
+  if [ -n "$RUNNER_FORMANN_REFUSAL" ]; then
+    fail_invariant "runner-formann" "refusing to drain: $RUNNER_FORMANN_REFUSAL"
+  fi
+  echo "[$(now_clock)] runner: Formann $(runner_formann_label)"
   preflight
   trap handle_signal INT TERM
   case "$RUN_MODE" in
     single) run_single ;;
-    loop)   run_loop ;;
-    drain)  run_drain ;;
+    loop)   if [ -n "$ARG_IDLE" ]; then run_idle run_claimed_loop; else run_claimed_loop; fi ;;
+    drain)  if [ -n "$ARG_IDLE" ]; then run_idle run_drain; else run_drain; fi ;;
     *)
       echo "runner: internal error — unknown run mode '$RUN_MODE'" >&2
       exit 2
