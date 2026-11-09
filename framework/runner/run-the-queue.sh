@@ -1854,13 +1854,31 @@ reset_runner_checkout_origin() {
 #     feature. Requires the checkout directory to already exist (see
 #     ensure_runner_checkout_exists above).
 #
+# Args: $1 = branch  $2 = optional `defer-create`
+#
+#   With `defer-create`, a branch missing everywhere (no host branch, no
+#   parking ref, nothing on the Shared remote) is not created: the
+#   runner-checkout is put on a detached HEAD at the default branch's fresh
+#   tip — the exact tree the new branch would start from, so a snapshot
+#   taken now reads what it would read after the lazy init — and
+#   RUNNER_CHECKOUT_BRANCH_DEFERRED is set to the branch. No local branch,
+#   no push. Drain mode uses this so a feature with nothing to dispatch
+#   never gets an empty branch on the Shared remote (#14); it calls again
+#   without the flag once it knows the feature has work. A branch that
+#   exists anywhere syncs exactly as without the flag.
+#
 # Failure mode:
 #   - Returns 1 with a stderr diagnostic for any git failure or post-sync
 #     mismatch. The caller decides whether to `fail_invariant` (pre-flight
 #     / narrowed mode) or record a per-feature `skip:fetch-failed` (drain
 #     mode). The function itself never aborts — it has no run-mode context.
+RUNNER_CHECKOUT_BRANCH_DEFERRED=""
 ensure_runner_checkout_on_branch() {
-  local branch="$1"
+  local branch="$1" defer_create=0
+  RUNNER_CHECKOUT_BRANCH_DEFERRED=""
+  if [ "${2:-}" = "defer-create" ]; then
+    defer_create=1
+  fi
   if [ -z "$branch" ]; then
     echo "runner: ensure_runner_checkout_on_branch: empty branch" >&2
     return 1
@@ -1983,6 +2001,26 @@ ensure_runner_checkout_on_branch() {
     if ! git -C "$HOST_CHECKOUT" fetch --quiet origin "$default_branch" >&2; then
       echo "runner: ensure_runner_checkout_on_branch: git fetch origin $default_branch (lazy init) failed" >&2
       return 1
+    fi
+    if [ "$defer_create" -eq 1 ]; then
+      # Not yet: view the default branch's tip without creating anything.
+      # Non-destructive (refs/heads/<branch>, if the runner-checkout has
+      # one, is left alone), so the guard below is not needed here; it runs
+      # when the branch is actually created.
+      if ! git -C "$HOST_CHECKOUT" checkout --quiet --detach "refs/remotes/origin/$default_branch" >&2; then
+        echo "runner: ensure_runner_checkout_on_branch: git checkout --detach origin/$default_branch (deferred lazy init for $branch) failed" >&2
+        return 1
+      fi
+      if ! git -C "$HOST_CHECKOUT" reset --quiet --hard "refs/remotes/origin/$default_branch" >&2; then
+        echo "runner: ensure_runner_checkout_on_branch: git reset --hard origin/$default_branch (deferred lazy init for $branch) failed" >&2
+        return 1
+      fi
+      if ! git -C "$HOST_CHECKOUT" clean --quiet -fd >&2; then
+        echo "runner: ensure_runner_checkout_on_branch: git clean -fd failed" >&2
+        return 1
+      fi
+      RUNNER_CHECKOUT_BRANCH_DEFERRED="$branch"
+      return 0
     fi
     # Guard: the runner-checkout's local refs/heads/<branch> may hold commits
     # from a prior dispatch whose propagation failed. With both host refs absent
@@ -4518,8 +4556,12 @@ drain_one_feature() {
 
   # Sync the runner-checkout to this feature's branch. fail-soft: a fetch
   # failure for one feature is recorded and the run continues with the next.
-  # Missing host branches are handled lazily by ensure_runner_checkout_on_branch.
-  if ! ensure_runner_checkout_on_branch "$feature"; then
+  # A branch missing everywhere is not created yet (`defer-create`, #14): the
+  # checkout views the default branch's tip, which is what the snapshot
+  # below must read (local-markdown reads the checkout's HEAD), and the
+  # branch is created and pushed only once the feature turns out to have
+  # work. An idle pass thus never pushes an empty branch.
+  if ! ensure_runner_checkout_on_branch "$feature" defer-create; then
     echo "[$(now_clock)] runner: skipping $feature — fetch-failed"
     record_feature_outcome "$feature" "skip:fetch-failed"
     return 0
@@ -4545,6 +4587,17 @@ drain_one_feature() {
     echo "[$(now_clock)] runner: skipping $feature — queue-empty"
     record_feature_outcome "$feature" "skip:queue-empty"
     return 0
+  fi
+
+  # The feature has work: now create its deferred branch from the default
+  # branch and push it to the Shared remote, before the claim and the first
+  # dispatch (#5).
+  if [ "$RUNNER_CHECKOUT_BRANCH_DEFERRED" = "$feature" ]; then
+    if ! ensure_runner_checkout_on_branch "$feature"; then
+      echo "[$(now_clock)] runner: skipping $feature — fetch-failed"
+      record_feature_outcome "$feature" "skip:fetch-failed"
+      return 0
+    fi
   fi
 
   # Claim the feature on the Shared remote before its first dispatch. A

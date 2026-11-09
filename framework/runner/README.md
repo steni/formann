@@ -344,7 +344,7 @@ Window-waits do not consume the transport-retry budget, and the transport attemp
 
 ## Default-branch resolution
 
-When a feature's branch exists on the Shared remote but not on host, the runner starts from the remote's branch (see *Publishing to the Shared remote*). When it doesn't exist anywhere yet, the runner lazy-initializes it from the repo's default branch — based on that branch's *current host tip*, fetched at sync time — and pushes it to the Shared remote at once. The same resolution drives the lazy-init preserve-commits guard and the unborn-HEAD recovery. The default branch is resolved deliberately (`resolve_default_branch`), in precedence order:
+When a feature's branch exists on the Shared remote but not on host, the runner starts from the remote's branch (see *Publishing to the Shared remote*). When it doesn't exist anywhere yet, the runner lazy-initializes it from the repo's default branch — based on that branch's *current host tip*, fetched at sync time — and pushes it to the Shared remote at once. In drain mode (and each `--idle` pass) that happens only once the feature's snapshot shows work to dispatch; a feature with nothing eligible gets no branch at all. The same resolution drives the lazy-init preserve-commits guard and the unborn-HEAD recovery. The default branch is resolved deliberately (`resolve_default_branch`), in precedence order:
 
 1. `RUNNER_DEFAULT_BRANCH` — operator override.
 2. The host repo's own `refs/remotes/origin/HEAD` — when the host was cloned from a real upstream, this is the upstream's default branch.

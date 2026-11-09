@@ -89,6 +89,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   own when its runner is killed outright; a takeover it sees stops the feature after the dispatch in
   flight. Pre-flight (`claim-knobs`) refuses a heartbeat interval that is not a whole number above 0
   or not below the stale-after time.
+- AFK runner no longer pushes an empty branch to the Shared remote for every feature it merely
+  checks. In drain mode and on every `--idle` pass, a feature with no branch anywhere gets its
+  branch created from the default branch and pushed only once its snapshot shows an eligible issue
+  or a pending Blocked re-walk; a feature with nothing to dispatch is recorded `queue-empty` and
+  gets no branch, local or remote. `--feature` and `--issue` still create the branch up front.
+  Branches pushed by an earlier version are not deleted.
 - AFK runner puts the runner-checkout's `origin` back to the host repo before every sync and logs
   the repair, so a dispatch that rewrote or removed the remote to push can no longer halt the next
   run with `preflight-abort: runner-checkout`. Every dispatch is told that the runner publishes

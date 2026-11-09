@@ -7100,6 +7100,186 @@ EOF
   grep -qx "remotefeat $remote_tip" "$RF_DRAINED_FILE"
 }
 
+# --- Drain mode: no branch is created for a feature with nothing to do (#14) --
+#
+# Real host repo (local-markdown tracker-snapshot at the role surface), a bare
+# repo standing in for the Shared remote, and a runner-checkout cloned from
+# host. Every feature lives on main only: no host branch, no parking ref, no
+# branch on the Shared remote. Real ensure_runner_checkout_on_branch, real
+# take_snapshot and real claims; only the mvn cache and the per-issue loop are
+# mocked. The run_loop mock records, at the moment the drain hands over to the
+# per-issue loop, the feature, the runner-checkout's branch and the Shared
+# remote's tip for it.
+
+# Write a local-markdown issue file. Args: $1=feature dir  $2=nn  $3=status
+nobranch_issue() {
+  mkdir -p "$1/issues"
+  cat >"$1/issues/$2-thing.md" <<ISSUE
+---
+status: $3
+category: enhancement
+type: AFK
+---
+
+# Thing $2
+
+## What to build
+
+A trivial thing.
+
+## Acceptance criteria
+
+- [ ] It does the thing.
+
+## Blocked by
+
+None — can start immediately.
+ISSUE
+}
+
+# Host on main with features `idle` (one done issue), `work` (one
+# ready-for-agent issue) and `rewalk` (one in-review issue).
+setup_nobranch_drain_test() {
+  HOST_REPO="$BATS_TEST_TMPDIR/nb-host"
+  HOST_CHECKOUT="$BATS_TEST_TMPDIR/nb-checkout"
+  HOST_ABORT_DIR="$BATS_TEST_TMPDIR/nb-aborted"
+  HOST_BLOCKED_DIR="$BATS_TEST_TMPDIR/nb-blocked"
+  SHARED_BARE="$BATS_TEST_TMPDIR/nb-shared.git"
+  mkdir -p "$HOST_REPO" "$HOST_ABORT_DIR" "$HOST_BLOCKED_DIR"
+  unset RUNNER_SHARED_REMOTE
+
+  git -C "$HOST_REPO" init --quiet --initial-branch=main
+  mkdir -p "$HOST_REPO/docs/formann/issue-tracker"
+  cp "$HERE/../bindings/issue-tracker/local-markdown/tracker-snapshot" \
+     "$HOST_REPO/docs/formann/issue-tracker/tracker-snapshot"
+  chmod +x "$HOST_REPO/docs/formann/issue-tracker/tracker-snapshot"
+  nobranch_issue "$HOST_REPO/.features/idle" 01 done
+  nobranch_issue "$HOST_REPO/.features/work" 01 ready-for-agent
+  nobranch_issue "$HOST_REPO/.features/rewalk" 01 in-review
+  git -C "$HOST_REPO" add -A
+  git -C "$HOST_REPO" -c user.email=t@t -c user.name=t \
+    commit --quiet -m "three features on main"
+  git init --quiet --bare --initial-branch=main "$SHARED_BARE"
+  git -C "$HOST_REPO" remote add origin "$SHARED_BARE"
+  git -C "$HOST_REPO" push --quiet origin main
+  git clone --quiet "$HOST_REPO" "$HOST_CHECKOUT" >&2
+
+  NB_HANDOVER_FILE="$BATS_TEST_TMPDIR/nb-handover"
+  : >"$NB_HANDOVER_FILE"
+  ensure_mvn_cache_for() { MVN_VOLUME="nb-mvn"; return 0; }
+  run_loop() {
+    printf '%s %s %s\n' "$TARGET_FEATURE" \
+      "$(git -C "$HOST_CHECKOUT" symbolic-ref --quiet --short HEAD || echo detached)" \
+      "$(git -C "$SHARED_BARE" rev-parse --verify --quiet "refs/heads/$TARGET_FEATURE" || echo absent)" \
+      >>"$NB_HANDOVER_FILE"
+    RUN_STOP_REASON="queue-empty"
+    return 0
+  }
+  RUN_DIR="$BATS_TEST_TMPDIR/nb-run"
+  mkdir -p "$RUN_DIR"
+  RUNNER_INTERRUPTED=0
+  RUN_FEATURE_OUTCOMES=()
+  RUN_DISPATCHES=()
+  RUN_BLOCKED_THIS_RUN=""
+  RESOLVED_POST_DRAIN=""
+  RUN_STOP_REASON=""
+  TARGET_FEATURE=""
+  RUN_MODE="drain"
+}
+
+# No refs/heads/<branch> in any of the three repos.
+assert_no_branch_anywhere() {
+  ! git -C "$HOST_REPO" show-ref --quiet --verify "refs/heads/$1"
+  ! git -C "$HOST_CHECKOUT" show-ref --quiet --verify "refs/heads/$1"
+  ! git -C "$SHARED_BARE" show-ref --quiet --verify "refs/heads/$1"
+}
+
+@test "drain_one_feature — nothing eligible, no branch anywhere (#14): no branch created, nothing pushed, queue-empty" {
+  setup_nobranch_drain_test
+  local shared_refs_before
+  shared_refs_before="$(git -C "$SHARED_BARE" for-each-ref)"
+
+  local out="$BATS_TEST_TMPDIR/nb-out"
+  drain_one_feature idle >"$out" 2>&1
+
+  [ "${RUN_FEATURE_OUTCOMES[0]}" = "idle|skip:queue-empty" ]
+  grep -qF "runner: skipping idle — queue-empty" "$out"
+  ! grep -qF "pushed it to" "$out"
+  assert_no_branch_anywhere idle
+  # Nothing at all was pushed: no branch, no claim ref.
+  [ "$(git -C "$SHARED_BARE" for-each-ref)" = "$shared_refs_before" ]
+  [ ! -s "$NB_HANDOVER_FILE" ]
+}
+
+@test "run_drain — a pass over features with nothing eligible and no branch (#14) pushes nothing; the one with work gets its branch" {
+  setup_nobranch_drain_test
+  DISCOVERY_JSON='["idle","work"]'
+
+  run_drain >/dev/null 2>&1
+
+  [ "${RUN_FEATURE_OUTCOMES[0]}" = "idle|skip:queue-empty" ]
+  [ "${RUN_FEATURE_OUTCOMES[1]}" = "work|drained" ]
+  assert_no_branch_anywhere idle
+  [ "$(git -C "$SHARED_BARE" rev-parse --verify --quiet refs/heads/work)" = "$(git -C "$HOST_REPO" rev-parse main)" ]
+}
+
+@test "drain_one_feature — eligible issue, no branch anywhere (#14): branch created and pushed before the first dispatch" {
+  setup_nobranch_drain_test
+  local main_tip
+  main_tip="$(git -C "$HOST_REPO" rev-parse main)"
+
+  drain_one_feature work >/dev/null 2>&1
+
+  [ "${RUN_FEATURE_OUTCOMES[0]}" = "work|drained" ]
+  # When the per-issue loop started, the runner-checkout was on `work` and
+  # the Shared remote already had it, at main's tip.
+  [ "$(cat "$NB_HANDOVER_FILE")" = "work work $main_tip" ]
+}
+
+@test "drain_one_feature — only a pending Blocked re-walk, no branch anywhere (#14): still synced and walked" {
+  setup_nobranch_drain_test
+  write_blocked_marker rewalk 01 "review" "the preview service"
+  local main_tip
+  main_tip="$(git -C "$HOST_REPO" rev-parse main)"
+
+  drain_one_feature rewalk >/dev/null 2>&1
+
+  [ "${RUN_FEATURE_OUTCOMES[0]}" = "rewalk|drained" ]
+  [ "$(cat "$NB_HANDOVER_FILE")" = "rewalk rewalk $main_tip" ]
+}
+
+@test "drain_one_feature — nothing eligible after a feature that was synced (#14): the next snapshot reads main, not the previous branch" {
+  # The runner-checkout is left on `work` by the first feature. `idle` has
+  # no branch: its snapshot must come from main (where its done issue is),
+  # and it must still not get a branch.
+  setup_nobranch_drain_test
+  drain_one_feature work >/dev/null 2>&1
+  # A commit on the `work` branch that marks idle's issue ready — visible
+  # only to a snapshot that (wrongly) reads the previous feature's branch.
+  nobranch_issue "$HOST_CHECKOUT/.features/idle" 01 ready-for-agent
+  git -C "$HOST_CHECKOUT" add -A
+  git -C "$HOST_CHECKOUT" -c user.email=t@t -c user.name=t \
+    commit --quiet -m "work branch only: idle looks ready here"
+
+  drain_one_feature idle >/dev/null 2>&1
+
+  [ "${RUN_FEATURE_OUTCOMES[1]}" = "idle|skip:queue-empty" ]
+  assert_no_branch_anywhere idle
+}
+
+@test "ensure_runner_checkout — --feature on a feature with no branch anywhere (#14): created and pushed up front" {
+  setup_nobranch_drain_test
+  RUN_MODE="single"
+  TARGET_FEATURE="idle"
+
+  run ensure_runner_checkout
+
+  assert_success
+  assert_output --partial "runner: created idle from main and pushed it to origin/idle"
+  [ "$(git -C "$HOST_CHECKOUT" symbolic-ref --short HEAD)" = "idle" ]
+  [ "$(git -C "$SHARED_BARE" rev-parse --verify --quiet refs/heads/idle)" = "$(git -C "$HOST_REPO" rev-parse main)" ]
+}
+
 @test "drain_one_feature — records skip:fetch-failed when runner-checkout sync fails" {
   setup_drain_test
   git -C "$HOST_REPO" branch alpha

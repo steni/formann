@@ -127,11 +127,10 @@ Wraps the per-issue loop and walks every feature in the discovery output.
 │   [feature empty?] ──yes──► RUN_STOP_REASON = "completed"; stop           │
 │         │ no                                                              │
 │         ▼                                                                 │
-│   ensure_runner_checkout_on_branch(feature)  (reads <shared>/<feature>;   │
-│                                                lazy: inits from resolved  │
-│                                                default branch's host tip  │
-│                                                and pushes it, if no ref   │
-│                                                exists anywhere yet)       │
+│   ensure_runner_checkout_on_branch(feature, defer-create)                 │
+│                          (reads <shared>/<feature>; no ref anywhere yet:  │
+│                           detached HEAD at the resolved default branch's  │
+│                           host tip, no branch created, nothing pushed)    │
 │         │                                                                 │
 │   [fetch failed?] ──yes──► record skip:fetch-failed; next feature         │
 │         │ no                                                              │
@@ -144,6 +143,11 @@ Wraps the per-issue loop and walks every feature in the discovery output.
 │   [≥1 eligible non-aborted ref in snap?]                                  │
 │         │ no  ──► record skip:queue-empty; next feature                   │
 │         │ yes                                                             │
+│         ▼                                                                 │
+│   [branch deferred?] ──yes──► ensure_runner_checkout_on_branch(feature)   │
+│         │                     (lazy init: creates the branch from the     │
+│         │                      default branch's tip and pushes it;        │
+│         │                      failure → record skip:fetch-failed)        │
 │         ▼                                                                 │
 │   ensure_mvn_cache_for(feature)   (lazy — only here, not in preflight)    │
 │         │                                                                 │
