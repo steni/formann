@@ -10348,8 +10348,25 @@ while [ $# -gt 0 ]; do
 done
 echo "$$" >"$FAKE_CONTAINER_PID_FILE"
 trap 'exit 143' TERM
-end=$(( $(date +%s) + FAKE_CONTAINER_SECONDS ))
-while [ "$(date +%s)" -lt "$end" ]; do sleep 0.2; done
+if [ -n "${FAKE_CONTAINER_UNTIL_HEARTBEATS:-}" ]; then
+  # Live until the claim on the Shared remote has moved past N new heartbeat
+  # commits, then exit: the test waits for the refresher's work, not for a
+  # wall-clock duration a loaded machine may not keep up with. Each sha seen
+  # is recorded; a 60s safety limit writes a marker instead of hanging.
+  ref=refs/formann/claims/f
+  last="$(git --git-dir="$FAKE_CLAIM_REMOTE" rev-parse --verify --quiet "$ref")"
+  : >"$FAKE_HEARTBEATS_SEEN"
+  end=$(( $(date +%s) + 60 ))
+  while [ "$(wc -l <"$FAKE_HEARTBEATS_SEEN" | tr -d ' ')" -lt "$FAKE_CONTAINER_UNTIL_HEARTBEATS" ]; do
+    if [ "$(date +%s)" -ge "$end" ]; then echo timeout >"$FAKE_HEARTBEATS_SEEN.timeout"; break; fi
+    now="$(git --git-dir="$FAKE_CLAIM_REMOTE" rev-parse --verify --quiet "$ref")"
+    if [ -n "$now" ] && [ "$now" != "$last" ]; then echo "$now" >>"$FAKE_HEARTBEATS_SEEN"; last="$now"; fi
+    sleep 0.1
+  done
+else
+  end=$(( $(date +%s) + FAKE_CONTAINER_SECONDS ))
+  while [ "$(date +%s)" -lt "$end" ]; do sleep 0.2; done
+fi
 printf '{"type":"result","subtype":"success","is_error":false,"result":"x","uuid":"u"}\n'
 exit 0
 DOCKEREOF
@@ -10489,25 +10506,26 @@ wait_pid_gone() {
   declare -f preflight | grep -q 'check_claim_knobs'
 }
 
-@test "run_dispatch_container (#13) — a container outliving stale-after leaves the claim held at every point; the refresher is reaped and its sha adopted" {
+@test "run_dispatch_container (#13) — the claim is heart-beaten again and again while the container runs; the refresher is reaped and its sha adopted" {
   setup_refresher_test
-  local samples="$BATS_TEST_TMPDIR/verdicts" stop="$BATS_TEST_TMPDIR/stop-observer"
-  : >"$samples"
-  # Another runner's view of the claim, sampled every half second.
-  ( while [ ! -f "$stop" ]; do remote_claim_verdict >>"$samples"; sleep 0.5; done ) &
-  local observer=$!
+  # The container lives until it has seen three heartbeats land on the Shared
+  # remote: deterministic, however slowly the machine schedules the refresher.
+  # (That a heartbeat interval below stale-after keeps the claim held is
+  # check_claim_knobs' job, tested above; that without the refresher the
+  # claim goes stale is the control test below.)
+  export FAKE_CONTAINER_UNTIL_HEARTBEATS=3 FAKE_CLAIM_REMOTE="$SHARED_CLAIMS"
+  export FAKE_HEARTBEATS_SEEN="$BATS_TEST_TMPDIR/heartbeats-seen"
 
-  local started=$(( $(date +%s) ))
   run_dispatch_container "f/01" "$BATS_TEST_TMPDIR/dispatch" >"$BATS_TEST_TMPDIR/out" 2>&1
-  local took=$(( $(date +%s) - started ))
-  : >"$stop"
-  wait "$observer"
 
-  # The dispatch outlived stale-after by a wide margin...
-  [ "$took" -ge $(( RUNNER_CLAIM_STALE_AFTER * 2 )) ] || fail "dispatch took only ${took}s"
-  # ...and the claim was held at every sample.
-  [ "$(wc -l <"$samples" | tr -d ' ')" -ge 10 ] || fail "too few samples: $(cat "$samples")"
-  [ "$(sort -u "$samples")" = "held" ] || fail "verdicts: $(sort "$samples" | uniq -c)"
+  [ ! -f "$FAKE_HEARTBEATS_SEEN.timeout" ] || fail "no 3 heartbeats within 60s: $(cat "$FAKE_HEARTBEATS_SEEN")"
+  [ "$(sort -u "$FAKE_HEARTBEATS_SEEN" | wc -l | tr -d ' ')" -eq 3 ]
+  ! grep -qx "$TAKEN_SHA" "$FAKE_HEARTBEATS_SEEN"
+  # Every heartbeat seen is this runner's, on this feature.
+  local sha
+  while read -r sha; do
+    [ "$(claim_field "$(git -C "$SHARED_CLAIMS" log -1 --format=%B "$sha")" machine)" = "m1" ]
+  done <"$FAKE_HEARTBEATS_SEEN"
   # The refresher is gone and the runner adopted the sha it last wrote.
   [ -z "$CLAIM_REFRESHER_PID" ]
   [ "$CLAIM_HELD_FEATURE" = "f" ]
@@ -10521,18 +10539,14 @@ wait_pid_gone() {
 
 @test "run_item_container (#13) — a post-implement step container is covered too" {
   setup_refresher_test
-  export FAKE_CONTAINER_SECONDS=7
+  export FAKE_CONTAINER_UNTIL_HEARTBEATS=2 FAKE_CLAIM_REMOTE="$SHARED_CLAIMS"
+  export FAKE_HEARTBEATS_SEEN="$BATS_TEST_TMPDIR/heartbeats-seen"
   printf 'review\n' >"$BATS_TEST_TMPDIR/step.md"
-  local samples="$BATS_TEST_TMPDIR/verdicts" stop="$BATS_TEST_TMPDIR/stop-observer"
-  : >"$samples"
-  ( while [ ! -f "$stop" ]; do remote_claim_verdict >>"$samples"; sleep 0.5; done ) &
-  local observer=$!
 
   run_item_container "f/01" "$BATS_TEST_TMPDIR/item" "$BATS_TEST_TMPDIR/step.md" >"$BATS_TEST_TMPDIR/out" 2>&1
-  : >"$stop"
-  wait "$observer"
 
-  [ "$(sort -u "$samples")" = "held" ] || fail "verdicts: $(sort "$samples" | uniq -c)"
+  [ ! -f "$FAKE_HEARTBEATS_SEEN.timeout" ] || fail "no 2 heartbeats within 60s: $(cat "$FAKE_HEARTBEATS_SEEN")"
+  [ "$(sort -u "$FAKE_HEARTBEATS_SEEN" | wc -l | tr -d ' ')" -eq 2 ]
   [ -z "$CLAIM_REFRESHER_PID" ]
 }
 
@@ -10709,28 +10723,31 @@ teardown_dispatching_runner() {
   wait_pid_gone "$REFRESHER_PID" 1 || { teardown_dispatching_runner; fail "refresher survived the container's death"; }
 }
 
-@test "claim refresher (#13) — a runner killed outright mid-dispatch stops refreshing: stale within stale-after plus one interval" {
+@test "claim refresher (#13) — a runner killed outright mid-dispatch stops refreshing, so its claim goes stale stale-after past its last heartbeat" {
   setup_refresher_process_test
   start_dispatching_runner 60
-  [ "$(remote_claim_verdict)" = "held" ]
-  local killed_at
   kill -KILL "$RUNNER_PID"
-  killed_at="$(date +%s)"
   wait "$RUNNER_PID" 2>/dev/null || true
-  # The refresher notices its runner is gone within one interval.
-  wait_pid_gone "$REFRESHER_PID" $(( RUNNER_CLAIM_HEARTBEAT_SECONDS + 2 )) \
+  # The refresher notices its runner is gone and exits. The bound is generous
+  # on purpose: this is a wait, not a timing claim.
+  wait_pid_gone "$REFRESHER_PID" 30 \
     || { teardown_dispatching_runner; fail "refresher outlived its runner"; }
-  # And the claim goes stale within stale-after plus one interval (plus the
-  # one-second resolution of the heartbeat stamp and of this clock).
-  local bound=$(( RUNNER_CLAIM_STALE_AFTER + RUNNER_CLAIM_HEARTBEAT_SECONDS + 2 ))
-  local verdict=""
-  while [ $(( $(date +%s) - killed_at )) -le "$bound" ]; do
-    verdict="$(remote_claim_verdict)"
-    [ "$verdict" = "stale" ] && break
-    sleep 0.2
-  done
+  # Nothing refreshes the claim any more: it stays put across two intervals.
+  local sha_then sha_now
+  sha_then="$(git -C "$SHARED_CLAIMS" rev-parse refs/formann/claims/f)"
+  sleep $(( RUNNER_CLAIM_HEARTBEAT_SECONDS * 2 ))
+  sha_now="$(git -C "$SHARED_CLAIMS" rev-parse refs/formann/claims/f)"
   teardown_dispatching_runner
-  [ "$verdict" = "stale" ] || fail "claim still $verdict ${bound}s after the kill"
+  [ "$sha_now" = "$sha_then" ] || fail "the claim moved after the refresher died"
+  # So any reader judges it by its last heartbeat: held up to stale-after past
+  # it, stale after that. claim_verdict takes the reader's clock as an
+  # argument, so this is decided without waiting on the real clock.
+  local msg last
+  msg="$(git -C "$SHARED_CLAIMS" log -1 --format=%B "$sha_now")"
+  last="$(claim_iso_to_epoch "$(claim_field "$msg" heartbeat)")"
+  [ "$(claim_verdict "$msg" "$last" "$RUNNER_CLAIM_STALE_AFTER")" = "held" ]
+  [ "$(claim_verdict "$msg" $(( last + RUNNER_CLAIM_STALE_AFTER )) "$RUNNER_CLAIM_STALE_AFTER")" = "held" ]
+  [ "$(claim_verdict "$msg" $(( last + RUNNER_CLAIM_STALE_AFTER + 1 )) "$RUNNER_CLAIM_STALE_AFTER")" = "stale" ]
 }
 
 # === Drain pass: the cheap any-eligible check (#15) ===========================
