@@ -3,15 +3,16 @@
 ### tracker-snapshot — github-issues binding's machine-readable interface.
 ###
 ### Usage: tracker-snapshot --list
-###        tracker-snapshot --any-eligible
+###        tracker-snapshot --eligible-features
 ###        tracker-snapshot <feature-slug>
 ###
 ### --list:  Emit a JSON array of active feature slugs (open formann:feature
 ###          parent issues, ordered by issue number ascending).
 ###
-### --any-eligible:
-###          Print `yes` when at least one issue in an active feature would be
-###          `eligible: true` in that feature's own snapshot, otherwise `no`.
+### --eligible-features:
+###          Emit a JSON array of the active feature slugs holding at least
+###          one issue that would be `eligible: true` in that feature's own
+###          snapshot, ordered as --list orders them; `[]` when none does.
 ###          One GraphQL query (plus pages) over the open ready-for-agent
 ###          issues, never one per feature.  Exit 0 either way; 3 on a
 ###          transient failure.
@@ -41,7 +42,7 @@ if ! command -v jq &>/dev/null; then
 fi
 
 if [ "$#" -lt 1 ]; then
-  echo "usage: tracker-snapshot <feature-slug> | tracker-snapshot --list | tracker-snapshot --any-eligible" >&2
+  echo "usage: tracker-snapshot <feature-slug> | tracker-snapshot --list | tracker-snapshot --eligible-features" >&2
   exit "$_EXIT_USAGE"
 fi
 
@@ -185,9 +186,9 @@ if [ "$1" = "--list" ]; then
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# --any-eligible mode
+# --eligible-features mode
 # ═══════════════════════════════════════════════════════════════════════════════
-# One question for the whole tracker: would any feature's snapshot hold an
+# One question for the whole tracker: which features' snapshots would hold an
 # eligible issue?  Asked with one query over the open ready-for-agent issues
 # (paginated), each with its parent and its blockers' state, close reason and
 # parent, so the snapshot's blocker resolution can be applied in memory:
@@ -202,10 +203,11 @@ fi
 # The repository `labels:` filter matches any of the listed labels, not all
 # of them, so the query filters on the status label alone and the type is
 # checked here.  Where the snapshot could differ (a slug shared by two
-# parents, say) the answer errs towards `yes`: a wrong `yes` costs one full
-# pass, a wrong `no` would leave work undispatched.
-if [ "$1" = "--any-eligible" ]; then
-  _any_query='query($owner: String!, $name: String!, $cursor: String) {
+# parents, say) the answer errs towards listing the feature: a feature listed
+# wrongly costs one snapshot, a feature left out wrongly would leave its work
+# undispatched.
+if [ "$1" = "--eligible-features" ]; then
+  _eligible_query='query($owner: String!, $name: String!, $cursor: String) {
   repository(owner: $owner, name: $name) {
     issues(labels: ["formann:status:ready-for-agent"], states: [OPEN], first: 100, after: $cursor) {
       pageInfo { hasNextPage endCursor }
@@ -222,50 +224,56 @@ if [ "$1" = "--any-eligible" ]; then
   }
 }'
 
+  # Every page's eligible roots, as {number, slug} objects, one JSON array
+  # per page.
+  _roots_pages=""
   _cursor=""
   while :; do
     if [ -z "$_cursor" ]; then
-      _resp="$(_graphql -F owner="$_gh_owner" -F name="$_gh_name" -f query="$_any_query")"
+      _resp="$(_graphql -F owner="$_gh_owner" -F name="$_gh_name" -f query="$_eligible_query")"
     else
       _resp="$(_graphql -F owner="$_gh_owner" -F name="$_gh_name" \
-        -F cursor="$_cursor" -f query="$_any_query")"
+        -F cursor="$_cursor" -f query="$_eligible_query")"
     fi
 
-    if ! _found="$(printf '%s' "$_resp" | jq -r '
+    if ! _page_roots="$(printf '%s' "$_resp" | jq -c '
       def has_label($n): any(.labels.nodes[]?; .name == $n);
-      def slugged: any(.labels.nodes[]?; .name | startswith("formann:slug:"));
-      [ .data.repository.issues.nodes[]?
+      def slugs: [ .labels.nodes[]?.name | select(startswith("formann:slug:"))
+                   | ltrimstr("formann:slug:") ];
+      if (.data.repository.issues.nodes | type) != "array" then error("no issues") else . end
+      | [ .data.repository.issues.nodes[]
         | select(.state == null or .state == "OPEN")
         | select(has_label("formann:status:ready-for-agent"))
         | select(has_label("formann:type:afk"))
         | . as $i
-        | [ ( $i.parent // empty
-              | select(.state == null or .state == "OPEN")
-              | select(slugged) | .number ),
-            ( $i | select(slugged) | .number ) ] as $roots
-        | select(any($roots[]; . as $r
-            | all($i.blockedBy.nodes[]?;
-                .state == "CLOSED" and .stateReason == "COMPLETED"
-                and (.number == $r or ((.parent // {}).number == $r)))))
-      ] | if length > 0 then "yes" else "no" end')"; then
-      echo "tracker-snapshot: --any-eligible: unparseable API response" >&2
+        | ( ( $i.parent // empty
+              | select(.state == null or .state == "OPEN") ),
+            $i )
+        | select((slugs | length) > 0)
+        | . as $root
+        | select(all($i.blockedBy.nodes[]?;
+            .state == "CLOSED" and .stateReason == "COMPLETED"
+            and (.number == $root.number or ((.parent // {}).number == $root.number))))
+        | {number: $root.number, slug: ($root | slugs[])} ]')"; then
+      echo "tracker-snapshot: --eligible-features: unparseable API response" >&2
       exit "$_EXIT_TRANSIENT"
     fi
+    _roots_pages="$_roots_pages$_page_roots"$'\n'
 
-    if [ "$_found" = "yes" ]; then
-      echo "yes"
-      exit 0
-    fi
     if [ "$(printf '%s' "$_resp" | jq -r '.data.repository.issues.pageInfo.hasNextPage // false')" != "true" ]; then
       break
     fi
     _cursor="$(printf '%s' "$_resp" | jq -r '.data.repository.issues.pageInfo.endCursor // empty')"
     if [ -z "$_cursor" ]; then
-      echo "tracker-snapshot: --any-eligible: next page announced without a cursor" >&2
+      echo "tracker-snapshot: --eligible-features: next page announced without a cursor" >&2
       exit "$_EXIT_TRANSIENT"
     fi
   done
-  echo "no"
+
+  # One slug per feature, ordered by its root issue's number, as --list is.
+  printf '%s' "$_roots_pages" | jq -sc '
+    add // [] | sort_by(.number)
+    | reduce .[].slug as $s ([]; if index([$s]) then . else . + [$s] end)'
   exit 0
 fi
 

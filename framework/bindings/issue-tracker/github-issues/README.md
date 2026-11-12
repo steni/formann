@@ -6,7 +6,7 @@ This binding represents the issue-tracker role of the lifecycle for projects who
 
 - **[`BINDING.md`](BINDING.md)** — the role doc. Source of truth for the agent-facing conventions: Tracker operations (the seven binding-agnostic verbs and their GitHub-issues realizations), issue conventions, authorship. Adopting projects symlink `docs/formann/issue-tracker/` at this binding folder so skills resolve via the role surface.
 - **[`bootstrap-labels`](bootstrap-labels)** — idempotent install-time script. Creates the binding's static label namespace via `gh label create --force`. Run once per Consumer repo before first use; re-running is harmless.
-- **[`tracker-snapshot`](tracker-snapshot)** — the binding's machine-readable interface. Emits a JSON snapshot of a feature's issues with computed AFK eligibility (`tracker-snapshot <feature-slug>`) or the list of active feature slugs (`tracker-snapshot --list`), or answers whether any feature has an eligible issue (`tracker-snapshot --any-eligible`). Output is byte-compatible with the local-markdown binding. Contract summarised below; full schema in [`BINDING.md`](BINDING.md#snapshot-contract).
+- **[`tracker-snapshot`](tracker-snapshot)** — the binding's machine-readable interface. Emits a JSON snapshot of a feature's issues with computed AFK eligibility (`tracker-snapshot <feature-slug>`) or the list of active feature slugs (`tracker-snapshot --list`), or the features that have an eligible issue (`tracker-snapshot --eligible-features`). Output is byte-compatible with the local-markdown binding. Contract summarised below; full schema in [`BINDING.md`](BINDING.md#snapshot-contract).
 - **[`blocked-passes`](blocked-passes)** — prints an issue's Blocked pass count (Blocked comments since its latest Implementation comment), read with `gh issue view --json comments`. The AFK runner reads it after a step ends Blocked. See [`BINDING.md`](BINDING.md#comment-with-kind).
 - **[`comment-on-feature`](comment-on-feature)** — posts a comment on a feature's parent issue ("Comment with `<kind>`" on the parent "Read the feature" finds). The AFK runner posts its claim Note through it. See [`BINDING.md`](BINDING.md#comment-with-kind).
 - **[`body-edit`](body-edit)** — section-level body rewrite for issues. Replaces (or removes) a single `## <section>` in an issue body, preserving surrounding sections verbatim. Used by `/triage` and `/implement` to publish the agent brief and record triage notes. See [`BINDING.md`](BINDING.md#body-shaped-write-semantics) for the fetch-then-PATCH semantics and the residual race window.
@@ -26,10 +26,10 @@ The agent-facing rule (see [`BINDING.md`](BINDING.md#authorship)) is the inversi
 ```
 docs/formann/issue-tracker/tracker-snapshot <feature-slug>
 docs/formann/issue-tracker/tracker-snapshot --list
-docs/formann/issue-tracker/tracker-snapshot --any-eligible
+docs/formann/issue-tracker/tracker-snapshot --eligible-features
 ```
 
-`--any-eligible` prints `yes` or `no`: does any feature have an issue the runner could take? One GraphQL query (plus pages) for the whole tracker. The runner asks it before every drain pass, so an idle runner with nothing to do stays cheap on the API budget.
+`--eligible-features` prints a JSON array of the features with an issue the runner could take. One GraphQL query (plus pages) for the whole tracker. The runner asks it before every drain pass and walks only those features, so an idle runner stays cheap on the API budget even while another runner holds the only feature with work.
 
 The output is byte-compatible with the local-markdown binding's snapshot, so consumers (the runner, `/triage`) can read either binding without per-binding branches. The only difference is the `ref` value format: `#N` here, `<feature>/NN` under local-markdown.
 

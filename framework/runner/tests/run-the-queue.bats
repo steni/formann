@@ -6873,9 +6873,10 @@ setup_drain_test() {
     return 0
   }
 
-  # The pass-level cheap check (#15) says there is work, so the drain walks
-  # every feature; the --any-eligible tests below plant other answers.
-  any_eligible_check() { ANY_ELIGIBLE_ANSWER="yes"; ANY_ELIGIBLE_FAILURE=""; }
+  # The pass-level cheap check (#15) lists every discovered feature as having
+  # work, so the drain walks them all; the --eligible-features tests below
+  # plant other answers.
+  eligible_features_check() { ELIGIBLE_FEATURES_JSON="$DISCOVERY_JSON"; ELIGIBLE_FEATURES_FAILURE=""; }
 
   RUN_DIR="$BATS_TEST_TMPDIR/run"
   mkdir -p "$RUN_DIR"
@@ -7221,8 +7222,9 @@ assert_no_branch_anywhere() {
 
   run_drain >/dev/null 2>&1
 
-  [ "${RUN_FEATURE_OUTCOMES[0]}" = "idle|skip:queue-empty" ]
-  [ "${RUN_FEATURE_OUTCOMES[1]}" = "work|drained" ]
+  # The binding lists only `work`, so `idle` is not even walked (#15).
+  [ "${#RUN_FEATURE_OUTCOMES[@]}" -eq 1 ]
+  [ "${RUN_FEATURE_OUTCOMES[0]}" = "work|drained" ]
   assert_no_branch_anywhere idle
   [ "$(git -C "$SHARED_BARE" rev-parse --verify --quiet refs/heads/work)" = "$(git -C "$HOST_REPO" rev-parse main)" ]
 }
@@ -10750,14 +10752,16 @@ teardown_dispatching_runner() {
   [ "$(claim_verdict "$msg" $(( last + RUNNER_CLAIM_STALE_AFTER + 1 )) "$RUNNER_CLAIM_STALE_AFTER")" = "stale" ]
 }
 
-# === Drain pass: the cheap any-eligible check (#15) ===========================
+# === Drain pass: only the features with work (#15) ===========================
 #
-# Before walking features one by one, a drain pass asks the binding once
-# (`tracker-snapshot --any-eligible`). On `no` with no pending Blocked re-walk
-# marker the pass ends at once: no per-feature snapshot, no branch sync.
+# Before walking features one by one, a drain pass asks the binding once which
+# features hold an eligible issue (`tracker-snapshot --eligible-features`).
+# The pass walks those, plus any discovered feature with a pending Blocked
+# re-walk marker on this machine, in discovery order. With neither, the pass
+# ends at once: no per-feature snapshot, no branch sync.
 
 # Record every per-feature sync and snapshot the drain attempts.
-setup_any_eligible_drain_test() {
+setup_eligible_features_drain_test() {
   setup_drain_test
   DISCOVERY_JSON='["alpha","beta"]'
   HOST_BLOCKED_DIR="$BATS_TEST_TMPDIR/blocked"
@@ -10771,9 +10775,19 @@ setup_any_eligible_drain_test() {
   take_snapshot() { echo "$1" >>"$ANY_SNAPS"; _any_orig_snap "$@"; }
 }
 
-@test "run_drain — check says no, nothing pending: the pass ends at once, no snapshot, no branch sync, one log line" {
-  setup_any_eligible_drain_test
-  any_eligible_check() { ANY_ELIGIBLE_ANSWER="no"; }
+# The real eligible_features_check, against a binding script printing $1 and
+# exiting $2 (default 0).
+use_real_eligible_features_check() {
+  unset -f eligible_features_check
+  eval "$(sed -n '/^eligible_features_check() {/,/^}/p' "$RUNNER_SCRIPT")"
+  mkdir -p "$HOST_REPO/docs/formann/issue-tracker"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" %q\nexit %s\n' "$1" "${2:-0}" \
+    >"$HOST_REPO/docs/formann/issue-tracker/tracker-snapshot"
+}
+
+@test "run_drain — no feature listed, nothing pending: the pass ends at once, no snapshot, no branch sync, one log line" {
+  setup_eligible_features_drain_test
+  eligible_features_check() { ELIGIBLE_FEATURES_JSON='[]'; }
 
   run_drain >"$BATS_TEST_TMPDIR/out" 2>&1
 
@@ -10786,36 +10800,74 @@ setup_any_eligible_drain_test() {
   [ "$(wc -l <"$BATS_TEST_TMPDIR/out" | tr -d ' ')" -eq 1 ]
 }
 
-@test "run_drain — check says no but a Blocked re-walk marker is pending: the pass walks every feature" {
-  setup_any_eligible_drain_test
+@test "run_drain — one feature listed: only that feature is synced and snapshotted, and the narrowing is logged once" {
+  setup_eligible_features_drain_test
+  DISCOVERY_JSON='["alpha","beta","gamma"]'
+  eligible_features_check() { ELIGIBLE_FEATURES_JSON='["beta"]'; }
+
+  run_drain >"$BATS_TEST_TMPDIR/out" 2>&1
+
+  [ "$RUN_STOP_REASON" = "completed" ]
+  [ "$(cat "$ANY_SYNCS" | tr '\n' ' ')" = "beta " ]
+  [ "$(cat "$ANY_SNAPS" | tr '\n' ' ')" = "beta " ]
+  [ "$(drain_outcomes_count)" = "1" ]
+  [ "$(drain_outcome_nth 0)" = "beta|drained" ]
+  [ "$(grep -c 'walking 1 of 3 features' "$BATS_TEST_TMPDIR/out")" -eq 1 ]
+  grep -q 'walking 1 of 3 features .*: beta$' "$BATS_TEST_TMPDIR/out"
+}
+
+@test "run_drain — listed features are walked in discovery order, and a listed feature not discovered is ignored" {
+  setup_eligible_features_drain_test
+  DISCOVERY_JSON='["alpha","beta","gamma"]'
+  eligible_features_check() { ELIGIBLE_FEATURES_JSON='["gamma","not-discovered","alpha"]'; }
+
+  run_drain >/dev/null 2>&1
+
+  [ "$RUN_STOP_REASON" = "completed" ]
+  [ "$(cat "$ANY_SNAPS" | tr '\n' ' ')" = "alpha gamma " ]
+}
+
+@test "run_drain — no feature listed but a Blocked re-walk marker is pending: that feature alone is walked" {
+  setup_eligible_features_drain_test
   TEST_CHECKS="$BATS_TEST_TMPDIR/checks"
   : >"$TEST_CHECKS"
-  any_eligible_check() { echo x >>"$TEST_CHECKS"; ANY_ELIGIBLE_ANSWER="no"; }
+  eligible_features_check() { echo x >>"$TEST_CHECKS"; ELIGIBLE_FEATURES_JSON='[]'; }
   write_blocked_marker beta 03 "review" "the staging DB"
 
   run_drain >/dev/null 2>&1
 
   [ "$RUN_STOP_REASON" = "completed" ]
-  [ "$(cat "$ANY_SNAPS" | tr '\n' ' ')" = "alpha beta " ]
-  [ "$(drain_outcomes_count)" = "2" ]
-  # The local marker settles it: no tracker call at all.
-  [ ! -s "$TEST_CHECKS" ]
+  [ "$(cat "$ANY_SNAPS" | tr '\n' ' ')" = "beta " ]
+  [ "$(drain_outcomes_count)" = "1" ]
+  [ "$(wc -l <"$TEST_CHECKS" | tr -d ' ')" -eq 1 ]
+}
+
+@test "run_drain — a listed feature and a feature with a pending marker are both walked, in discovery order" {
+  setup_eligible_features_drain_test
+  DISCOVERY_JSON='["alpha","beta","gamma"]'
+  eligible_features_check() { ELIGIBLE_FEATURES_JSON='["gamma"]'; }
+  write_blocked_marker alpha 02 "review" "the staging DB"
+
+  run_drain >/dev/null 2>&1
+
+  [ "$RUN_STOP_REASON" = "completed" ]
+  [ "$(cat "$ANY_SNAPS" | tr '\n' ' ')" = "alpha gamma " ]
 }
 
 @test "run_drain — a post-drain Blocked marker is pending work too" {
-  setup_any_eligible_drain_test
-  any_eligible_check() { ANY_ELIGIBLE_ANSWER="no"; }
+  setup_eligible_features_drain_test
+  eligible_features_check() { ELIGIBLE_FEATURES_JSON='[]'; }
   write_blocked_marker alpha post-drain "smoke" "the device lab"
 
   run_drain >/dev/null 2>&1
 
   [ "$RUN_STOP_REASON" = "completed" ]
-  grep -Fxq alpha "$ANY_SNAPS"
+  [ "$(cat "$ANY_SNAPS" | tr '\n' ' ')" = "alpha " ]
 }
 
 @test "run_drain — a marker for a feature no longer discovered does not hold the pass open" {
-  setup_any_eligible_drain_test
-  any_eligible_check() { ANY_ELIGIBLE_ANSWER="no"; }
+  setup_eligible_features_drain_test
+  eligible_features_check() { ELIGIBLE_FEATURES_JSON='[]'; }
   write_blocked_marker archived-feature 02 "review" "x"
 
   run_drain >/dev/null 2>&1
@@ -10824,9 +10876,9 @@ setup_any_eligible_drain_test() {
   [ ! -s "$ANY_SNAPS" ]
 }
 
-@test "run_drain — check says yes: the pass walks and dispatches as today" {
-  setup_any_eligible_drain_test
-  any_eligible_check() { ANY_ELIGIBLE_ANSWER="yes"; }
+@test "run_drain — every discovered feature listed: the pass walks and dispatches as before, with no extra log line" {
+  setup_eligible_features_drain_test
+  eligible_features_check() { ELIGIBLE_FEATURES_JSON='["alpha","beta"]'; }
 
   run_drain >"$BATS_TEST_TMPDIR/out" 2>&1
 
@@ -10834,59 +10886,59 @@ setup_any_eligible_drain_test() {
   [ "$(drain_outcome_nth 0)" = "alpha|drained" ]
   [ "$(drain_outcome_nth 1)" = "beta|drained" ]
   [ "$(drained_features_count)" = "2" ]
-  run grep -q 'any-eligible\|nothing to do' "$BATS_TEST_TMPDIR/out"
+  run grep -q 'eligible-features\|nothing to do\|walking' "$BATS_TEST_TMPDIR/out"
   assert_failure
 }
 
 @test "run_drain — a failed check falls back to the full walk, logged once" {
-  setup_any_eligible_drain_test
-  # The real any_eligible_check, against a binding script that fails transiently.
-  unset -f any_eligible_check
-  eval "$(sed -n '/^any_eligible_check() {/,/^}/p' "$RUNNER_SCRIPT")"
-  mkdir -p "$HOST_REPO/docs/formann/issue-tracker"
-  printf '#!/usr/bin/env bash\necho "tracker-snapshot: API request failed after 3 attempts" >&2\nexit 3\n' \
-    >"$HOST_REPO/docs/formann/issue-tracker/tracker-snapshot"
+  setup_eligible_features_drain_test
+  use_real_eligible_features_check "" 3
 
   run_drain >"$BATS_TEST_TMPDIR/out" 2>&1
 
   [ "$RUN_STOP_REASON" = "completed" ]
   [ "$(cat "$ANY_SNAPS" | tr '\n' ' ')" = "alpha beta " ]
   [ "$(drained_features_count)" = "2" ]
-  [ "$(grep -c 'any-eligible check failed' "$BATS_TEST_TMPDIR/out")" -eq 1 ]
-  grep -q 'tracker-snapshot --any-eligible exited 3); walking every feature' "$BATS_TEST_TMPDIR/out"
+  [ "$(grep -c 'eligible-features check failed' "$BATS_TEST_TMPDIR/out")" -eq 1 ]
+  grep -q 'tracker-snapshot --eligible-features exited 3); walking every feature' "$BATS_TEST_TMPDIR/out"
 }
 
-@test "any_eligible_check — an answer that is neither yes nor no is a failed check" {
+@test "eligible_features_check — an answer that is not a JSON array of slugs is a failed check" {
   HOST_REPO="$BATS_TEST_TMPDIR/host"
-  mkdir -p "$HOST_REPO/docs/formann/issue-tracker"
-  printf '#!/usr/bin/env bash\necho maybe\n' >"$HOST_REPO/docs/formann/issue-tracker/tracker-snapshot"
-  run any_eligible_check
-  assert_failure
-  any_eligible_check || true
-  [ "$ANY_ELIGIBLE_FAILURE" = "answered 'maybe'" ]
+  local answer
+  for answer in 'yes' '{"alpha":true}' '[1,2]' '["alpha",null]' ''; do
+    use_real_eligible_features_check "$answer"
+    run eligible_features_check
+    assert_failure
+    eligible_features_check || true
+    [ "$ELIGIBLE_FEATURES_FAILURE" = "answered '$answer'" ]
+  done
+  use_real_eligible_features_check '["alpha","beta"]'
+  eligible_features_check
+  [ "$ELIGIBLE_FEATURES_JSON" = '["alpha","beta"]' ]
 }
 
-@test "run_drain — with the real local-markdown binding: no eligible issue anywhere ends the pass before any snapshot" {
-  setup_any_eligible_drain_test
-  unset -f any_eligible_check
-  eval "$(sed -n '/^any_eligible_check() {/,/^}/p' "$RUNNER_SCRIPT")"
+@test "run_drain — with the real local-markdown binding: only the feature with an eligible issue is walked" {
+  setup_eligible_features_drain_test
+  unset -f eligible_features_check
+  eval "$(sed -n '/^eligible_features_check() {/,/^}/p' "$RUNNER_SCRIPT")"
   mkdir -p "$HOST_REPO/docs/formann/issue-tracker"
   cp "$HERE/../bindings/issue-tracker/local-markdown/tracker-snapshot" \
      "$HOST_REPO/docs/formann/issue-tracker/tracker-snapshot"
-  local i="$HOST_REPO/.features/alpha/issues"
-  mkdir -p "$i" "$HOST_REPO/.features/beta/issues"
+  local i="$HOST_REPO/.features/beta/issues"
+  mkdir -p "$i" "$HOST_REPO/.features/alpha/issues"
   printf -- '---\nstatus: ready-for-agent\ncategory: enhancement\ntype: HITL\n---\n\n# A\n' >"$i/01-a.md"
 
   run_drain >/dev/null 2>&1
   [ "$RUN_STOP_REASON" = "nothing-eligible" ]
   [ ! -s "$ANY_SNAPS" ]
 
-  # Make one issue AFK: the same check now says yes and the pass walks.
+  # Make beta's issue AFK: the same check now lists beta, and only beta is walked.
   printf -- '---\nstatus: ready-for-agent\ncategory: enhancement\ntype: AFK\n---\n\n# A\n' >"$i/01-a.md"
   RUN_STOP_REASON=""
   run_drain >/dev/null 2>&1
   [ "$RUN_STOP_REASON" = "completed" ]
-  grep -Fxq alpha "$ANY_SNAPS"
+  [ "$(cat "$ANY_SNAPS" | tr '\n' ' ')" = "beta " ]
 }
 
 @test "format_multi_feature_summary_md — a nothing-eligible pass says so in one line" {
@@ -10897,7 +10949,7 @@ setup_any_eligible_drain_test() {
 }
 
 @test "run_idle — a quiet drain pass counts as a pass with nothing to do, and the next pass asks again" {
-  setup_any_eligible_drain_test
+  setup_eligible_features_drain_test
   RUN_MODE=drain
   ARG_IDLE=1
   RUN_PASS=0
@@ -10906,7 +10958,7 @@ setup_any_eligible_drain_test() {
   RUN_POST_DRAIN=()
   TEST_CHECKS="$BATS_TEST_TMPDIR/checks"
   : >"$TEST_CHECKS"
-  any_eligible_check() { echo x >>"$TEST_CHECKS"; ANY_ELIGIBLE_ANSWER="no"; }
+  eligible_features_check() { echo x >>"$TEST_CHECKS"; ELIGIBLE_FEATURES_JSON='[]'; }
   prepare_idle_pass() { return 0; }
   idle_sleep() { [ "$RUN_PASS" -lt 3 ] || RUNNER_INTERRUPTED=1; }
 

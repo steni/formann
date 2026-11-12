@@ -89,15 +89,15 @@ Any other combination — including `ready-for-agent + HITL`, any non-`ready-for
 
 **Consumer note.** The runner persists this output to `<run-dir>/discovery.json` for forensics. The runner validates it parses as a JSON array; non-array output causes `preflight-abort: discovery`.
 
-### `tracker-snapshot --any-eligible`
+### `tracker-snapshot --eligible-features`
 
-**Invocation:** `tracker-snapshot --any-eligible` — no feature-slug argument.
+**Invocation:** `tracker-snapshot --eligible-features` — no feature-slug argument.
 
-**Output:** one word on stdout, `yes` or `no`, and exit `0`. `yes` means at least one active feature (as `--list` sees them) has an issue whose `tracker-snapshot <feature>` entry is `eligible: true`. The answer is the snapshot's own: the script re-runs itself per feature, so the eligibility rule above applies unchanged.
+**Output:** a JSON array of feature slugs on stdout, and exit `0`: every active feature (as `--list` sees them, in `--list` order) with an issue whose `tracker-snapshot <feature>` entry is `eligible: true`; `[]` when there is none. The answer is the snapshot's own: the script re-runs itself per feature, so the eligibility rule above applies unchanged.
 
-**Branch views.** The AFK runner snapshots each feature on the feature's branch, which can be ahead of the working tree. So when the tracker root is a git repo's `.features/` (or `SNAPSHOT_CHECKOUT_DIR` names the repo), the feature's committed `.features/<feature>/` on every local branch and remote-tracking branch named `<feature>` is read too. Any view with an eligible issue answers `yes`. State the repo has not fetched yet (another machine's push to a Shared remote) is not seen until it is fetched.
+**Branch views.** The AFK runner snapshots each feature on the feature's branch, which can be ahead of the working tree. So when the tracker root is a git repo's `.features/` (or `SNAPSHOT_CHECKOUT_DIR` names the repo), the feature's committed `.features/<feature>/` on every local branch and remote-tracking branch named `<feature>` is read too. A feature with an eligible issue in any view is listed. State the repo has not fetched yet (another machine's push to a Shared remote) is not seen until it is fetched.
 
-**Consumer note.** The runner asks this before every drain pass, and ends the pass at once on `no` (when no Blocked re-walk is pending) without syncing or snapshotting any feature.
+**Consumer note.** The runner asks this before every drain pass and syncs and snapshots only the listed features, plus any with a Blocked re-walk pending; with neither, the pass ends at once.
 
 ## Sandbox compatibility
 

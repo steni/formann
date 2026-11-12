@@ -56,11 +56,13 @@
 #
 # Stop reasons (drain mode):
 #   - `completed`             — every discovery slug considered.
-#   - `nothing-eligible`      — `tracker-snapshot --any-eligible` said `no`
-#                                and no Blocked re-walk is pending: the pass
-#                                ended before any per-feature snapshot or
-#                                branch sync (#15). A failed check walks
-#                                every feature instead.
+#   - `nothing-eligible`      — `tracker-snapshot --eligible-features` listed
+#                                no discovered feature and no Blocked re-walk
+#                                is pending: the pass ended before any
+#                                per-feature snapshot or branch sync (#15).
+#                                Otherwise the pass walks only the listed
+#                                features and those with a pending marker; a
+#                                failed check walks every feature.
 #   - `interrupted`           — Ctrl-C during the outer loop.
 #   - `propagation-error`     — parking-ref publish failed inside a feature loop.
 #   - `runaway-halt (<ref>)`  — post-implement step pushed issue back to eligible.
@@ -4512,9 +4514,10 @@ run_drain() {
   local considered=""
   local feature
 
-  # A quiet pass is cheap: one tracker question before any per-feature
-  # snapshot or branch sync (#15).
-  if ! drain_pass_has_work; then
+  # A pass walks only the features with work: one tracker question before
+  # any per-feature snapshot or branch sync (#15).
+  drain_pass_features
+  if [ "$DRAIN_PASS_JSON" = "[]" ] && [ "$DISCOVERY_JSON" != "[]" ]; then
     RUN_STOP_REASON="nothing-eligible"
     return 0
   fi
@@ -4526,7 +4529,7 @@ run_drain() {
       return 0
     fi
 
-    feature="$(next_eligible_feature "$DISCOVERY_JSON" "$considered" "")"
+    feature="$(next_eligible_feature "$DRAIN_PASS_JSON" "$considered" "")"
     if [ -z "$feature" ]; then
       echo "[$(now_clock)] runner: completed — every feature in discovery considered"
       RUN_STOP_REASON="completed"
@@ -4563,10 +4566,10 @@ run_drain() {
   done
 }
 
-# Print the first discovered feature with a pending Blocked re-walk marker
-# (an issue's walk, or the post-drain phase, that ended Blocked), or nothing.
+# Print every discovered feature with a pending Blocked re-walk marker (an
+# issue's walk, or the post-drain phase, that ended Blocked), one per line.
 # Local files only: no tracker call.
-pending_blocked_feature() {
+pending_blocked_features() {
   [ -n "${HOST_BLOCKED_DIR:-}" ] && [ -d "$HOST_BLOCKED_DIR" ] || return 0
   local slug f
   while IFS= read -r slug; do
@@ -4575,52 +4578,65 @@ pending_blocked_feature() {
     for f in "$HOST_BLOCKED_DIR/$slug"/*; do
       if [ -f "$f" ]; then
         printf '%s\n' "$slug"
-        return 0
+        break
       fi
     done
   done < <(jq -r '.[]' <<<"${DISCOVERY_JSON:-[]}" 2>/dev/null)
 }
 
-# Ask the binding once whether any feature has an eligible issue
-# (`tracker-snapshot --any-eligible`). Sets ANY_ELIGIBLE_ANSWER to `yes` or
-# `no` and returns 0; on a failed check (non-zero exit, or an answer that is
-# neither) sets ANY_ELIGIBLE_FAILURE and returns 1.
-ANY_ELIGIBLE_ANSWER=""
-ANY_ELIGIBLE_FAILURE=""
-any_eligible_check() {
+# Ask the binding once which features hold an eligible issue
+# (`tracker-snapshot --eligible-features`). Sets ELIGIBLE_FEATURES_JSON to
+# its JSON array of slugs and returns 0; on a failed check (non-zero exit, or
+# an answer that is not a JSON array of strings) sets
+# ELIGIBLE_FEATURES_FAILURE and returns 1.
+ELIGIBLE_FEATURES_JSON=""
+ELIGIBLE_FEATURES_FAILURE=""
+eligible_features_check() {
   local rc=0 answer
-  ANY_ELIGIBLE_ANSWER=""
-  ANY_ELIGIBLE_FAILURE=""
+  ELIGIBLE_FEATURES_JSON=""
+  ELIGIBLE_FEATURES_FAILURE=""
   answer="$(TRACKER_ROOT="$HOST_REPO/.features" \
-    bash "$HOST_REPO/docs/formann/issue-tracker/tracker-snapshot" --any-eligible)" || rc=$?
+    bash "$HOST_REPO/docs/formann/issue-tracker/tracker-snapshot" --eligible-features)" || rc=$?
   if [ "$rc" -ne 0 ]; then
-    ANY_ELIGIBLE_FAILURE="exited $rc"
+    ELIGIBLE_FEATURES_FAILURE="exited $rc"
     return 1
   fi
-  case "$answer" in
-    yes|no) ANY_ELIGIBLE_ANSWER="$answer" ;;
-    *) ANY_ELIGIBLE_FAILURE="answered '$answer'"; return 1 ;;
-  esac
+  if ! jq -e 'type == "array" and all(.[]; type == "string")' >/dev/null 2>&1 <<<"$answer"; then
+    ELIGIBLE_FEATURES_FAILURE="answered '$answer'"
+    return 1
+  fi
+  ELIGIBLE_FEATURES_JSON="$(jq -c '.' <<<"$answer")"
 }
 
-# Does this drain pass have anything to act on? Returns 0 (walk every
-# feature, as before) when a Blocked re-walk is pending on this machine, when
-# the tracker says some feature has an eligible issue, or when that check
-# failed (logged once). Returns 1 — the pass ends at once, no feature
-# snapshotted or synced — only on a clean `no` with nothing pending.
-drain_pass_has_work() {
-  if [ -n "$(pending_blocked_feature)" ]; then
+# The features this drain pass walks, as a JSON array in DRAIN_PASS_JSON: the
+# discovered features the binding lists as holding an eligible issue, plus
+# those with a pending Blocked re-walk marker on this machine, in discovery
+# order. A feature outside that set would only be synced and snapshotted to
+# be skipped as queue-empty. A failed check walks every discovered feature
+# (logged once); an empty discovery asks nothing.
+DRAIN_PASS_JSON="[]"
+drain_pass_features() {
+  DRAIN_PASS_JSON="${DISCOVERY_JSON:-[]}"
+  [ "$DRAIN_PASS_JSON" != "[]" ] || return 0
+  if ! eligible_features_check; then
+    echo "[$(now_clock)] runner: the eligible-features check failed (tracker-snapshot --eligible-features ${ELIGIBLE_FEATURES_FAILURE:-failed}); walking every feature"
     return 0
   fi
-  if ! any_eligible_check; then
-    echo "[$(now_clock)] runner: the any-eligible check failed (tracker-snapshot --any-eligible ${ANY_ELIGIBLE_FAILURE:-failed}); walking every feature"
+  local with_work
+  with_work="$( { jq -r '.[]' <<<"$ELIGIBLE_FEATURES_JSON"; pending_blocked_features; } \
+    | jq -Rsc 'split("\n") | map(select(. != ""))')"
+  DRAIN_PASS_JSON="$(jq -c --argjson w "$with_work" '[ .[] | select(. as $f | $w | index([$f])) ]' \
+    <<<"$DISCOVERY_JSON")"
+  if [ "$DRAIN_PASS_JSON" = "[]" ]; then
+    echo "[$(now_clock)] runner: nothing to do — no feature has an eligible issue and no Blocked re-walk is pending; no feature snapshotted"
     return 0
   fi
-  if [ "$ANY_ELIGIBLE_ANSWER" = "yes" ]; then
-    return 0
+  local walking total
+  walking="$(jq 'length' <<<"$DRAIN_PASS_JSON")"
+  total="$(jq 'length' <<<"$DISCOVERY_JSON")"
+  if [ "$walking" -lt "$total" ]; then
+    echo "[$(now_clock)] runner: walking $walking of $total features (an eligible issue or a pending Blocked re-walk): $(jq -r 'join(" ")' <<<"$DRAIN_PASS_JSON")"
   fi
-  echo "[$(now_clock)] runner: nothing to do — no feature has an eligible issue and no Blocked re-walk is pending; no feature snapshotted"
-  return 1
 }
 
 # Drain a single feature inside drain mode. Evaluates the per-feature gate,

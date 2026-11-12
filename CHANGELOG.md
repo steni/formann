@@ -8,13 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- `tracker-snapshot --any-eligible` in both bindings prints `yes` or `no`: does any active feature
-  have an eligible issue? github-issues answers with one GraphQL query (plus pages); local-markdown
-  from the files, including each feature's committed branch. The AFK runner asks it before every
-  drain pass: on `no`, with no Blocked re-walk pending, the pass ends at once (stop reason
-  `nothing-eligible`) without snapshotting or syncing any feature, so an idle runner on a large
-  github-issues tracker no longer spends hundreds of API calls per quiet pass. A failed check is
-  logged once and the pass walks every feature as before.
+- `tracker-snapshot --eligible-features` in both bindings prints the JSON array of active features
+  that have an eligible issue. github-issues answers with one GraphQL query (plus pages);
+  local-markdown from the files, including each feature's committed branch. The AFK runner asks it
+  before every drain pass and syncs and snapshots only those features, plus any with a Blocked
+  re-walk pending on that machine; with neither, the pass ends at once (stop reason
+  `nothing-eligible`). An idle runner on a large github-issues tracker no longer spends hundreds of
+  API calls, and minutes, per pass on features with nothing ready, even while another runner holds
+  the one feature that has work. A failed check is logged once and the pass walks every feature as
+  before.
 - AFK runner runs a post-drain phase: host-side steps named in an optional consumer manifest
   `runner/post-drain.md` (same format as `runner/manifest.md`; a `.md` entry is a prompt for the
   host's `claude -p`, anything else a command given the feature slug), run once a feature has
