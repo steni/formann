@@ -66,7 +66,7 @@ The 1-match result provides `title` (feature name), `body`, and `labels`. **When
 
 Return the set of issues in a feature with their metadata (ref, status, category, type, blocked-by).
 
-**GitHub-issues realization:** Run `tracker-snapshot <slug>` to get the full snapshot for one feature (parent + all sub-issues). Run `tracker-snapshot --list` to enumerate all active feature slugs. Run `tracker-snapshot --any-eligible` to ask once, for the whole tracker, whether any feature has an eligible issue (`yes`/`no`). The snapshot forms emit JSON byte-compatible with the local-markdown binding's schema; only the `ref` value format differs (`#N` here, `<feature>/NN` there). See the [Snapshot contract](#snapshot-contract) section for the full schema, ordering rules, blocker resolution, slug-uniqueness cardinality handling, and transient-failure behaviour.
+**GitHub-issues realization:** Run `tracker-snapshot <slug>` to get the full snapshot for one feature (parent + all sub-issues). Run `tracker-snapshot --list` to enumerate all active feature slugs. Run `tracker-snapshot --eligible-features` to ask once, for the whole tracker, which features have an eligible issue. Every form emits JSON; the snapshot forms are byte-compatible with the local-markdown binding's schema; only the `ref` value format differs (`#N` here, `<feature>/NN` there). See the [Snapshot contract](#snapshot-contract) section for the full schema, ordering rules, blocker resolution, slug-uniqueness cardinality handling, and transient-failure behaviour.
 
 Internally, `tracker-snapshot` drives a single `gh api graphql` query per invocation. Per-feature form:
 
@@ -670,7 +670,7 @@ Sub-issues use the body template defined in the `to-issues` skill with no additi
 
 ```
 docs/formann/issue-tracker/tracker-snapshot --list
-docs/formann/issue-tracker/tracker-snapshot --any-eligible
+docs/formann/issue-tracker/tracker-snapshot --eligible-features
 docs/formann/issue-tracker/tracker-snapshot <feature-slug>
 ```
 
@@ -717,7 +717,7 @@ Field notes:
 - `blocked_by` — Array of `#N` refs derived from the entry's native `blockedBy` connection. Empty array if there are no native blockers.
 - `eligible` — `true` iff `status == "ready-for-agent"` AND `type == "AFK"` AND every `blocked_by` ref is a known entry in this snapshot's issues set with `status == "done"`. Any unmatched `#N` (not in the issues set) is treated as conservative-false.
 
-**`tracker-snapshot --any-eligible`** prints one word, not JSON: `yes` when at least one issue in an active feature would be `eligible: true` in that feature's own snapshot, otherwise `no`. Exit 0 either way; 3 on a transient failure, as the other forms. The AFK runner asks it before every drain pass, so a pass with nothing to do costs one query instead of a snapshot per feature.
+**`tracker-snapshot --eligible-features`** prints a JSON array of the active feature slugs holding at least one issue that would be `eligible: true` in that feature's own snapshot, ordered as `--list` orders them (parent issue number ascending); `[]` when none does. Exit 0 either way; 3 on a transient failure, as the other forms. The AFK runner asks it before every drain pass and syncs and snapshots only the features it lists (plus any with a Blocked re-walk pending on that machine), so a pass costs one query plus a snapshot per feature with work, instead of a snapshot per feature.
 
 It answers with one GraphQL query (plus pages of 100), never one per feature:
 
@@ -741,7 +741,7 @@ gh api graphql \
   }'
 ```
 
-The repository `labels:` argument matches issues carrying *any* of the listed labels, so the query filters on the status label and the `formann:type:afk` check is made in-script. An issue counts when it is open, `ready-for-agent` and AFK; belongs to a feature (its parent is open and carries a `formann:slug:*` label, or it carries one itself as a work-item parent); and every blocker resolves as the [blocker resolution rules](#blocker-resolution-rules) below: done (closed as completed) and in the same feature, meaning the feature's parent or one of its sub-issues. The script stops paging at the first such issue. Where a per-feature snapshot could still differ (a slug shared by two parents), the answer leans to `yes`: a wrong `yes` costs one full pass, a wrong `no` would leave work undispatched.
+The repository `labels:` argument matches issues carrying *any* of the listed labels, so the query filters on the status label and the `formann:type:afk` check is made in-script. An issue counts when it is open, `ready-for-agent` and AFK; belongs to a feature (its parent is open and carries a `formann:slug:*` label, or it carries one itself as a work-item parent); and every blocker resolves as the [blocker resolution rules](#blocker-resolution-rules) below: done (closed as completed) and in the same feature, meaning the feature's parent or one of its sub-issues. Each such issue lists its feature: the `formann:slug:*` value of the parent (or of the work-item parent itself). The script reads every page. Where a per-feature snapshot could still differ (a slug shared by two parents), the answer leans to listing the feature: a feature listed wrongly costs one snapshot, a feature left out wrongly would leave its work undispatched.
 
 ### Ordering rules
 

@@ -39,7 +39,7 @@ Retrieve the parent feature's PRD body.
 
 Return the set of issues in a feature with their metadata (ref, nn, status, category, type, blocked-by).
 
-**Local-markdown realization:** Run `tracker-snapshot <feature>` for a machine-readable JSON snapshot, or glob `.features/<feature>/issues/*.md` and read the frontmatter of each file. `tracker-snapshot --list` lists the active features; `tracker-snapshot --any-eligible` prints `yes` or `no` for whether any of them has an eligible issue (see [`README.md`](README.md#tracker-snapshot---any-eligible)).
+**Local-markdown realization:** Run `tracker-snapshot <feature>` for a machine-readable JSON snapshot, or glob `.features/<feature>/issues/*.md` and read the frontmatter of each file. `tracker-snapshot --list` lists the active features; `tracker-snapshot --eligible-features` lists those with an eligible issue (see [`README.md`](README.md#tracker-snapshot---eligible-features)).
 
 ### Set the state to `<state>`
 
