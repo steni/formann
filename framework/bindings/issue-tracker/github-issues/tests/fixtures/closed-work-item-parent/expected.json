@@ -1,0 +1,14 @@
+{
+  "feature": "closed-standalone",
+  "issues": [
+    {
+      "ref": "#40",
+      "nn": "40",
+      "status": "done",
+      "category": "bug",
+      "type": "AFK",
+      "blocked_by": [],
+      "eligible": false
+    }
+  ]
+}

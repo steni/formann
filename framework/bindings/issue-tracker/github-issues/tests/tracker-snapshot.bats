@@ -333,6 +333,92 @@ JSON
 }
 
 # ════════════════════════════════════════════════════════════════════════════════
+# Closed and archived features
+#
+# A feature whose parent is closed but not archived still lists every issue it
+# holds (the AFK gate closes a work-item parent when it goes done), and none of
+# them is eligible.  An archived feature (closed, formann:archived) is empty.
+# ════════════════════════════════════════════════════════════════════════════════
+
+# Write a slug-mode response holding the given parent nodes (a JSON array).
+_slug_page() {
+  export FIXTURE_RESPONSES_DIR="$BATS_TEST_TMPDIR/slug-page"
+  mkdir -p "$FIXTURE_RESPONSES_DIR"
+  jq -n --argjson nodes "$1" '{data: {repository: {issues: {nodes: $nodes}}}}' \
+    >"$FIXTURE_RESPONSES_DIR/graphql-response.json"
+}
+
+# A parent node: number, state, stateReason (or null), extra labels (JSON array
+# of names), status label value (or empty).
+_parent_node() {
+  jq -n --argjson n "$1" --arg st "$2" --argjson sr "$3" --argjson extra "$4" --arg slug "$5" '
+    {number: $n, state: $st, stateReason: $sr,
+     labels: {nodes: ([{name: "formann:feature"}, {name: ("formann:slug:" + $slug)}]
+                      + ($extra | map({name: .})))},
+     blockedBy: {nodes: []}, subIssues: {nodes: []}}'
+}
+
+@test "closed work-item parent — the parent itself is listed, done and not eligible" {
+  assert_snapshot_matches_golden "closed-work-item-parent" "closed-standalone"
+}
+
+@test "closed pure-container parent — every sub-issue is listed with its status, none eligible" {
+  assert_snapshot_matches_golden "closed-container-parent" "closed-feature"
+}
+
+@test "archived feature (closed, formann:archived) — empty snapshot, exit 0" {
+  assert_snapshot_matches_golden "archived-feature" "archived-feature"
+}
+
+@test "slug query asks for open and closed parents" {
+  export FIXTURE_RESPONSES_DIR="$FIXTURES/closed-work-item-parent/recorded-responses"
+  run "$TRACKER_SNAPSHOT" "closed-standalone"
+  assert_success
+  grep -q 'states: \[OPEN, CLOSED\]' "$CALL_LOG"
+}
+
+@test "closed wontfix work-item parent — listed as wontfix" {
+  _slug_page "[$(_parent_node 70 CLOSED '"NOT_PLANNED"' '["formann:category:bug","formann:type:hitl"]' wf)]"
+  run "$TRACKER_SNAPSHOT" "wf"
+  assert_success
+  [ "$(printf '%s\n' "$output" | jq -c '[.issues[] | [.ref, .status, .type, .eligible]]')" \
+    = '[["#70","wontfix","HITL",false]]' ]
+}
+
+@test "an open parent wins over a closed one sharing its slug — no collision" {
+  _slug_page "[$(_parent_node 80 CLOSED '"COMPLETED"' '["formann:category:bug","formann:type:afk"]' shared),
+               $(_parent_node 81 OPEN null '["formann:status:ready-for-agent","formann:category:bug","formann:type:afk"]' shared)]"
+  run "$TRACKER_SNAPSHOT" "shared"
+  assert_success
+  [ "$(printf '%s\n' "$output" | jq -c '[.issues[] | [.ref, .status, .eligible]]')" \
+    = '[["#81","ready-for-agent",true]]' ]
+}
+
+@test "an archived parent beside a closed one sharing its slug — the closed one, no collision" {
+  _slug_page "[$(_parent_node 90 CLOSED '"COMPLETED"' '["formann:archived","formann:category:bug","formann:type:afk"]' reused),
+               $(_parent_node 91 CLOSED '"COMPLETED"' '["formann:category:bug","formann:type:afk"]' reused)]"
+  run "$TRACKER_SNAPSHOT" "reused"
+  assert_success
+  [ "$(printf '%s\n' "$output" | jq -c '[.issues[] | [.ref, .status]]')" = '[["#91","done"]]' ]
+}
+
+@test "two closed unarchived parents sharing a slug — collision, exit 4, both named" {
+  _slug_page "[$(_parent_node 92 CLOSED '"COMPLETED"' '["formann:category:bug","formann:type:afk"]' twice),
+               $(_parent_node 93 CLOSED '"COMPLETED"' '["formann:category:bug","formann:type:afk"]' twice)]"
+  run "$TRACKER_SNAPSHOT" "twice"
+  [ "$status" -eq 4 ]
+  assert_output --partial "#92"
+  assert_output --partial "#93"
+}
+
+@test "a reopened archived parent is an open parent — snapshotted as before" {
+  _slug_page "[$(_parent_node 94 OPEN null '["formann:archived","formann:status:in-review","formann:category:bug","formann:type:afk"]' reopened)]"
+  run "$TRACKER_SNAPSHOT" "reopened"
+  assert_success
+  [ "$(printf '%s\n' "$output" | jq -c '[.issues[] | [.ref, .status]]')" = '[["#94","in-review"]]' ]
+}
+
+# ════════════════════════════════════════════════════════════════════════════════
 # Origin-URL parsing (the GH_TRACKER_REPO fallback path)
 #
 # These tests exercise the code path that runs when GH_TRACKER_REPO is unset.

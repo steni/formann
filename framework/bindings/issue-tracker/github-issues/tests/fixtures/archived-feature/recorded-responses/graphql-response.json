@@ -1,0 +1,39 @@
+{
+  "data": {
+    "repository": {
+      "issues": {
+        "nodes": [
+          {
+            "number": 60,
+            "state": "CLOSED",
+            "stateReason": "COMPLETED",
+            "labels": {
+              "nodes": [
+                {"name": "formann:feature"},
+                {"name": "formann:slug:archived-feature"},
+                {"name": "formann:archived"}
+              ]
+            },
+            "blockedBy": {"nodes": []},
+            "subIssues": {
+              "nodes": [
+                {
+                  "number": 61,
+                  "state": "CLOSED",
+                  "stateReason": "COMPLETED",
+                  "labels": {
+                    "nodes": [
+                      {"name": "formann:category:enhancement"},
+                      {"name": "formann:type:afk"}
+                    ]
+                  },
+                  "blockedBy": {"nodes": []}
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  }
+}

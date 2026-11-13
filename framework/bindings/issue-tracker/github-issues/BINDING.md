@@ -77,7 +77,7 @@ gh api graphql \
   -F slugLabel="formann:slug:<slug>" \
   -f query='query($owner: String!, $name: String!, $slugLabel: String!) {
     repository(owner: $owner, name: $name) {
-      issues(labels: [$slugLabel], states: [OPEN], first: 10) {
+      issues(labels: [$slugLabel], states: [OPEN, CLOSED], first: 10) {
         nodes {
           number
           state
@@ -701,7 +701,9 @@ Both invocation forms emit JSON byte-compatible with the local-markdown binding.
 }
 ```
 
-`issues[]` composition depends on the parent's shape. When the parent carries `formann:status:*` (work-item parent), it is emitted as `issues[0]`, followed by its sub-issues. A pure-container parent (no `formann:status:*` label) contributes only its sub-issues, starting at `issues[0]`. The two shapes are covered in [Read the feature](#read-the-feature).
+`issues[]` composition depends on the parent's shape. When the parent is a work item (work-item parent), it is emitted as `issues[0]`, followed by its sub-issues. A pure-container parent contributes only its sub-issues, starting at `issues[0]`. The two shapes are covered in [Read the feature](#read-the-feature). An open parent is a work item when it carries `formann:status:*`. A closed parent has had that label removed by the `done` / `wontfix` transition, so a closed parent is a work item when it carries `formann:type:*` or `formann:category:*`, which a work item carries and a PRD container does not.
+
+**Closed and archived features.** A feature whose parent is closed but not archived still lists every issue it holds, the closed ones as `done` or `wontfix` by the `status` rule below. That includes the parent itself when it is its own work item: the AFK gate closes a single-issue feature's parent when that issue goes `done`, and the snapshot then shows it `done`. A closed feature is no longer active (`--list` and `--eligible-features` leave it out), so no entry in its snapshot is `eligible`, whatever its status. An archived feature (closed, with `formann:archived`) snapshots empty, `{"feature":"<slug>","issues":[]}`: archived means nothing more happens to the feature, and its issues stay readable on the issues themselves. A parent that was archived and then reopened is an open parent and is snapshotted as one.
 
 **`tracker-snapshot --list`** emits a JSON array of feature slug strings:
 
@@ -717,7 +719,7 @@ Field notes:
 - `category` — Value from the `formann:category:<value>` label; empty string if absent.
 - `type` — Value from the `formann:type:<value>` label, normalised to uppercase (`afk` → `"AFK"`, `hitl` → `"HITL"`); empty string if absent.
 - `blocked_by` — Array of `#N` refs derived from the entry's native `blockedBy` connection. Empty array if there are no native blockers.
-- `eligible` — `true` iff `status == "ready-for-agent"` AND `type == "AFK"` AND every `blocked_by` ref is a known entry in this snapshot's issues set with `status == "done"`. Any unmatched `#N` (not in the issues set) is treated as conservative-false.
+- `eligible` — `true` iff the feature's parent is open AND `status == "ready-for-agent"` AND `type == "AFK"` AND every `blocked_by` ref is a known entry in this snapshot's issues set with `status == "done"`. Any unmatched `#N` (not in the issues set) is treated as conservative-false.
 
 **`tracker-snapshot --eligible-features`** prints a JSON array of the active feature slugs holding at least one issue that would be `eligible: true` in that feature's own snapshot, ordered as `--list` orders them (parent issue number ascending); `[]` when none does. Exit 0 either way; 3 on a transient failure, as the other forms. The AFK runner asks it before every drain pass and syncs and snapshots only the features it lists (plus any with a Blocked re-walk pending on that machine), so a pass costs one query plus a snapshot per feature with work, instead of a snapshot per feature.
 
@@ -763,11 +765,11 @@ Blocker eligibility resolves from the in-memory issues set — no extra API call
 
 ### Slug identity and uniqueness
 
-The slug is stored as label `formann:slug:<slug>` on the parent issue. GitHub enforces no uniqueness constraint. `tracker-snapshot` checks cardinality at every read:
+The slug is stored as label `formann:slug:<slug>` on the parent issue. GitHub enforces no uniqueness constraint. `tracker-snapshot` reads the issues carrying the slug label in every state and counts the feature's parents among them: the open ones when there is one, otherwise the closed ones without `formann:archived`. So a closed or archived parent never collides with an open one, nor an archived parent with a closed one. It checks cardinality at every read:
 
 | Parent count | Behaviour |
 |---|---|
-| 0 | Emit `{"feature":"<slug>","issues":[]}`, exit 0 (mirrors local-markdown's missing-feature-dir behaviour). Occurs naturally when the parent is archived (closed). |
+| 0 | Emit `{"feature":"<slug>","issues":[]}`, exit 0 (mirrors local-markdown's missing-feature-dir behaviour). Occurs when no issue carries the slug, or its only parents are archived. |
 | 1 | Normal snapshot. |
 | ≥ 2 | Exit non-zero (code 4). Stderr names both parent issues and the recovery recipe: `"remove the 'formann:slug:<slug>' label from one of: #N, #M"`. |
 

@@ -1,0 +1,27 @@
+{
+  "data": {
+    "repository": {
+      "issues": {
+        "nodes": [
+          {
+            "number": 40,
+            "state": "CLOSED",
+            "stateReason": "COMPLETED",
+            "labels": {
+              "nodes": [
+                {"name": "formann:feature"},
+                {"name": "formann:slug:closed-standalone"},
+                {"name": "formann:category:bug"},
+                {"name": "formann:type:afk"}
+              ]
+            },
+            "blockedBy": {"nodes": []},
+            "subIssues": {
+              "nodes": []
+            }
+          }
+        ]
+      }
+    }
+  }
+}
