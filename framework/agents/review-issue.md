@@ -25,17 +25,23 @@ An issue reference. If none was supplied — or none can be inferred unambiguous
 
 ## What to read
 
-The issue file (including the agent brief's acceptance criteria and the in-review summary's **Evidence** block), the PRD (light read for context), `GLOSSARY.md`, ADRs under `docs/adr/` relevant to the changed code, the module map (`README.md`) of each changed area if it has one, the diff, and changed files in full.
+The issue file (including the agent brief's acceptance criteria), the PRD (light read for context), `GLOSSARY.md`, ADRs under `docs/adr/` relevant to the changed code, the module map (`README.md`) of each changed area if it has one, the diff, and changed files in full.
 
 Read the diff first, then read changed files in full to understand surrounding patterns and invariants. Focus findings on the changed code, but informed by context.
 
 ## What to check
 
-Five kinds of finding apply:
+Five kinds of finding apply. Whether the proof the Evidence block offers shows each acceptance criterion is not one of them: claims against criteria are `review-claims`' job, judged from the proof alone.
 
 - **Bug-hunt.** Bugs, logic errors, null safety, missing parameters, type-switch exhaustiveness, resource leaks, security issues (injection, XSS, auth bypass), thread safety, performance problems (N+1, memory leaks, inefficient algorithms), circular dependencies (a new constructor dependency can introduce cycles — especially suspect when the class already has cycle workarounds).
 - **Intent-check.** Does the implementation match what the issue asked for? Flag drift between intent and code.
-- **Evidence-check.** For each `[x]` criterion in the Evidence block, verify the agent's claim against the proof: if it points at a named test, confirm the test exists and its assertions actually cover the criterion (not just adjacent code); if it quotes a command and observed result, confirm the command would yield that output against the current tree. Flag claimed-vs-actual mismatches. Don't attempt `[human]` (`[ ]`) criteria — list them under **Pending human verification** in the summary. If no Evidence block exists, note it and skip evidence-check.
+- **Red-team pass.** For each entry point the change touches — a request handler, a form post, a command-line command, a job, a message consumer, a public function — try to break it, reading the code to see what happens:
+  - a hostile input: oversized, malformed, empty, the wrong type, a missing field, an id that belongs to another user or tenant;
+  - an odd state: the thing already deleted, never set up, half set up, permission refused, a dependency down;
+  - repetition: a double submit, a retried request, a replayed message or token, a job run twice;
+  - concurrency: a second session or worker acting on the same thing at the same time.
+
+  Report each break you can trace through the code as a finding at the severity of what breaks. An attempt the code holds against is not a finding.
 - **Map-check.** Does the module map of each changed area still describe the code? Flag a module added, removed or renamed without the map following; a structural claim the diff violates; and a claim the map lists as checked whose check does not exist or does not hold it. An area with no map is not a finding unless this issue landed a module from the PRD's module table there.
 - **Codebase-fit check.** Flag comments and names that narrate history instead of describing current behavior. Comments must describe what the code does or why it exists; names must describe what code does, not its trajectory. Triggers: comment phrases like *"previously"*, *"used to be"*, *"now Y"*, *"improved from the old version"*, *"kept for backwards compat"* (when no compat is actually needed); identifiers like `NewFoo`, `OldBar`, `LegacyHandler`, `ImprovedX`. Version control is the time machine, not comments.
 
@@ -68,7 +74,7 @@ Present each finding as its own block, separated by a `---` rule so they're easy
 - **Problem:** the technical detail — `file:line` and the mechanism — enough for an implementor to locate and understand the issue.
 - **Suggested fix:** one brief sentence pointing at a plausible direction, only when it's obvious. No deep research; don't overstate — it's a pointer, not a verified solution. Omit when nothing's obvious.
 
-End with a **Verification summary**: list the specific things checked, even if clean. If the issue has `[human]` criteria, list them under a **Pending human verification** subheading.
+End with a **Verification summary**: list the specific things checked, even if clean. Name the entry points it tried in the red-team pass, or say the change touches none.
 
 ## Rules
 

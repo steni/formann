@@ -28,7 +28,7 @@ Read the diff first, then read changed files in full to understand surrounding p
 
 ## What to check
 
-Four kinds of finding apply (a fifth, evidence-check, is delegated to `review-issue`):
+Four kinds of finding apply. Claims against acceptance criteria are not one of them: `review-claims` judges those per issue, before the issue is `done`.
 
 - **Bug-hunt.** Bugs, logic errors, null safety, missing parameters, type-switch exhaustiveness, resource leaks, security issues (injection, XSS, auth bypass), thread safety, performance problems (N+1, memory leaks, inefficient algorithms), circular dependencies (a new constructor dependency can introduce cycles — especially suspect when the class already has cycle workarounds).
 - **Intent-check.** Does the implementation match what the PRD and issues asked for? Flag drift between intent and code, and gaps between PRD and what was shipped.
