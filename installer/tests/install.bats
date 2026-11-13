@@ -33,6 +33,7 @@ _setup_formann_fixture() {
   mkdir -p "$FORMANN_FIXTURE/framework/agents"
   touch "$FORMANN_FIXTURE/framework/skills/grill-me/SKILL.md"
   touch "$FORMANN_FIXTURE/framework/skills/implement/SKILL.md"
+  touch "$FORMANN_FIXTURE/framework/agents/review-claims.md"
   touch "$FORMANN_FIXTURE/framework/agents/review-feature.md"
   touch "$FORMANN_FIXTURE/framework/agents/review-issue.md"
   touch "$FORMANN_FIXTURE/framework/lifecycle.md"
@@ -124,6 +125,14 @@ _run_installer() {
       return 1
     }
   done
+}
+
+@test ".claude/agents/review-claims.md is a symlink resolving through .formann" {
+  run _run_installer
+  assert_success
+  [ -L "$CONSUMER/.claude/agents/review-claims.md" ]
+  target="$(readlink "$CONSUMER/.claude/agents/review-claims.md")"
+  [ "$target" = "../../.formann/agents/review-claims.md" ]
 }
 
 @test ".claude/agents/review-feature.md is a symlink resolving through .formann" {

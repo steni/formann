@@ -508,14 +508,17 @@ That prompt instructs the dispatched claude session to:
 
 1. Read the issue file.
 2. Spawn the `review-issue` agent for an independent review.
-3. Classify by 🔴 Critical findings — clean if none, blocked otherwise.
-4. Comment with Review (AFK gate) on the issue, with the findings verbatim.
-5. On a clean verdict only, set the state to `done`.
-6. Land a single `tracker:` commit and emit a `verdict:` line on stdout.
+3. Spawn the `review-claims` agent to judge each automated acceptance criterion
+   from its proof (not shown is 🔴 Critical, weakly shown 🟡 Important).
+4. Classify by 🔴 Critical findings from either — clean if none, blocked otherwise.
+5. Comment with Review (AFK gate) on the issue, with both agents' findings
+   verbatim, the claims review under `## Claims review`.
+6. On a clean verdict only, set the state to `done`.
+7. Land a single `tracker:` commit and emit a `verdict:` line on stdout.
 
 A Consumer can replace the default with a custom manifest composed from the
 framework's single-purpose **building-block steps** in `framework/runner/steps/`
-— `review.md` (review and post findings, no state change), `gate.md` (read the
+— `review.md` (general and claims review, post findings, no state change), `gate.md` (read the
 latest findings and promote on no-Critical, runs no review of its own),
 `fix.md` (read the latest findings and commit fixes), and `find-and-fix.md`
 (run `/code-review --fix` over the change-set, commit the fixes, and note them;
