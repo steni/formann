@@ -272,11 +272,14 @@ The review-and-gate prompt at `framework/runner/steps/review-and-gate.md` instru
 
 1. Read the issue file in full.
 2. Spawn the `review-issue` agent (via the `Agent` tool) for an independent review of the just-shipped commits.
-3. Classify the agent's findings by highest severity — anything at `🔴 Critical` (or equivalent) → `blocked`; `🟡 Important` or below or no findings → `clean`.
-4. Comment with Review (AFK gate) on the issue, with the agent's findings verbatim (including its Verification summary) and the AI-generated disclaimer.
-5. **On `clean` only**, set the state to `done`.
-6. Record the outcome via BINDING.md verbs: "set the state to `done`" (clean only) and "comment with `Review (AFK gate)`". Under local-markdown this lands as a `tracker:` commit (the binding fixes only the `tracker:` prefix; the rest of the subject is the agent's phrasing); under GitHub Issues it is one or two API calls with no resulting commit.
-7. Emit the review-issue agent's output verbatim on stdout, followed by a `verdict: clean|blocked` line.
+3. Spawn the `review-claims` agent for an independent claims review: one verdict per automated acceptance criterion, judged from the proof the Evidence block points to (never the code). Not shown is `🔴 Critical`, weakly shown `🟡 Important`.
+4. Classify both agents' findings by highest severity — anything at `🔴 Critical` (or equivalent) → `blocked`; `🟡 Important` or below or no findings → `clean`.
+5. Comment with Review (AFK gate) on the issue, with the review-issue agent's findings verbatim (including its Verification summary), then the review-claims agent's under a `## Claims review` heading, and the AI-generated disclaimer.
+6. **On `clean` only**, set the state to `done`.
+7. Record the outcome via BINDING.md verbs: "set the state to `done`" (clean only) and "comment with `Review (AFK gate)`". Under local-markdown this lands as a `tracker:` commit (the binding fixes only the `tracker:` prefix; the rest of the subject is the agent's phrasing); under GitHub Issues it is one or two API calls with no resulting commit.
+8. Emit both agents' output verbatim on stdout (the claims review under its heading), followed by a `verdict: clean|blocked` line.
+
+Where a project's evidence lives is the Consumer's to say. The default step points `review-claims` at the Evidence block's own pointers; a Consumer whose evidence lives elsewhere (a comment another step posts, a directory, a URL) shadows `review-and-gate.md` or `review.md` with its own prompt that tells the agent where to look, and a delta gate passes it "only these criteria" to re-judge what an earlier round found not or weakly shown. The agent file itself names no project.
 
 The runner classifies each step's outcome from the post-step snapshot and the dispatch exit code (`classify_item_action`) — it does not parse the verdict line. The one line of a step's result the runner does read is a closing `BLOCKED: <dependency>` (see "Blocked steps" below). The verdict line exists for the human reading the step's artifacts (`<NN>-<step>-<label>.summary.md` for the skim, `.stdout.jsonl` for the full trace) after the fact.
 
@@ -286,8 +289,8 @@ Why a separate dispatch (not a slash command, not part of `/implement`)? Indepen
 
 For workflows the fused `review-and-gate` step can't express, the framework ships four single-purpose **building-block steps** in `framework/runner/steps/` a Consumer composes into a custom manifest:
 
-- **`review.md`** — spawns the `review-issue` agent and posts the severity-tagged findings comment. Changes no issue state.
-- **`gate.md`** — reads the **latest** findings comment and thresholds on `🔴 Critical`: promotes to `done` only when none are present, otherwise leaves the issue at `in-review`. Runs no review of its own.
+- **`review.md`** — spawns the `review-issue` and `review-claims` agents and posts the severity-tagged findings comment, the claims review under its own `## Claims review` heading. Changes no issue state.
+- **`gate.md`** — reads the **latest** findings comment, every section of it, and thresholds on `🔴 Critical`: promotes to `done` only when none are present, otherwise leaves the issue at `in-review`. Runs no review of its own.
 - **`fix.md`** — reads the latest findings comment and produces commits. Posts no comment and changes no issue state.
 - **`find-and-fix.md`** — runs `/code-review --fix` over the issue's change-set, commits the fixes, and posts a `Note` describing them. Changes no issue state. Soft-fails: a pass that finds nothing or cannot run leaves the issue at `in-review` for the next step rather than blocking it. Unlike `fix.md` (which reacts to a prior findings comment), it finds the bugs itself and leaves a record.
 

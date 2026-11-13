@@ -95,7 +95,8 @@ cp -R framework/runner/tests/fixtures/smoke-review-only/issues \
 git -C "$ws" show smoke-review-only:.features/smoke-review-only/issues/01-stamp-marker.md | grep '^status:'
 # → status: in-review
 
-# A findings comment was posted (review-issue output under a "Review (AFK runner)" heading).
+# A findings comment was posted (review-issue output, then review-claims output under
+# "## Claims review", in a "Review (AFK runner)" comment).
 git -C "$ws" show smoke-review-only:.features/smoke-review-only/issues/01-stamp-marker.md | grep -F '### Review (AFK runner)'
 
 # The step event stream exists (drain mode nests logs under the feature slug).

@@ -48,7 +48,7 @@ A Claude Code slash command that advances work along the **Lifecycle** (`/triage
 _Avoid_: "command", "slash command"
 
 **Agent**:
-A Claude Code subagent (e.g., `review-feature`, `review-issue`) — a single-purpose worker invoked from inside a **Skill**. Lives at `framework/agents/<name>.md`.
+A Claude Code subagent (e.g., `review-feature`, `review-issue`, `review-claims`) — a single-purpose worker invoked from inside a **Skill**. Lives at `framework/agents/<name>.md`.
 _Avoid_: Using "agent" to mean "an autonomous run inside the sandbox" — that's a **Dispatch**.
 
 ### Bindings

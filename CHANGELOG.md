@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- A claims reviewer, the agent `review-claims` beside `review-issue` and `review-feature`. For
+  each acceptance criterion that claims an automated proof it gives one verdict, citing what it
+  looked at: shown (the test and its assertion, or the evidence and what is visible in it),
+  weakly shown (`🟡 Important`: only the happy path, or a test asserting something near the
+  claim) or not shown (`🔴 Critical`: what is missing and what would show it). It reads only the
+  proof: the brief's criteria, the latest Implementation comment's Evidence block, the tests it
+  names and the evidence wherever the dispatcher says it lives, images included. It never reads
+  the production code or the implementer's narrative, so a criterion is never shown because the
+  code looks right; a criterion with no Evidence row is not shown; `[human]` rows stay the
+  maintainer's. An optional "only these criteria" lets a delta gate re-judge only what an earlier
+  round flagged. Decision-neutral, writes nothing. The default `review-and-gate` and `review`
+  steps dispatch it beside `review-issue`, pointing it at the Evidence block's own pointers, and
+  record its output verbatim under `## Claims review` after the general review, in the comment
+  and on stdout; a not-shown Critical blocks `review-and-gate` like any other Critical, and
+  `gate` classifies every section of the findings comment. The installer links it as
+  `.claude/agents/review-claims.md`.
 - AFK runner stamps every commit a dispatch makes (`/implement` and each post-implement step)
   with the trailer `Formann-Issue: <ref>` before it publishes them, keeping author, author date
   and message otherwise. A commit already stamped for the ref is left alone; one stamped for
@@ -90,6 +106,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `review-issue` and `review-feature` gain a map-check: a module map that no longer
   describes the code, or a structural claim the code violates, is a finding.
 - Agent briefs and issue slices name modules by their names in the PRD's module table.
+- `review-issue` makes a red-team pass: for each entry point the change touches (a request
+  handler, a form post, a command, a job, a public function) it tries a hostile input, an odd
+  state, repetition (a double submit, a replay) and concurrency (a second session on the same
+  thing), and its Verification summary names the entry points it tried. Its evidence-check is
+  gone: whether the proof shows each criterion is `review-claims`' job, so a manual
+  `review-issue` at Verify no longer checks the Evidence block; run `review-claims` for that.
 
 ### Fixed
 - Runner Dockerfile template installs Node.js 22 (NodeSource `setup_22.x`) instead of 20. On Node 20,
