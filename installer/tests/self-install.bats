@@ -36,6 +36,7 @@ _setup_self_install_fixture() {
   mkdir -p "$FORMANN_FIXTURE/framework/agents"
   touch "$FORMANN_FIXTURE/framework/skills/grill-me/SKILL.md"
   touch "$FORMANN_FIXTURE/framework/skills/implement/SKILL.md"
+  touch "$FORMANN_FIXTURE/framework/agents/review-claims.md"
   touch "$FORMANN_FIXTURE/framework/agents/review-feature.md"
   touch "$FORMANN_FIXTURE/framework/agents/review-issue.md"
   touch "$FORMANN_FIXTURE/framework/lifecycle.md"
@@ -158,6 +159,7 @@ _assert_block_lacks() {
 @test "managed block contains every agent under /.claude/agents/<name>.md" {
   run _run_self_install
   assert_success
+  _assert_block_contains "$FORMANN_FIXTURE/.gitignore" '/.claude/agents/review-claims.md'
   _assert_block_contains "$FORMANN_FIXTURE/.gitignore" '/.claude/agents/review-feature.md'
   _assert_block_contains "$FORMANN_FIXTURE/.gitignore" '/.claude/agents/review-issue.md'
 }
@@ -345,6 +347,7 @@ EOF
     '/.formann' \
     '/.claude/skills/grill-me' \
     '/.claude/skills/implement' \
+    '/.claude/agents/review-claims.md' \
     '/.claude/agents/review-feature.md' \
     '/.claude/agents/review-issue.md' \
     '/docs/formann/issue-tracker' \
