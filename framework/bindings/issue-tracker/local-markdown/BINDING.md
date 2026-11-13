@@ -261,7 +261,9 @@ When the current git branch matches a feature slug, `#NN` is shorthand for `<cur
 
 Convention: feature branches are named with the feature slug.
 
-Convention: commits that do work toward an issue reference the issue in the commit message (e.g., `#04` or `microsite-path-cleanup/04`). Tooling — for example the `review-issue` agent — relies on this to resolve "what changed for issue NN" by scanning commits on the current branch. Tracker-mutation commits posted by `/triage` already follow this; extend it to work commits.
+Convention: commits that do work toward an issue reference the issue in the commit message (e.g., `#04` or `microsite-path-cleanup/04`). Tracker-mutation commits posted by `/triage` already follow this; extend it to work commits.
+
+To resolve "what changed for issue NN", ask `.formann/runner/issue-commits <feature>/NN` rather than scanning commit messages: it lists the commits the AFK runner stamped `Formann-Issue: <feature>/NN`, the commits whose message mentions the issue (this convention), and, for a feature with only that issue, every commit on its branch. See "Which commits are an issue's" in the runner README.
 
 ## Default query scope
 

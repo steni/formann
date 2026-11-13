@@ -654,7 +654,9 @@ The `formann:archived` label is durable — it survives `gh issue reopen` and pe
 
 ## Commit-message convention
 
-Convention: commits that do work toward an issue reference the issue as `#N` in the commit message. GitHub auto-links the reference and renders it in the issue timeline. Tooling — for example the `review-issue` agent — relies on this to resolve "what changed for issue N" by scanning commits on the current branch. Tracker-mutation commits posted by `/triage` already follow this; extend it to work commits.
+Convention: commits that do work toward an issue reference the issue as `#N` in the commit message. GitHub auto-links the reference and renders it in the issue timeline. Tracker-mutation commits posted by `/triage` already follow this; extend it to work commits.
+
+To resolve "what changed for issue N", ask `.formann/runner/issue-commits '#N'` rather than scanning commit messages: it lists the commits the AFK runner stamped `Formann-Issue: #N`, the commits whose message mentions `#N` (this convention), and, for a standalone issue, every commit on its branch. See "Which commits are an issue's" in the runner README.
 
 ## Issue template
 
