@@ -1801,23 +1801,9 @@ ensure_runner_checkout_exists() {
 # Prints the branch name (no refs/heads/ prefix) on stdout; returns 1 with a
 # stderr diagnostic when nothing resolves.
 resolve_default_branch() {
-  if [ -n "${RUNNER_DEFAULT_BRANCH:-}" ]; then
-    printf '%s\n' "$RUNNER_DEFAULT_BRANCH"
+  if runner_default_branch "$HOST_REPO"; then
     return 0
   fi
-  local upstream_default
-  upstream_default="$(git -C "$HOST_REPO" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')"
-  if [ -n "$upstream_default" ]; then
-    printf '%s\n' "$upstream_default"
-    return 0
-  fi
-  local candidate
-  for candidate in main master; do
-    if git -C "$HOST_REPO" show-ref --quiet --verify "refs/heads/$candidate"; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
-  done
   echo "runner: resolve_default_branch: cannot determine the default branch — host has no refs/remotes/origin/HEAD and neither refs/heads/main nor refs/heads/master exists; set RUNNER_DEFAULT_BRANCH to the default branch's name" >&2
   return 1
 }

@@ -393,6 +393,27 @@ _parse_origin_and_call() {
   assert_output --partial "name=some-repo"
 }
 
+# Inside the runner's sandbox `origin` is a host path, but the sandbox env
+# carries gh's own GH_REPO: the snapshot reads the repo from it.
+@test "GH_REPO names the repo when GH_TRACKER_REPO is unset, ahead of the origin URL" {
+  export GH_REPO="sandbox-owner/sandbox-repo"
+  _parse_origin_and_call "/host/path/the/sandbox/cannot/see" "some-slug"
+  assert_success
+  run cat "$CALL_LOG"
+  assert_output --partial "owner=sandbox-owner"
+  assert_output --partial "name=sandbox-repo"
+}
+
+@test "GH_TRACKER_REPO wins over GH_REPO" {
+  export GH_REPO="sandbox-owner/sandbox-repo"
+  export FIXTURE_RESPONSES_DIR="$FIXTURES/empty-feature/recorded-responses"
+  run "$TRACKER_SNAPSHOT" "some-slug"
+  assert_success
+  run cat "$CALL_LOG"
+  assert_output --partial "owner=test-owner"
+  refute_output --partial "owner=sandbox-owner"
+}
+
 # ════════════════════════════════════════════════════════════════════════════════
 # --eligible-features
 #

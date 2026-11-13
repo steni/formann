@@ -153,3 +153,31 @@ RUNNER_MANIFEST_FILE="${RUNNER_CONSUMER_PROMPTS_DIR}/manifest.md"
 # feature's Claim (post-drain.sh). Same line format as the post-implement
 # manifest. Optional: a missing or empty manifest means no post-drain steps.
 RUNNER_POST_DRAIN_MANIFEST_FILE="${RUNNER_CONSUMER_PROMPTS_DIR}/post-drain.md"
+
+# Print the default branch of the git repository at $1 (no refs/heads/
+# prefix), in precedence order: the RUNNER_DEFAULT_BRANCH override, the
+# repository's own refs/remotes/origin/HEAD, then refs/heads/main and
+# refs/heads/master. Returns 1, printing nothing, when none resolves. The
+# runner's resolve_default_branch (run-the-queue.sh) and issue-commits share
+# this chain; see the runner README's "Default-branch resolution".
+runner_default_branch() {
+  local repo="$1"
+  if [ -n "${RUNNER_DEFAULT_BRANCH:-}" ]; then
+    printf '%s\n' "$RUNNER_DEFAULT_BRANCH"
+    return 0
+  fi
+  local upstream_default
+  upstream_default="$(git -C "$repo" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')"
+  if [ -n "$upstream_default" ]; then
+    printf '%s\n' "$upstream_default"
+    return 0
+  fi
+  local candidate
+  for candidate in main master; do
+    if git -C "$repo" show-ref --quiet --verify "refs/heads/$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
