@@ -1,0 +1,63 @@
+{
+  "data": {
+    "repository": {
+      "issues": {
+        "nodes": [
+          {
+            "number": 50,
+            "state": "CLOSED",
+            "stateReason": "COMPLETED",
+            "labels": {
+              "nodes": [
+                {"name": "formann:feature"},
+                {"name": "formann:slug:closed-feature"}
+              ]
+            },
+            "blockedBy": {"nodes": []},
+            "subIssues": {
+              "nodes": [
+                {
+                  "number": 51,
+                  "state": "CLOSED",
+                  "stateReason": "COMPLETED",
+                  "labels": {
+                    "nodes": [
+                      {"name": "formann:category:enhancement"},
+                      {"name": "formann:type:afk"}
+                    ]
+                  },
+                  "blockedBy": {"nodes": []}
+                },
+                {
+                  "number": 52,
+                  "state": "CLOSED",
+                  "stateReason": "NOT_PLANNED",
+                  "labels": {
+                    "nodes": [
+                      {"name": "formann:category:bug"},
+                      {"name": "formann:type:hitl"}
+                    ]
+                  },
+                  "blockedBy": {"nodes": []}
+                },
+                {
+                  "number": 53,
+                  "state": "OPEN",
+                  "stateReason": null,
+                  "labels": {
+                    "nodes": [
+                      {"name": "formann:status:ready-for-agent"},
+                      {"name": "formann:category:enhancement"},
+                      {"name": "formann:type:afk"}
+                    ]
+                  },
+                  "blockedBy": {"nodes": [{"number": 51}]}
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  }
+}

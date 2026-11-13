@@ -252,9 +252,9 @@ RUNNER_BLOCKED_PASS_LIMIT=3
 #   left-for-human — exit 0, blocked, passes >= 3: the same outcome as a walk
 #                    exhausted at in-review (no abort flag).
 #   Status-based actions apply only when not blocked:
-#   stop-success   — exit 0 AND status is done, wontfix, or empty (github-issues
-#                    binding closes the work-item parent on done, so absence is
-#                    the binding-native signal for done).
+#   stop-success   — exit 0 AND status is done, wontfix, or empty (an issue
+#                    missing from the snapshot, as when its feature was
+#                    archived during the walk, has nothing left to walk).
 #   continue       — exit 0 AND status is in-review; proceed to the next step.
 #   terminate-run  — exit 0 AND status is ready-for-agent (runaway: the step
 #                    re-opened an eligible issue that the next loop iteration

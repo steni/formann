@@ -1,0 +1,32 @@
+{
+  "feature": "closed-feature",
+  "issues": [
+    {
+      "ref": "#51",
+      "nn": "51",
+      "status": "done",
+      "category": "enhancement",
+      "type": "AFK",
+      "blocked_by": [],
+      "eligible": false
+    },
+    {
+      "ref": "#52",
+      "nn": "52",
+      "status": "wontfix",
+      "category": "bug",
+      "type": "HITL",
+      "blocked_by": [],
+      "eligible": false
+    },
+    {
+      "ref": "#53",
+      "nn": "53",
+      "status": "ready-for-agent",
+      "category": "enhancement",
+      "type": "AFK",
+      "blocked_by": ["#51"],
+      "eligible": false
+    }
+  ]
+}

@@ -20,7 +20,10 @@
 ### <slug>:  Emit a JSON object describing the feature's sub-issues with their
 ###          metadata and eligibility.  Schema byte-compatible with the
 ###          local-markdown binding's output; only the `ref` value format
-###          differs (`#N` here, `<feature>/NN` there).
+###          differs (`#N` here, `<feature>/NN` there).  A feature whose
+###          parent is closed still lists every issue it holds, none of them
+###          eligible; an archived feature (closed, formann:archived) lists
+###          none.
 ###
 ### Override the GitHub repo for tests via GH_TRACKER_REPO (owner/repo format).
 ### Otherwise gh's GH_REPO (owner/repo) names it when set, then the origin URL.
@@ -291,7 +294,7 @@ _slug_label="formann:slug:${_slug}"
 
 _slug_query='query($owner: String!, $name: String!, $slugLabel: String!) {
   repository(owner: $owner, name: $name) {
-    issues(labels: [$slugLabel], states: [OPEN], first: 10) {
+    issues(labels: [$slugLabel], states: [OPEN, CLOSED], first: 10) {
       nodes {
         number
         state
@@ -318,8 +321,20 @@ _resp="$(_graphql \
   -F slugLabel="$_slug_label" \
   -f query="$_slug_query")"
 
+# The feature's parent: an open parent when there is one (archived or not, as
+# a reopened archived parent is open again), otherwise a closed one that is not
+# archived.  A closed parent is a feature that is done, but not archived: its
+# issues are listed, none of them eligible.  An archived feature has no parent
+# here, so its snapshot is empty.
+_parents="$(printf '%s' "$_resp" | jq -c '
+  (.data.repository.issues.nodes // []) as $all
+  | [ $all[] | select((.state // "OPEN") == "OPEN") ] as $open
+  | if ($open | length) > 0 then $open
+    else [ $all[] | select(all(.labels.nodes[]?; .name != "formann:archived")) ]
+    end')"
+
 # Count parent matches.
-_parent_count="$(printf '%s' "$_resp" | jq '.data.repository.issues.nodes | length')"
+_parent_count="$(printf '%s' "$_parents" | jq 'length')"
 
 # 0 matches → empty snapshot.
 if [ "$_parent_count" -eq 0 ]; then
@@ -329,29 +344,39 @@ fi
 
 # ≥2 matches → collision error.
 if [ "$_parent_count" -ge 2 ]; then
-  _parent_nums="$(printf '%s' "$_resp" | jq -r '.data.repository.issues.nodes[].number | "#" + tostring' | tr '\n' ' ' | sed 's/ $//')"
+  _parent_nums="$(printf '%s' "$_parents" | jq -r '.[].number | "#" + tostring' | tr '\n' ' ' | sed 's/ $//')"
   echo "tracker-snapshot: slug collision: ${_parent_count} parents share label '${_slug_label}'" >&2
   echo "tracker-snapshot: remove the '${_slug_label}' label from one of: ${_parent_nums}" >&2
   exit "$_EXIT_COLLISION"
 fi
 
 # 1 match — build the stream of issue nodes to process.
-# When the parent carries formann:status:*, it is a work-item and emits as the
-# first entry in issues[]; sub-issues follow in UI priority order (no sort applied).
-_parent_has_status="$(printf '%s' "$_resp" | jq '
-  [.data.repository.issues.nodes[0].labels.nodes[]?.name
-   | select(startswith("formann:status:"))] | length')"
+# When the parent is a work item it emits as the first entry in issues[]; sub-
+# issues follow in UI priority order (no sort applied).  An open work-item
+# parent carries formann:status:*; a closed one has had that label removed by
+# the done/wontfix transition, and is told from a PRD container by the
+# formann:type:* or formann:category:* label a work item carries and a PRD
+# does not.
+_parent_is_work_item="$(printf '%s' "$_parents" | jq '
+  .[0] as $p
+  | [$p.labels.nodes[]?.name] as $names
+  | any($names[]; startswith("formann:status:"))
+    or (($p.state // "OPEN") == "CLOSED"
+        and any($names[]; startswith("formann:type:") or startswith("formann:category:")))')"
 
-if [ "$_parent_has_status" -gt 0 ]; then
-  _issue_json="$(printf '%s' "$_resp" | jq -c '
-    .data.repository.issues.nodes[0] as $p |
+if [ "$_parent_is_work_item" = "true" ]; then
+  _issue_json="$(printf '%s' "$_parents" | jq -c '
+    .[0] as $p |
     ([{number: $p.number, state: $p.state, stateReason: $p.stateReason,
        labels: $p.labels, blockedBy: $p.blockedBy}]
      + ($p.subIssues.nodes // []))[]')"
 else
-  _issue_json="$(printf '%s' "$_resp" | jq -c \
-    '.data.repository.issues.nodes[0].subIssues.nodes[]')"
+  _issue_json="$(printf '%s' "$_parents" | jq -c '.[0].subIssues.nodes[]')"
 fi
+
+# A closed parent's feature is no longer active (--list and
+# --eligible-features leave it out), so none of its issues is eligible.
+_feature_open="$(printf '%s' "$_parents" | jq -r 'if ((.[0].state // "OPEN") == "OPEN") then "true" else "false" end')"
 
 # Phase 1: collect issue metadata into parallel arrays (work-item parent first,
 # if present, then sub-issues).
@@ -457,7 +482,7 @@ for (( _i=0; _i < _issue_count; _i++ )); do
 
   # Compute eligibility.
   _eligible="false"
-  if [ "$_status" = "ready-for-agent" ] && [ "$_type" = "AFK" ]; then
+  if [ "$_feature_open" = "true" ] && [ "$_status" = "ready-for-agent" ] && [ "$_type" = "AFK" ]; then
     _eligible="true"
     for _ref in "${_this_refs[@]+"${_this_refs[@]}"}"; do
       _bnum="${_ref#\#}"  # strip leading #

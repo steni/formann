@@ -210,7 +210,7 @@ Append a new issue file to an existing feature. The new issue enters at `needs-t
 
 Close the feature and mark it as archived. Pre-condition: all issues in the feature must be in a terminal state (`done` or `wontfix`). Per-issue completion only flips `status`; archival is a feature-level operation.
 
-**Local-markdown realization:** Move `.features/<slug>/` to `.features/.archived/<slug>/`. The PRD and all issue files move with it. Commit via a `tracker:` commit.
+**Local-markdown realization:** Move `.features/<slug>/` to `.features/.archived/<slug>/`. The PRD and all issue files move with it. Commit via a `tracker:` commit. From then on `tracker-snapshot <slug>` emits an empty `issues` array; until then it lists every issue, done ones included (see [`README.md`](README.md#tracker-snapshot-feature-slug)).
 
 ## Conventions
 

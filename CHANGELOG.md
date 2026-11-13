@@ -114,6 +114,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `review-issue` at Verify no longer checks the Evidence block; run `review-claims` for that.
 
 ### Fixed
+- github-issues `tracker-snapshot <slug>` lists the issues of a feature whose parent is closed but
+  not archived, the closed ones `done` or `wontfix`, the parent itself included when it is its own
+  work item. A single-issue feature the AFK gate closed on `done` used to snapshot with no issues,
+  so a step run after the drain (a branch review gathering each issue's evidence) saw a feature
+  with nothing in it. No entry of a closed feature is eligible, and `--list` and
+  `--eligible-features` still leave closed features out, so what the runner dispatches is
+  unchanged. An archived feature (closed, `formann:archived`) still snapshots empty, as an archived
+  local-markdown feature does. A closed or archived parent sharing an open parent's slug is no
+  collision: the open one is the feature.
 - Runner Dockerfile template installs Node.js 22 (NodeSource `setup_22.x`) instead of 20. On Node 20,
   npm quietly installed the last Claude Code whose `engines` still allowed it (2.1.197), too old for
   Opus 5.5, so every dispatch failed with an API 400. The install layer now compares `claude

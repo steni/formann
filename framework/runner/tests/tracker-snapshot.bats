@@ -56,6 +56,33 @@ assert_snapshot_matches_golden() {
   assert_output --partial "usage: tracker-snapshot"
 }
 
+# A feature that is done but not archived is still a directory of the tracker
+# root: its snapshot lists every issue, none eligible.  An archived feature
+# (moved under .archived/) snapshots empty — the same contract as the
+# github-issues binding's closed and archived parents.
+@test "done feature, not archived — every issue listed with its terminal status" {
+  local tracker_root="$BATS_TEST_TMPDIR/tracker-done"
+  mkdir -p "$tracker_root/finished/issues"
+  printf -- '---\nstatus: done\ncategory: bug\ntype: AFK\n---\n# One\n' \
+    >"$tracker_root/finished/issues/01-one.md"
+  printf -- '---\nstatus: wontfix\ncategory: enhancement\ntype: HITL\n---\n# Two\n' \
+    >"$tracker_root/finished/issues/02-two.md"
+  TRACKER_ROOT="$tracker_root" run "$TRACKER_SNAPSHOT" finished
+  assert_success
+  [ "$(printf '%s\n' "$output" | jq -c '[.issues[] | [.ref, .status, .eligible]]')" \
+    = '[["finished/01","done",false],["finished/02","wontfix",false]]' ]
+}
+
+@test "archived feature — empty snapshot, exit 0" {
+  local tracker_root="$BATS_TEST_TMPDIR/tracker-archived-slug"
+  mkdir -p "$tracker_root/.archived/shelved/issues"
+  printf -- '---\nstatus: done\ncategory: bug\ntype: AFK\n---\n# One\n' \
+    >"$tracker_root/.archived/shelved/issues/01-one.md"
+  TRACKER_ROOT="$tracker_root" run "$TRACKER_SNAPSHOT" shelved
+  assert_success
+  [ "$output" = '{"feature":"shelved","issues":[]}' ]
+}
+
 # === tracker-snapshot --list ================================================
 #
 # Additive flag: emits a JSON array of active feature slugs (subdirs of

@@ -65,6 +65,8 @@ Any other combination — including `ready-for-agent + HITL`, any non-`ready-for
 
 **Malformed frontmatter.** When an issue's frontmatter block is malformed (missing closing `---`, non-`key: value` lines, etc.), the issue still appears in `issues[]` with a `parse_error: "<short diagnostic>"` field added and `eligible: false`. The script does not exit non-zero just because one issue is malformed — the runner needs to see the snapshot to skip past bad files.
 
+**Done and archived features.** A feature whose issues are all `done` or `wontfix` but which is not archived is still a directory of `.features/`, so its snapshot lists every issue with its status, none of them eligible. An archived feature (moved to `.features/.archived/<slug>/`) snapshots empty, `{"feature":"<slug>","issues":[]}`, as does a slug with no directory: archived means nothing more happens to the feature. The github-issues binding keeps the same contract for a closed and an archived parent.
+
 **What the script does *not* do.** It does not modify any files. It does not follow cross-feature blocker references. It does not interpret natural-language phrases like "None — can start immediately" — those simply contain no canonical refs and yield an empty `blocked_by`.
 
 ### `tracker-snapshot --list`

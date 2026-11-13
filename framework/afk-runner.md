@@ -349,7 +349,7 @@ Inputs: the post-item status, the step's dispatch exit code, and an optional pai
 
 Blocked takes precedence over every status-based guard, but not over a nonzero exit: a failed dispatch is a failure whatever its last line says. A missing or non-integer pass count counts as 0.
 
-An **absent** ref (guard 2) is `stop-success`, not a failure: the github-issues binding closes the issue on `done`, so the issue dropping out of the snapshot is that binding's native "done" signal. `wontfix` is also terminal — a valid final resolution.
+An **absent** ref (guard 2) is `stop-success`, not a failure: an issue missing from the snapshot (its feature archived during the walk, say) has nothing left to walk. A closed issue, the github-issues work-item parent the gate closes on `done` included, stays in its feature's snapshot as `done` or `wontfix` until the feature is archived. `wontfix` is also terminal — a valid final resolution.
 
 `classify_item_action` itself knows nothing about transport crashes or abort flags — those are `walk_post_implement_steps`' job. The walk maps each action to a combined outcome: `stop-success` → `done` (return 0); `continue` → advance to the next item, or `left-for-human` if it was the last (return 0, no abort flag); `fail` → `gate-failed`, or `review-aborted` when the step subprocess transport-crashed (return 1, abort flag `type: technical` / `type: transport` respectively); `terminate-run` → `halt → runaway`, halting the whole run (return 1, no abort flag — the issue is eligible, not stuck); `blocked` → `blocked (<dependency>)` (return 0, no abort flag, no state change); `left-for-human` → `left-for-human (blocked: <dependency>)` (return 0, no abort flag).
 
