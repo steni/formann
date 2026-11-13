@@ -2673,6 +2673,57 @@ EOF
   grep -q '^GH_TOKEN=fixture_binding_token$' "$cap"
 }
 
+@test "run_sandbox_container — the resolved default branch reaches the sandbox as RUNNER_DEFAULT_BRANCH (#19)" {
+  local cap="$BATS_TEST_TMPDIR/captured-env"
+  : >"$cap"
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  cat >"$BATS_TEST_TMPDIR/bin/docker" <<EOF
+#!/usr/bin/env bash
+while [ \$# -gt 0 ]; do
+  [ "\$1" = "--env-file" ] && { shift; cat "\$1" >>"$cap" 2>>"$cap"; }
+  [ "\$1" = "--cidfile" ] && { echo cid >"\$2" 2>/dev/null || true; }
+  shift
+done
+exit 0
+EOF
+  chmod +x "$BATS_TEST_TMPDIR/bin/docker"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+
+  HOST_REPO="$BATS_TEST_TMPDIR/repo"
+  mkdir -p "$HOST_REPO/docs/formann/issue-tracker"
+  git -C "$HOST_REPO" init --quiet --initial-branch=trunk
+  git -C "$HOST_REPO" -c user.email=t@t -c user.name=t commit --allow-empty --quiet -m init
+  git -C "$HOST_REPO" branch master
+  HOST_CHECKOUT="$HOST_REPO"
+  HOST_RUNNER_STATE="$BATS_TEST_TMPDIR"
+  NET_NAME=none
+  RUNNER_CONTAINER_REPO_PATH=/repo
+  RUNNER_CONTAINER_M2_PATH=/m2
+  MVN_VOLUME=vol
+  IMAGE_NAME=img
+  TOKEN=oauth
+  RUNNER_GIT_USER_NAME=Arne
+  RUNNER_GIT_USER_EMAIL=a@b.c
+  RUNNER_INTERRUPTED=0
+  RUNNER_KILL_GRACE_SECONDS=1
+  IN_FLIGHT_CID_FILE=""
+
+  run_sandbox_container "$BATS_TEST_TMPDIR/dispatch" claude -p "/implement #1"
+
+  grep -qx 'RUNNER_DEFAULT_BRANCH=master' "$cap"
+}
+
+@test "collect_consumer_env — refuses RUNNER_DEFAULT_BRANCH, which the runner sets (#19)" {
+  local script="$BATS_TEST_TMPDIR/consumer-sandbox-env"
+  printf '#!/usr/bin/env bash\necho RUNNER_DEFAULT_BRANCH=other\n' >"$script"
+  chmod +x "$script"
+
+  run collect_consumer_env "$script" ""
+
+  assert_failure
+  assert_output --partial "RUNNER_DEFAULT_BRANCH"
+}
+
 @test "run_sandbox_container — empty binding env (no sandbox-env) still dispatches" {
   # Local-markdown / no-prereq bindings emit no sandbox-env, so binding_env is
   # empty. The inline --env-file then carries a blank env-file, which docker
@@ -5579,6 +5630,128 @@ setup_propagate_test() {
   }
 }
 
+# === stamp_dispatch_commits / propagate_feature <branch> <ref> <base> (#19) ===
+#
+# Before it publishes, propagate_feature stamps the commits a dispatch made
+# (<base>..HEAD) with `Formann-Issue: <ref>`. Real host + runner-checkout pair.
+
+# Commit in the runner-checkout as a named author at a fixed date.
+# Args: $1 = message.
+stamp_commit() {
+  GIT_AUTHOR_NAME="Agent Author" GIT_AUTHOR_EMAIL=agent@example.com \
+    GIT_AUTHOR_DATE="1700000000 +0100" \
+    GIT_COMMITTER_NAME="Agent Committer" GIT_COMMITTER_EMAIL=committer@example.com \
+    GIT_COMMITTER_DATE="1700000100 +0100" \
+    git -C "$HOST_CHECKOUT" commit --allow-empty --quiet -m "$1"
+}
+
+# The Formann-Issue trailer values of commit $1 in repo $2, one per line.
+issue_trailers() {
+  git -C "$2" log -1 --format='%(trailers:key=Formann-Issue,valueonly,separator=%x0A)' "$1"
+}
+
+@test "propagate_feature <ref> <base> — every dispatch commit is published with Formann-Issue: <ref>, author, date and message otherwise kept" {
+  setup_propagate_test
+  git -C "$HOST_REPO" checkout --quiet -b elsewhere
+  stamp_commit "before the dispatch"
+  local base
+  base="$(git -C "$HOST_CHECKOUT" rev-parse HEAD)"
+  stamp_commit $'Do the thing\n\nBody text.\n\nCo-Authored-By: Someone <s@example.com>'
+  stamp_commit "tracker: f/01 → in-review"
+
+  propagate_feature "f" "f/01" "$base"
+
+  local parking
+  parking="$(git -C "$HOST_REPO" rev-parse refs/remotes/runner/f)"
+  # The host branch, the parking ref and the runner-checkout agree.
+  [ "$(git -C "$HOST_REPO" rev-parse f)" = "$parking" ]
+  [ "$(git -C "$HOST_CHECKOUT" rev-parse HEAD)" = "$parking" ]
+  [ -z "$(git -C "$HOST_CHECKOUT" status --porcelain)" ]
+
+  # The two dispatch commits carry the trailer; the commit before it does not.
+  [ "$(issue_trailers "$parking" "$HOST_REPO")" = "f/01" ]
+  [ "$(issue_trailers "$parking~1" "$HOST_REPO")" = "f/01" ]
+  [ "$(git -C "$HOST_REPO" rev-parse "$parking~2")" = "$base" ]
+
+  # Author, author date and the message apart from the trailer are kept.
+  [ "$(git -C "$HOST_REPO" log -1 --format='%an <%ae> %ad' --date=raw "$parking~1")" \
+    = "Agent Author <agent@example.com> 1700000000 +0100" ]
+  [ "$(git -C "$HOST_REPO" log -1 --format=%B "$parking~1")" = $'Do the thing\n\nBody text.\n\nCo-Authored-By: Someone <s@example.com>\nFormann-Issue: f/01' ]
+  [ "$(git -C "$HOST_REPO" log -1 --format=%B "$parking")" = $'tracker: f/01 → in-review\n\nFormann-Issue: f/01' ]
+}
+
+@test "propagate_feature <ref> <base> — commits already stamped for <ref> are not rewritten" {
+  setup_propagate_test
+  local base
+  base="$(git -C "$HOST_CHECKOUT" rev-parse HEAD)"
+  stamp_commit $'one\n\nFormann-Issue: f/01'
+  stamp_commit $'two\n\nFormann-Issue: f/01'
+  local tip
+  tip="$(git -C "$HOST_CHECKOUT" rev-parse HEAD)"
+
+  propagate_feature "f" "f/01" "$base"
+
+  [ "$(git -C "$HOST_REPO" rev-parse refs/remotes/runner/f)" = "$tip" ]
+}
+
+@test "propagate_feature <ref> <base> — another issue's Formann-Issue fails propagation naming both refs, nothing published" {
+  setup_propagate_test
+  local base
+  base="$(git -C "$HOST_CHECKOUT" rev-parse HEAD)"
+  stamp_commit "mine"
+  stamp_commit $'theirs\n\nFormann-Issue: f/02'
+  local tip
+  tip="$(git -C "$HOST_CHECKOUT" rev-parse HEAD)"
+
+  RUNNER_LAST_PROPAGATION="stale"
+  local err_file="$BATS_TEST_TMPDIR/stamp-err.txt" rc=0
+  propagate_feature "f" "f/01" "$base" >"$err_file" 2>&1 || rc=$?
+
+  [ "$rc" -eq 1 ]
+  [ -z "$RUNNER_LAST_PROPAGATION" ]
+  grep -q "f/01" "$err_file"
+  grep -q "f/02" "$err_file"
+  # Nothing changed: no parking ref, runner-checkout untouched.
+  run git -C "$HOST_REPO" rev-parse --verify --quiet refs/remotes/runner/f
+  assert_failure
+  [ "$(git -C "$HOST_CHECKOUT" rev-parse HEAD)" = "$tip" ]
+  [ -z "$(issue_trailers "$tip~1" "$HOST_CHECKOUT")" ]
+}
+
+@test "dispatch_one — implement and walk propagations pass the ref and the pre-dispatch head" {
+  setup_dispatch_one_test
+  install_afk_snapshots done
+
+  TEST_PROPAGATE_ARGS="$BATS_TEST_TMPDIR/prop-args"
+  : >"$TEST_PROPAGATE_ARGS"
+  TEST_HEADS="$BATS_TEST_TMPDIR/pre-heads"
+  : >"$TEST_HEADS"
+  propagate_feature() {
+    printf '%s|%s|%s\n' "${1-}" "${2-}" "${3-}" >>"$TEST_PROPAGATE_ARGS"
+    return 0
+  }
+  run_dispatch_container() {
+    git -C "$HOST_CHECKOUT" rev-parse HEAD >>"$TEST_HEADS"
+    git -C "$HOST_CHECKOUT" -c user.email=t@t -c user.name=t \
+      commit --allow-empty --quiet -m "implement"
+    return 0
+  }
+  run_item_container() {
+    git -C "$HOST_CHECKOUT" rev-parse HEAD >>"$TEST_HEADS"
+    git -C "$HOST_CHECKOUT" -c user.email=t@t -c user.name=t \
+      commit --allow-empty --quiet -m "tracker: review f/01 → done"
+    return 0
+  }
+
+  set +e
+  dispatch_one "f" "01" "$TEST_RUN_DIR"
+  set -e
+
+  [ "$(sed -n 1p "$TEST_PROPAGATE_ARGS")" = "f|f/01|$(sed -n 1p "$TEST_HEADS")" ]
+  [ "$(sed -n 2p "$TEST_PROPAGATE_ARGS")" = "f|f/01|$(sed -n 2p "$TEST_HEADS")" ]
+  [ "$(wc -l <"$TEST_PROPAGATE_ARGS" | tr -d ' ')" = "2" ]
+}
+
 # === select_sync_base — pre-dispatch sync-base selector ====================
 #
 # Pure function: takes the Shared remote's branch relation and the parking
@@ -5968,6 +6141,33 @@ setup_ensure_checkout_parking_test() {
   assert_success
   refute_output --partial "runner-checkout origin"
   [ "$(git -C "$HOST_CHECKOUT" remote get-url origin)" = "$HOST_REPO" ]
+}
+
+# issue-commits inside the sandbox excludes what the default branch holds,
+# read from the runner-checkout's origin/<default> (#19): every sync brings
+# that ref up to the host's default branch.
+@test "ensure_runner_checkout_on_branch — refreshes the runner-checkout's origin/<default> to the host's default branch" {
+  setup_ensure_checkout_parking_test
+  git -C "$HOST_REPO" branch main f
+  git -C "$HOST_REPO" checkout --quiet main
+  git -C "$HOST_REPO" -c user.email=t@t -c user.name=t \
+    commit --allow-empty --quiet -m "main moved on"
+  git -C "$HOST_REPO" checkout --quiet f
+
+  run ensure_runner_checkout_on_branch "f"
+
+  assert_success
+  [ "$(git -C "$HOST_CHECKOUT" rev-parse refs/remotes/origin/main)" \
+    = "$(git -C "$HOST_REPO" rev-parse refs/heads/main)" ]
+}
+
+@test "ensure_runner_checkout_on_branch — an unresolvable default branch does not fail the sync" {
+  setup_ensure_checkout_parking_test
+
+  run ensure_runner_checkout_on_branch "f"
+
+  assert_success
+  refute_output --partial "resolve_default_branch"
 }
 
 @test "ensure_runner_checkout — rewritten origin (#96) no longer aborts the run with preflight-abort: runner-checkout" {

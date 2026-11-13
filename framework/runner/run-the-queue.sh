@@ -2128,6 +2128,18 @@ ensure_runner_checkout_on_branch() {
     echo "runner: ensure_runner_checkout_on_branch: git clean -fd failed" >&2
     return 1
   fi
+
+  # Bring the runner-checkout's origin/<default> up to the host's default
+  # branch (#19): issue-commits, run inside the sandbox, leaves out what the
+  # default branch already holds, and the sandbox can't fetch it itself.
+  # Best-effort: a default branch that doesn't resolve or fetch leaves the
+  # sync as it was, and issue-commits reports that it cannot tell.
+  local sync_default_branch
+  if sync_default_branch="$(resolve_default_branch 2>/dev/null)"; then
+    git -C "$HOST_CHECKOUT" fetch --quiet origin \
+      "+refs/heads/$sync_default_branch:refs/remotes/origin/$sync_default_branch" \
+      >/dev/null 2>&1 || true
+  fi
   return 0
 }
 
@@ -2603,7 +2615,7 @@ collect_consumer_env() {
   local consumer_env
   consumer_env="$(collect_binding_env "$script_path")" || return 1
 
-  local taken=" CLAUDE_CODE_OAUTH_TOKEN GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL "
+  local taken=" CLAUDE_CODE_OAUTH_TOKEN GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL RUNNER_DEFAULT_BRANCH "
   local entry
   for entry in "${RUNNER_DISPATCH_ENV[@]}"; do
     taken+="${entry%%=*} "
@@ -2719,6 +2731,15 @@ run_sandbox_container() {
   local consumer_env
   consumer_env="$(collect_consumer_env "$HOST_REPO/runner/sandbox-env" "$binding_env")" || return 1
 
+  # The default branch as the host resolves it (#19). Inside the sandbox the
+  # runner-checkout's own origin/HEAD is an accident of clone time, so steps
+  # that need the default branch (issue-commits) read RUNNER_DEFAULT_BRANCH.
+  # Left out when it doesn't resolve; issue-commits then says it cannot tell.
+  local default_branch_env="" sandbox_default_branch
+  if sandbox_default_branch="$(resolve_default_branch 2>/dev/null)"; then
+    default_branch_env="RUNNER_DEFAULT_BRANCH=$sandbox_default_branch"
+  fi
+
   # `--init` puts Docker's built-in init (tini) at PID 1, with the image's
   # entrypoint as its child. PID 1 inherits every process whose parent has
   # exited, and only PID 1 can collect such an orphan's exit status once it
@@ -2744,6 +2765,7 @@ run_sandbox_container() {
       "$RUNNER_GIT_USER_NAME" "$RUNNER_GIT_USER_EMAIL") \
     --env-file <(printf '%s\n' "$binding_env") \
     --env-file <(printf '%s\n' "$consumer_env") \
+    --env-file <(printf '%s\n' "$default_branch_env") \
     "$IMAGE_NAME" \
     "$@" \
     >"$log_base.stdout.jsonl" 2>"$log_base.stderr.log" &
@@ -3202,6 +3224,116 @@ Fix with: git remote remove runner
 
 # === Host fast-forward propagation =========================================
 
+# Stamp the commits one dispatch made with the issue it worked on (#19).
+#
+# Every commit on the runner-checkout's current branch that is not reachable
+# from <base> (the branch head before the dispatch) gets the trailer
+# `Formann-Issue: <ref>`, added with `git interpret-trailers`. Tree, author,
+# author date, committer and committer date are kept; only the message gains
+# the trailer. A commit already carrying the trailer for <ref> keeps its
+# message, and keeps its sha unless a parent was rewritten. A commit carrying
+# another issue's `Formann-Issue` is never overwritten: the function prints a
+# message naming both refs and returns 1, having changed nothing. The
+# commits are unpublished at this point, so the rewrite touches nothing
+# anyone else has fetched; propagate_feature calls it before it publishes.
+#
+# Args: $1 = ref (binding-native), $2 = base (pre-dispatch head sha)
+# Return: 0 (stamped, or nothing to stamp), 1 (conflict or git failure).
+stamp_dispatch_commits() {
+  local ref="$1" base="$2"
+  local trailer_key="Formann-Issue"
+  local branch_ref head commits
+  if ! branch_ref="$(git -C "$HOST_CHECKOUT" symbolic-ref --quiet HEAD)"; then
+    echo "runner: stamp_dispatch_commits: the runner-checkout's HEAD is not on a branch" >&2
+    return 1
+  fi
+  head="$(git -C "$HOST_CHECKOUT" rev-parse --verify HEAD)" || return 1
+  commits="$(git -C "$HOST_CHECKOUT" rev-list --reverse --topo-order "$head" --not "$base")" || return 1
+  [ -z "$commits" ] && return 0
+
+  # Refuse before rewriting anything: one commit of another issue's fails
+  # the whole stamp.
+  local sha value
+  while IFS= read -r sha; do
+    while IFS= read -r value; do
+      [ -z "$value" ] && continue
+      if [ "$value" != "$ref" ]; then
+        echo "runner: commit $sha carries $trailer_key: $value, but the dispatch for $ref made it; the runner does not overwrite another issue's $trailer_key (issue $value vs issue $ref)" >&2
+        return 1
+      fi
+    done <<<"$(git -C "$HOST_CHECKOUT" log -1 \
+      --format="%(trailers:key=$trailer_key,valueonly,separator=%x0A)" "$sha")"
+  done <<<"$commits"
+
+  # Rewrite oldest first. olds[i] → news[i] maps each rewritten commit, so a
+  # child is re-parented onto its parent's new sha (bash 3.2: no associative
+  # arrays, a linear lookup over one dispatch's commits).
+  local olds=() news=()
+  local parents parent new_parents mapped i changed stamped new_sha
+  local author_name author_email author_date committer_name committer_email committer_date
+  while IFS= read -r sha; do
+    parents="$(git -C "$HOST_CHECKOUT" rev-list --parents -n 1 "$sha")"
+    parents="${parents#"$sha"}"
+    new_parents=()
+    changed=0
+    for parent in $parents; do
+      mapped="$parent"
+      i=0
+      while [ "$i" -lt "${#olds[@]}" ]; do
+        if [ "${olds[$i]}" = "$parent" ]; then mapped="${news[$i]}"; break; fi
+        i=$((i + 1))
+      done
+      [ "$mapped" != "$parent" ] && changed=1
+      new_parents+=(-p "$mapped")
+    done
+    stamped=0
+    if git -C "$HOST_CHECKOUT" log -1 \
+        --format="%(trailers:key=$trailer_key,valueonly,separator=%x0A)" "$sha" \
+        | grep -qxF -- "$ref"; then
+      stamped=1
+    fi
+    if [ "$stamped" -eq 1 ] && [ "$changed" -eq 0 ]; then
+      new_sha="$sha"
+    else
+      author_name="$(git -C "$HOST_CHECKOUT" log -1 --format=%an "$sha")"
+      author_email="$(git -C "$HOST_CHECKOUT" log -1 --format=%ae "$sha")"
+      author_date="$(git -C "$HOST_CHECKOUT" log -1 --format=%ad --date=raw "$sha")"
+      committer_name="$(git -C "$HOST_CHECKOUT" log -1 --format=%cn "$sha")"
+      committer_email="$(git -C "$HOST_CHECKOUT" log -1 --format=%ce "$sha")"
+      committer_date="$(git -C "$HOST_CHECKOUT" log -1 --format=%cd --date=raw "$sha")"
+      # The raw message: everything after the header block's blank line.
+      if ! new_sha="$(
+          git -C "$HOST_CHECKOUT" cat-file commit "$sha" | sed '1,/^$/d' \
+          | if [ "$stamped" -eq 1 ]; then cat; else
+              git -C "$HOST_CHECKOUT" interpret-trailers \
+                --where end --if-exists addIfDifferent --if-missing add \
+                --trailer "$trailer_key: $ref"
+            fi \
+          | GIT_AUTHOR_NAME="$author_name" GIT_AUTHOR_EMAIL="$author_email" \
+            GIT_AUTHOR_DATE="$author_date" \
+            GIT_COMMITTER_NAME="$committer_name" GIT_COMMITTER_EMAIL="$committer_email" \
+            GIT_COMMITTER_DATE="$committer_date" \
+            git -C "$HOST_CHECKOUT" commit-tree "${sha}^{tree}" ${new_parents[@]+"${new_parents[@]}"} -F -
+        )"; then
+        echo "runner: stamp_dispatch_commits: could not rewrite commit $sha" >&2
+        return 1
+      fi
+    fi
+    olds+=("$sha")
+    news+=("$new_sha")
+  done <<<"$commits"
+
+  local new_head="${news[$((${#news[@]} - 1))]}"
+  [ "$new_head" = "$head" ] && return 0
+  # Trees are unchanged, so moving the checked-out branch leaves the index
+  # and working tree as they are.
+  if ! git -C "$HOST_CHECKOUT" update-ref -m "runner: stamp $trailer_key: $ref" \
+      "$branch_ref" "$new_head" "$head" >&2; then
+    echo "runner: stamp_dispatch_commits: git update-ref $branch_ref failed" >&2
+    return 1
+  fi
+}
+
 # Publish the feature branch to the per-feature parking ref
 # (`refs/remotes/runner/<branch>` on host), then attempt a best-effort
 # host fast-forward (`refs/heads/<branch>`), then fast-forward the Shared
@@ -3238,9 +3370,24 @@ Fix with: git remote remove runner
 # On return 1 (error), RUNNER_LAST_PROPAGATION is cleared to ''.
 #
 # Args: $1 = branch name
+#       $2 = ref, $3 = pre-dispatch head (optional, together): stamp the
+#            commits $3..HEAD with `Formann-Issue: $2` first
+#            (stamp_dispatch_commits). A propagation that publishes no
+#            dispatch's commits (the claim Note) passes neither.
 propagate_feature() {
-  local branch="$1"
+  local branch="$1" stamp_ref="${2:-}" stamp_base="${3:-}"
   local parking_ref="refs/remotes/runner/${branch}"
+
+  # Step 0: stamp the dispatch's commits with its issue (#19) — fail-fatal,
+  # before anything is published, so the parking ref, the host branch and
+  # the Shared remote all carry the stamped shas.
+  if [ -n "$stamp_ref" ] && [ -n "$stamp_base" ]; then
+    if ! stamp_dispatch_commits "$stamp_ref" "$stamp_base"; then
+      echo "runner: propagation error — could not stamp the dispatch's commits with Formann-Issue: ${stamp_ref}; nothing was published. The commits are in the runner-checkout ($HOST_CHECKOUT, branch ${branch})." >&2
+      RUNNER_LAST_PROPAGATION=""
+      return 1
+    fi
+  fi
 
   # Step 1: publish to parking ref — fail-fatal. The `+` prefix force-updates
   # the parking ref; it is runner-owned and its semantics are "this is the
@@ -3686,7 +3833,7 @@ walk_post_implement_steps() {
       snap_iter_duration=$(( impl_duration + total_item_seconds + snap_item_duration ))
       echo "runner: walk_post_implement_steps: tracker-snapshot failed (post-$item_label) for ref '$ref'" >&2
       if [ "$item_has_runner_commits" -eq 1 ]; then
-        if ! propagate_feature "$feature"; then
+        if ! propagate_feature "$feature" "$ref" "$pre_item_head"; then
           local halt_duration
           halt_duration=$(( $(date +%s) - item_started_at + impl_duration + total_item_seconds ))
           RUN_STOP_REASON="propagation-error"
@@ -3756,7 +3903,7 @@ walk_post_implement_steps() {
         fi
         format_progress_outcome "$(now_clock)" "$ref" "$item_label" "$blocked_progress_label" "$item_duration"
         if [ "$item_has_runner_commits" -eq 1 ]; then
-          if ! propagate_feature "$feature"; then
+          if ! propagate_feature "$feature" "$ref" "$pre_item_head"; then
             local halt_duration
             halt_duration=$(( $(date +%s) - item_started_at + impl_duration + total_item_seconds - item_duration ))
             format_progress_outcome "$(now_clock)" "$ref" "$item_label" "halt → gate-failed" "$item_duration"
@@ -3778,7 +3925,7 @@ walk_post_implement_steps() {
       stop-success)
         format_progress_outcome "$(now_clock)" "$ref" "$item_label" "clean → done" "$item_duration"
         if [ "$item_has_runner_commits" -eq 1 ]; then
-          if ! propagate_feature "$feature"; then
+          if ! propagate_feature "$feature" "$ref" "$pre_item_head"; then
             local halt_duration
             halt_duration=$(( $(date +%s) - item_started_at + impl_duration + total_item_seconds - item_duration ))
             format_progress_outcome "$(now_clock)" "$ref" "$item_label" "halt → gate-failed" "$item_duration"
@@ -3811,7 +3958,7 @@ walk_post_implement_steps() {
         [ "$item_window_gave_up" = "1" ] && flag_type="window"
         write_abort_flag "$feature" "$nn" "$item_label" "$item_rc" "$item_log_base.stdout.jsonl" "$flag_type"
         if [ "$item_has_runner_commits" -eq 1 ]; then
-          if ! propagate_feature "$feature"; then
+          if ! propagate_feature "$feature" "$ref" "$pre_item_head"; then
             local halt_duration
             halt_duration=$(( $(date +%s) - item_started_at + impl_duration + total_item_seconds - item_duration ))
             format_progress_outcome "$(now_clock)" "$ref" "$item_label" "halt → $item_combined_label" "$item_duration"
@@ -3830,7 +3977,7 @@ walk_post_implement_steps() {
         # Do NOT write an abort flag: the issue is eligible, not stuck.
         format_progress_outcome "$(now_clock)" "$ref" "$item_label" "halt → runaway" "$item_duration"
         if [ "$item_has_runner_commits" -eq 1 ]; then
-          if ! propagate_feature "$feature"; then
+          if ! propagate_feature "$feature" "$ref" "$pre_item_head"; then
             local halt_duration
             halt_duration=$(( $(date +%s) - item_started_at + impl_duration + total_item_seconds - item_duration ))
             RUN_STOP_REASON="propagation-error"
@@ -3856,7 +4003,7 @@ walk_post_implement_steps() {
         fi
         format_progress_outcome "$(now_clock)" "$ref" "$item_label" "$item_progress_label" "$item_duration"
         if [ "$item_has_runner_commits" -eq 1 ]; then
-          if ! propagate_feature "$feature"; then
+          if ! propagate_feature "$feature" "$ref" "$pre_item_head"; then
             local halt_duration
             halt_duration=$(( $(date +%s) - item_started_at + impl_duration + total_item_seconds - item_duration ))
             format_progress_outcome "$(now_clock)" "$ref" "$item_label" "halt → gate-failed" "$item_duration"
@@ -4013,7 +4160,7 @@ dispatch_one() {
     snap_duration=$(( snap_fail_at - started_at ))
     echo "runner: dispatch_one: tracker-snapshot failed (post-implement stage) for ref '$ref'" >&2
     if [ "$impl_has_runner_commits" -eq 1 ]; then
-      if ! propagate_feature "$feature"; then
+      if ! propagate_feature "$feature" "$ref" "$pre_implement_head"; then
         local halt_duration
         halt_duration=$(( $(date +%s) - started_at ))
         RUN_STOP_REASON="propagation-error"
@@ -4085,7 +4232,7 @@ dispatch_one() {
   # the runner-checkout still holds the un-published commits, and the next
   # sync would wipe them if the loop continued.
   if [ "$impl_has_runner_commits" -eq 1 ]; then
-    if ! propagate_feature "$feature"; then
+    if ! propagate_feature "$feature" "$ref" "$pre_implement_head"; then
       # The original outcome line above already showed the implement-step
       # result (in-review/done). Emit a follow-up `halt → FAIL` line so
       # the operator's terminal record matches the SUMMARY.md row, while
