@@ -23,6 +23,7 @@
 ###          differs (`#N` here, `<feature>/NN` there).
 ###
 ### Override the GitHub repo for tests via GH_TRACKER_REPO (owner/repo format).
+### Otherwise gh's GH_REPO (owner/repo) names it when set, then the origin URL.
 ###
 ### Bash 3.2 compatible (macOS default): no associative arrays.
 ###
@@ -47,10 +48,15 @@ if [ "$#" -lt 1 ]; then
 fi
 
 # ── Owner/repo detection ──────────────────────────────────────────────────────
-# Tests set GH_TRACKER_REPO=owner/repo to bypass git-remote parsing.
+# Tests set GH_TRACKER_REPO=owner/repo to bypass git-remote parsing. Next
+# comes gh's own GH_REPO, which the runner's sandbox carries (sandbox-env):
+# there `origin` is a host path the container can't parse a repo from.
 if [ -n "${GH_TRACKER_REPO:-}" ]; then
   _gh_owner="${GH_TRACKER_REPO%%/*}"
   _gh_name="${GH_TRACKER_REPO##*/}"
+elif [ -n "${GH_REPO:-}" ]; then
+  _gh_owner="${GH_REPO%%/*}"
+  _gh_name="${GH_REPO##*/}"
 else
   _remote_url=""
   _remote_url="$(git remote get-url origin 2>/dev/null)" || true

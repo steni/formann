@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# issue-commits — which commits on HEAD are an issue's.
+#
+# Usage: .formann/runner/issue-commits <ref>
+#
+#   Run from the checkout's root, on the host or inside the runner's sandbox.
+#   <ref> is the binding-native issue ref (`#N` under github-issues,
+#   `<feature>/NN` under local-markdown). Prints the full shas of the issue's
+#   commits on HEAD, oldest first, one per line. Commits reachable from the
+#   default branch are never listed, and neither are merge commits (as
+#   `git log --no-merges`), whatever they carry: a consumer diffs each listed
+#   commit on its own.
+#
+#   A commit belongs to the issue when the first of these matches:
+#     1. it carries a `Formann-Issue:` trailer: it is the issue's when one of
+#        them names <ref>, and no other rule is asked (the runner stamps every
+#        dispatch commit with the issue it worked on);
+#     2. its message mentions <ref> (the binding's commit-message convention,
+#        for commits made before the runner stamped them). On the feature
+#        branch `#NN` is shorthand for `<feature>/NN`;
+#     3. the issue is its feature's only issue (a standalone work item, the
+#        parent of its own feature): every commit on the branch since it left
+#        the default branch.
+#
+#   The feature is HEAD's branch (feature branches are named with the
+#   feature's slug); its issues come from the binding's tracker-snapshot,
+#   `docs/formann/issue-tracker/tracker-snapshot <feature>`. The default
+#   branch is resolved as the runner resolves it (RUNNER_DEFAULT_BRANCH, then
+#   origin/HEAD, then main, then master; see runner_default_branch in
+#   lib.sh); the runner sets RUNNER_DEFAULT_BRANCH inside the sandbox.
+#
+# Exit codes:
+#   0 — success, possibly with no output
+#   2 — usage error (not exactly one non-empty <ref>, or not in a git checkout)
+#   3 — cannot tell: the default branch, HEAD's branch or the tracker cannot
+#       be read
+#
+# Bash 3.2 compatible (macOS default): no associative arrays.
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib.sh
+source "$HERE/lib.sh"
+
+readonly EXIT_USAGE=2
+readonly EXIT_CANNOT_TELL=3
+readonly TRAILER_KEY="Formann-Issue"
+
+if [ "$#" -ne 1 ] || [ -z "$1" ]; then
+  echo "usage: issue-commits <ref>" >&2
+  exit "$EXIT_USAGE"
+fi
+ref="$1"
+
+if ! root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+  echo "issue-commits: not inside a git checkout" >&2
+  exit "$EXIT_USAGE"
+fi
+
+# The default branch, and the refs that hold it here: the local branch and the
+# tracking ref of `origin` (the only one a sandbox checkout may have).
+if ! default_branch="$(runner_default_branch "$root")"; then
+  echo "issue-commits: cannot resolve the default branch; set RUNNER_DEFAULT_BRANCH" >&2
+  exit "$EXIT_CANNOT_TELL"
+fi
+default_refs=()
+for candidate in "refs/heads/$default_branch" "refs/remotes/origin/$default_branch"; do
+  if git -C "$root" show-ref --verify --quiet "$candidate"; then
+    default_refs+=("$candidate")
+  fi
+done
+if [ "${#default_refs[@]}" -eq 0 ]; then
+  echo "issue-commits: the default branch '$default_branch' has no ref in this checkout (neither refs/heads/$default_branch nor refs/remotes/origin/$default_branch)" >&2
+  exit "$EXIT_CANNOT_TELL"
+fi
+
+if ! feature="$(git -C "$root" symbolic-ref --quiet --short HEAD)"; then
+  echo "issue-commits: HEAD is not on a branch, so its feature (and tracker) cannot be read" >&2
+  exit "$EXIT_CANNOT_TELL"
+fi
+
+if ! snapshot="$(cd "$root" && bash docs/formann/issue-tracker/tracker-snapshot "$feature")"; then
+  echo "issue-commits: cannot read the tracker (tracker-snapshot $feature failed)" >&2
+  exit "$EXIT_CANNOT_TELL"
+fi
+if ! standalone="$(jq -r --arg r "$ref" \
+    '(.issues | length) == 1 and .issues[0].ref == $r' <<<"$snapshot")"; then
+  echo "issue-commits: cannot read the tracker (tracker-snapshot $feature printed no JSON)" >&2
+  exit "$EXIT_CANNOT_TELL"
+fi
+
+# Message mentions: the ref itself, and on the feature branch the `#NN`
+# shorthand for `<feature>/NN`. A ref ends at a non-digit, and starts after
+# anything that can't be part of a longer ref.
+ere_escape() {
+  printf '%s' "$1" | sed 's/[][\.^$*+?(){}|/]/\\&/g'
+}
+mention_pattern="$(ere_escape "$ref")"
+case "$ref" in
+  "$feature"/*)
+    mention_pattern="($mention_pattern|#$(ere_escape "${ref#"$feature"/}"))"
+    ;;
+esac
+mention_pattern="(^|[^0-9A-Za-z_./-])${mention_pattern}([^0-9]|\$)"
+
+commits="$(git -C "$root" rev-list --reverse --topo-order --no-merges HEAD --not "${default_refs[@]}")"
+[ -z "$commits" ] && exit 0
+
+while IFS= read -r sha; do
+  trailers="$(git -C "$root" log -1 \
+    --format="%(trailers:key=$TRAILER_KEY,valueonly,separator=%x0A)" "$sha")"
+  if [ -n "$trailers" ]; then
+    if printf '%s\n' "$trailers" | grep -qxF -- "$ref"; then
+      printf '%s\n' "$sha"
+    fi
+    continue
+  fi
+  if git -C "$root" log -1 --format=%B "$sha" | grep -qE -- "$mention_pattern"; then
+    printf '%s\n' "$sha"
+    continue
+  fi
+  if [ "$standalone" = "true" ]; then
+    printf '%s\n' "$sha"
+  fi
+done <<<"$commits"
