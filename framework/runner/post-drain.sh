@@ -86,7 +86,7 @@ resolve_post_drain_manifest() {
 # resolves. Sets RESOLVED_POST_DRAIN.
 check_post_drain_manifest() {
   if ! RESOLVED_POST_DRAIN="$(resolve_post_drain_manifest \
-      "$HOST_REPO/$RUNNER_CONSUMER_PROMPTS_DIR" "$HERE" "$HERE/steps" 2>&1)"; then
+      "$(judges_dir)/$RUNNER_CONSUMER_PROMPTS_DIR" "$HERE" "$HERE/steps" 2>&1)"; then
     fail_invariant "post-drain-manifest" "$RESOLVED_POST_DRAIN"
   fi
 }

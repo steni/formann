@@ -155,6 +155,28 @@ Keep starting the runner as before (`.formann/runner/run-the-queue.sh`, or the s
 - **Refusal.** Local changes (modified, staged or untracked files), divergence (commits the ref lacks — the checkout is ahead of it or has diverged), a missing directory, a directory that is not a git clone, or a ref that cannot be fetched refuse the drain with the reason, before any claim is taken: at startup `preflight-abort: runner-formann` (exit 2; the reason is the line `runner: runner-formann: refusing to drain: <reason>` in `runner.log`); in the idle loop the pass is skipped as `formann-refused` and the runner tries again after the sleep. Reconcile the checkout by hand (`git -C "$RUNNER_FORMANN_DIR" status`, `reset --hard <remote>/<branch>` if the local state is not wanted) — the runner never discards it for you.
 - **Record.** The sha is the `formann:` line of the **Claim** and the `- Formann: <sha> (<ref>)` line of `SUMMARY.md` (every variant, including a pre-flight abort and each pass's summary), and `runner.log` opens with `runner: Formann <sha> (<ref>)`. A bad run points straight at the version that produced it.
 
+## The Judges checkout
+
+The sandbox's reviewers (`.claude/skills`, `.claude/agents`, `.claude/rules`, mounted read-only) and the consumer's post-implement and post-drain manifests and step prompts (`runner/`) are read from a checkout the slug branch can't change. That checkout is not the host repo — people and their sessions work there, and the runner never updates it — but a clone the runner owns at `.runner-state/judges/`, beside the runner-checkout. Before anything reads a judge (in pre-flight, after the lock) and, with `--idle`, before every pass after the first, `judges_refresh` (`judges.sh`) fetches the default branch from the **Shared remote** (`RUNNER_SHARED_REMOTE`, default `origin`; the branch as in [Default-branch resolution](#default-branch-resolution)) and sets the judges checkout to it exactly: detached, `--force`, cleaned. So a runner machine's gates run the reviewers and prompts on the default branch, whatever the host repo has checked out and whether or not anyone pulled.
+
+- **Never the host repo.** The only change in the host repo is the fetch into `refs/remotes/<remote>/<branch>`; its HEAD, branches and working tree are untouched, dirty or not, on any branch.
+- **Nothing to skip.** Nobody edits the judges checkout; an edit or stray file in it is gone at the next refresh.
+- **Can't refresh** (a failed fetch, a default branch that doesn't resolve, a failed clone): the judges stay at their last commit, `runner.log` warns, and the pass goes on. Before the checkout first exists, the judges come from the host repo, with the same warning. Pre-flight never fails on it.
+- **No Shared remote** (one machine): the judges come from the host repo, as they always have, and no judges checkout is made.
+- **Untracked `.claude/<sub>`** (gitignored in the consumer, as in Formann's self-install): mounted from the host repo. `.formann` and `docs/formann` stay mounted from the host repo; they are Formann's, and Formann's own judges come from [the Runner's Formann](#the-runners-formann).
+- **Record.** After the Formann line, `runner.log` names the judges' commit, and every later pass repeats it:
+
+  ```
+  [12:00:01] runner: Formann <sha> (origin/main)
+  [12:00:02] runner: judges <sha> (origin/main)
+  [12:00:02] runner: warning: judges not refreshed: fetch of origin/main failed: <git's last line>; keeping them at <sha>
+  [12:00:02] runner: judges <sha> (origin/main, not refreshed)
+  ```
+
+  With no Shared remote the line reads `runner: judges <sha> (host repo, no Shared remote 'origin')`; read from the host repo as a fallback, `(host repo)`. The claim Note posted on a feature names it beside Formann's: ``Formann `<sha>`, judges `<sha>` ``.
+
+Post-implement and post-drain manifests are resolved once, in pre-flight; a later pass reads the refreshed contents of the steps they name, but a step added to a manifest is picked up by the next run.
+
 ## Per-run output
 
 Every invocation — including pre-flight aborts — creates a fresh run dir
