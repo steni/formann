@@ -10,11 +10,11 @@ The issue ref is appended to this prompt below the `---` separator at the end. I
 
 1. **Read the issue and its comments.** Note the acceptance criteria and the Evidence block from the implementation comment.
 
-2. **Find the latest findings comment.** Look for the most recent comment that contains severity markers — `🔴 Critical`, `🟡 Important`, or `🟢 Minor` (or equivalent text if the emoji drifted). This is the handoff from the review step. The heading of the comment does not matter; the severity convention is the contract.
+2. **Find the latest findings comment.** Look for the most recent comment that contains severity markers — `🔴 Critical`, `🟡 Important`, or `🟢 Minor` (or equivalent text if the emoji drifted). This is the handoff from the review step. The heading of the comment does not matter; the severity convention is the contract. The comment may hold several reviewers' sections — the default review step records the general review and then the claims review under `## Claims review` — and you classify across every section of it, not only the first.
 
    If no such comment exists, exit non-zero with a diagnostic: "gate: no severity-tagged findings comment found; cannot classify." The runner will record `gate-failed`.
 
-3. **Classify.** Read the identified findings and determine the highest severity present.
+3. **Classify.** Read the identified findings — every section of the comment — and determine the highest severity present.
 
    - **Any `🔴 Critical` (or equivalent) finding present** → verdict is `blocked`.
    - **Highest severity is `🟡 Important` or below, or no findings** → verdict is `clean`.
