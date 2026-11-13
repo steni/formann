@@ -174,6 +174,8 @@ git -C <host-repo> fetch <runner-checkout> <branch>:<branch>
 git -C <host-repo> push <shared-remote> <parking-ref-tip>:refs/heads/<branch>
 ```
 
+Before step 1 the runner stamps the dispatch's commits — those on the runner-checkout's branch that the head before the dispatch did not hold — with the trailer `Formann-Issue: <ref>`, the binding-native ref of the issue the dispatch worked on (`#N` under github-issues, `<feature>/NN` under local-markdown). That covers `/implement` and every post-implement step that commits; a propagation that publishes no dispatch's work (the claim Note) stamps nothing. The trailer is added with `git interpret-trailers`; tree, author, author date, committer and committer date are kept, so only the message changes, and the branch is moved to the rewritten tip before anything is published, so the parking ref, the host branch, the Shared remote and the next step's pre-dispatch head all see the same shas. The commits are unpublished at that point, so the rewrite touches nothing anyone else has fetched. A commit that already carries the trailer for this ref keeps its message (and its sha, unless a parent was rewritten). A commit carrying another issue's `Formann-Issue` is never overwritten: the propagation fails (`propagation-error`), naming both refs, and nothing is published; the commits stay in the runner-checkout.
+
 Step 1 is the runner's authoritative chain for `<branch>` and always advances on a successful dispatch; failure of step 1 is a true propagation error. Step 2 is best-effort: git's own refusal — host is on the target branch (HEAD-on-target) or the update isn't a fast-forward — yields a `parked-only` outcome rather than a halt. Either step-2 outcome is recorded as success: the commit is reachable on host either way.
 
 If step 2 refuses, the maintainer pulls the runner's chain explicitly: `git pull runner <branch>`. The parking ref persists on host across dispatches independent of what the runner-checkout does, so a parked commit is durable until the next dispatch supersedes it. Successive parked-only dispatches chain linearly because the pre-dispatch sync (see "Runner-checkout" above) targets the parking-ref tip whenever it is strictly ahead of host's branch.
@@ -187,6 +189,16 @@ Step 3 publishes to the **Shared remote** (ADR-0011): the host repo's remote nam
 **Stale-parking-ref sweep.** Once per runner invocation, during pre-flight — after the runner-checkout clone-existence check (the sweep reads the checkout) and before the runner-checkout branch-sync — the runner sweeps `refs/remotes/runner/*` on host. That placement is load-bearing: the sweep deletes the runner-checkout's source branch, which may be the branch its HEAD points at, leaving HEAD unborn. The branch-sync must observe post-sweep state so its unborn-HEAD recovery heals the checkout in the same invocation, before the first snapshot reads `HEAD`. For each parking ref, it asks git which other refs contain the parking ref's tip commit (`git for-each-ref --contains <tip>`). If another ref (any ref except the parking ref itself and `refs/remotes/runner/HEAD`) contains the tip, **and** the runner-checkout's `refs/heads/<slug>` tip is similarly reachable from a host ref (when the source branch is present), both deletions happen: the runner-checkout's source branch first, then the host parking ref. Source-first order closes a race where an interleaved `git fetch runner` would restore the host ref from the surviving source. If either reachability check fails, the slug is left untouched and self-cleans on the next successful propagate. If the source-side delete itself fails (lock contention, permissions), the host parking ref is also kept — proceeding alone would reintroduce the original cluttering bug. The sweep is safe-by-construction: deletion only happens when reachability through another ref is proven AND the deletion on the other side succeeded (or wasn't needed). `refs/remotes/runner/HEAD` (the symbolic ref git creates for the runner remote) is never treated as a parking ref and is unconditionally skipped. A parking ref with an unreadable tip is skipped with a warning in `runner.log`; the sweep continues and exits 0. Each deletion is logged with the deleted ref and the witnessing ref. When at least one ref is swept, `SUMMARY.md` gains a `## Swept parking refs` section; when no refs are swept the section is absent. A feature whose parking ref was swept dispatches normally in the very same run — `ensure_runner_checkout_on_branch` sees an absent parking ref, syncs from the host branch tip, and the first successful propagation recreates the parking ref.
 
 The runner never pushes to a remote.
+
+### Which commits are an issue's — `framework/runner/issue-commits`
+
+A Consumer's steps (evidence, review gates) ask `.formann/runner/issue-commits <ref>` for the issue's commits instead of searching commit messages, which finds nothing in a project whose commit style leaves the ref out. Run from the checkout's root, on the host or inside the sandbox, it prints the full shas of the issue's commits on HEAD, oldest first, one per line, leaving out commits reachable from the default branch and merge commits (as `git log --no-merges`: a step diffs each listed commit on its own). A commit is the issue's when the first of these matches:
+
+1. it carries a `Formann-Issue` trailer (the stamp above): the trailer decides alone, the commit is the issue's when it names `<ref>`;
+2. its message mentions `<ref>` — the binding's commit-message convention, for commits made before the runner stamped them (on the feature branch `#NN` stands for `<feature>/NN`);
+3. the issue is its feature's only issue (a standalone work item, the parent of its own feature): every commit on the branch since it left the default branch.
+
+The feature is HEAD's branch; its issues come from the binding's `tracker-snapshot`. The default branch is resolved as the runner resolves it (`runner_default_branch` in `lib.sh`); inside the sandbox the runner passes `RUNNER_DEFAULT_BRANCH` and keeps the runner-checkout's `origin/<default>` at the host's default branch at every sync. Exit 0 (possibly no output), 2 on a usage error, 3 when it cannot tell (the default branch, HEAD's branch or the tracker can't be read).
 
 ### Per-feature mvn cache — `framework/runner/ensure-mvn-cache.sh`
 
@@ -539,7 +551,8 @@ framework/
     ├── README.md                             ← operator-facing reference
     ├── NOTES.md                              ← provenance of vendored files
     ├── run-the-queue.sh                      ← orchestrator
-    ├── lib.sh                                ← shared constants
+    ├── lib.sh                                ← shared constants and helpers
+    ├── issue-commits                         ← which commits on HEAD are an issue's
     ├── build-image.sh                        ← idempotent image builder (builds $HOST_REPO/runner/Dockerfile)
     ├── setup-network.sh                      ← bridge + iptables policy
     ├── ensure-mvn-cache.sh                   ← per-feature volume helper

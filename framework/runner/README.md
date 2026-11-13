@@ -346,7 +346,7 @@ Window-waits do not consume the transport-retry budget, and the transport attemp
 
 ## Default-branch resolution
 
-When a feature's branch exists on the Shared remote but not on host, the runner starts from the remote's branch (see *Publishing to the Shared remote*). When it doesn't exist anywhere yet, the runner lazy-initializes it from the repo's default branch — based on that branch's *current host tip*, fetched at sync time — and pushes it to the Shared remote at once. In drain mode (and each `--idle` pass) that happens only once the feature's snapshot shows work to dispatch; a feature with nothing eligible gets no branch at all. The same resolution drives the lazy-init preserve-commits guard and the unborn-HEAD recovery. The default branch is resolved deliberately (`resolve_default_branch`), in precedence order:
+When a feature's branch exists on the Shared remote but not on host, the runner starts from the remote's branch (see *Publishing to the Shared remote*). When it doesn't exist anywhere yet, the runner lazy-initializes it from the repo's default branch — based on that branch's *current host tip*, fetched at sync time — and pushes it to the Shared remote at once. In drain mode (and each `--idle` pass) that happens only once the feature's snapshot shows work to dispatch; a feature with nothing eligible gets no branch at all. The same resolution drives the lazy-init preserve-commits guard, the unborn-HEAD recovery and `issue-commits` (see *Which commits are an issue's*). The default branch is resolved deliberately (`resolve_default_branch`), in precedence order:
 
 1. `RUNNER_DEFAULT_BRANCH` — operator override.
 2. The host repo's own `refs/remotes/origin/HEAD` — when the host was cloned from a real upstream, this is the upstream's default branch.
@@ -360,6 +360,26 @@ Two sources are explicitly forbidden: the host's currently-checked-out branch an
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `RUNNER_DEFAULT_BRANCH` | (empty) | Override the resolved default branch; empty means auto-resolve per the precedence above |
+
+## Which commits are an issue's
+
+Every commit a dispatch makes — `/implement` and each post-implement step — is published with the trailer `Formann-Issue: <ref>`, the issue's binding-native ref (`#N`, or `<feature>/NN`). The runner adds it just before it publishes (`stamp_dispatch_commits`, called by `propagate_feature`), keeping author, author date and message otherwise; a commit already stamped for the ref is left as it is, and one stamped for another issue fails the propagation with both refs named (`propagation-error`; nothing is published).
+
+A step that needs the issue's commits asks for them rather than grepping messages:
+
+```sh
+.formann/runner/issue-commits <ref>     # from the checkout's root, host or sandbox
+```
+
+It prints the issue's commits on HEAD as full shas, oldest first, one per line, never a commit reachable from the default branch and never a merge commit (as `git log --no-merges`; a step diffs each listed commit on its own). A commit is the issue's when the first of these matches: it carries a `Formann-Issue` trailer, which decides alone (the commit is the issue's when the trailer names `<ref>`); its message mentions `<ref>` (on the feature branch `#NN` stands for `<feature>/NN`); or the issue is its feature's only issue (a standalone work item), and then every commit since the branch left the default branch is. The feature is HEAD's branch; its issues come from the binding's `tracker-snapshot`.
+
+| Exit | Meaning |
+|------|---------|
+| `0` | Success; the list may be empty |
+| `2` | Usage error (not exactly one non-empty `<ref>`, or not in a git checkout) |
+| `3` | Cannot tell: the default branch, HEAD's branch or the tracker can't be read |
+
+The default branch is resolved as below (*Default-branch resolution*), in the checkout the helper runs in. Inside the sandbox the runner passes the host's resolution as `RUNNER_DEFAULT_BRANCH` (a consumer `runner/sandbox-env` may not set it), and every sync brings the runner-checkout's `origin/<default>` up to the host's default branch. Under github-issues the snapshot reads the repo from `GH_REPO`, which the binding's `sandbox-env` provides.
 
 ## Publishing to the Shared remote
 

@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- AFK runner stamps every commit a dispatch makes (`/implement` and each post-implement step)
+  with the trailer `Formann-Issue: <ref>` before it publishes them, keeping author, author date
+  and message otherwise. A commit already stamped for the ref is left alone; one stamped for
+  another issue fails the propagation, naming both refs. `.formann/runner/issue-commits <ref>`,
+  on the host or in the sandbox, prints the issue's commits on HEAD (full shas, oldest first; no
+  merges, nothing the default branch holds): those stamped for it, those whose message mentions
+  it, or, for a standalone issue, every commit on its branch. Exit 2 on a usage error, 3 when the
+  default branch or the tracker can't be read. Steps that grepped commit messages for the ref
+  found nothing in a project whose commit style leaves it out. The sandbox now gets
+  `RUNNER_DEFAULT_BRANCH`, and the github-issues `tracker-snapshot` reads the repo from `GH_REPO`
+  when `GH_TRACKER_REPO` is unset.
 - `tracker-snapshot --eligible-features` in both bindings prints the JSON array of active features
   that have an eligible issue. github-issues answers with one GraphQL query (plus pages);
   local-markdown from the files, including each feature's committed branch. The AFK runner asks it
