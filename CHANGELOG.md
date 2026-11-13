@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- AFK runner reads its judges from a **Judges checkout** of its own, `.runner-state/judges/`:
+  a clone of the consumer's default branch, detached at the Shared remote's tip and set exactly
+  to it in pre-flight (after the lock) and, with `--idle`, before every later pass. The
+  `.claude/{skills,agents,rules}` the sandbox mounts read-only and the consumer's post-implement
+  and post-drain manifests and step prompts come from it instead of the host repo, which nothing
+  updated, so a runner machine's gates ran whatever reviewers the host repo had when someone last
+  pulled. The host repo, where people work, is never touched beyond a fetch into its
+  remote-tracking ref. A failed fetch keeps the judges at their last commit with a `runner:
+  warning: judges not refreshed: <reason>` line, and the pass goes on; with no Shared remote the
+  judges come from the host repo as before. `runner.log` names the judges' commit after the
+  Formann line (`runner: judges <sha> (origin/main)`), and the claim Note names it beside
+  Formann's. A `.claude/<sub>` the judges checkout lacks (Formann's self-install) is mounted from
+  the host repo.
 - A claims reviewer, the agent `review-claims` beside `review-issue` and `review-feature`. For
   each acceptance criterion that claims an automated proof it gives one verdict, citing what it
   looked at: shown (the test and its assertion, or the evidence and what is visible in it),

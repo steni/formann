@@ -81,6 +81,10 @@ Consumer-owned. Lives in the **Consumer** repo (not Formann), because container 
 The separate git clone at `.runner-state/checkout/` that the **Runner** mounts into the sandbox container as `/repo`. Distinct from the **Consumer**'s host repo: the **Dispatch** has no access to the host's `.git/`, working tree, or `~/`. The **Parking ref** is where the **Runner-checkout**'s committed work lands on the host side.
 _Avoid_: "runner clone", "sandbox repo"
 
+**Judges checkout**:
+The **Runner**'s own git clone at `.runner-state/judges/` of the **Consumer**'s default branch, detached at the **Shared remote**'s tip and set exactly to it before every pass. Everything that judges a **Dispatch** is read from it: the reviewers the sandbox mounts (`.claude/skills`, `.claude/agents`, `.claude/rules`) and the consumer's manifests and step prompts (`runner/`). The host repo is where people work, so the **Runner** never updates it; a slug branch never changes the reviewers that judge it. With no **Shared remote** the judges come from the host repo. Its commit is logged per pass beside the **Runner's Formann**'s.
+_Avoid_: "the host checkout" (that one is the maintainer's), "reviewer checkout"
+
 **Parking ref**:
 Per-feature ref (`refs/remotes/runner/<feature>`) in the **Consumer**'s repo where the **Runner** publishes every **Dispatch**'s output. The **Runner**'s authoritative chain for the feature; advances linearly in the steady-state on-branch loop and is force-updated when the maintainer pulls and rebases (the next dispatch's tip is no longer a descendant of the prior parking-ref tip). The maintainer pulls from this ref via `git pull runner <feature>` to bring runner work into the local feature branch.
 _Avoid_: "shadow branch", "runner branch"
