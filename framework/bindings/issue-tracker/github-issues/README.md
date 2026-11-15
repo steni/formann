@@ -12,6 +12,7 @@ This binding represents the issue-tracker role of the lifecycle for projects who
 - **[`body-edit`](body-edit)** — section-level body rewrite for issues. Replaces (or removes) a single `## <section>` in an issue body, preserving surrounding sections verbatim. Used by `/triage` and `/implement` to publish the agent brief and record triage notes. See [`BINDING.md`](BINDING.md#body-shaped-write-semantics) for the fetch-then-PATCH semantics and the residual race window.
 - **[`set-blockers`](set-blockers)** — declarative blocker write. Replaces an issue's native `blockedBy` dependencies with exactly the supplied set: reads current state, diffs against the requested refs, fires one `addBlockedBy` / `removeBlockedBy` mutation per delta. Empty refs clears all blockers. See [`BINDING.md`](BINDING.md#set-issue-metadata) for the contract.
 - **[`sandbox-env`](sandbox-env)** — runner hook. Emits `GH_TOKEN` (from the macOS Keychain entry `formann-gh-token`) and `GH_REPO` (derived from the host's `origin` remote) on stdout. The runner's `collect_binding_env` invokes it before `docker run` so the container inherits both values without them appearing in shell history or process listings. See [Sandbox compatibility](#sandbox-compatibility) below for setup and the full contract.
+- **[`sandbox-token-check`](sandbox-token-check)** — runner pre-flight hook. Reads the token `sandbox-env` would hand the sandbox and refuses one that can publish: a classic token with `repo` or `public_repo` scope. Exit 0 pass / 1 refuse / 2 no usable token / 3 transient. See [The sandbox's token](#the-sandboxs-token).
 
 ## Authorship
 
@@ -49,16 +50,46 @@ The binding ships a `sandbox-env` script at its folder root. The runner's `colle
 
 The script currently emits two values:
 
-- **`GH_TOKEN`** — read from the macOS Keychain entry `formann-gh-token` (service `formann-gh-token`, account `github`). The token must hold `repo` scope (Issues read/write).
+- **`GH_TOKEN`** — the **sandbox's token**, read from its own secret-store entry `formann-gh-token` (service `formann-gh-token`, account `github`). It must be a fine-grained token limited to issues; see [The sandbox's token](#the-sandboxs-token).
 - **`GH_REPO`** — derived from the host repo's `origin` remote so `gh` inside the container targets the same repo the host is working in. Resolves both SSH (`git@github.com:owner/repo`) and HTTPS (`https://github.com/owner/repo`) forms, strips a trailing `.git`, and rejects hostnames that aren't `github.com`.
 
-#### Keychain entry (one-time per machine)
+### The sandbox's token
+
+Two GitHub credentials are in play, and they are kept apart:
+
+| Token | Where it lives | Who reads it | What it may do |
+|---|---|---|---|
+| **The sandbox's token** | secret-store entry `formann-gh-token` (account `github`) | only `sandbox-env` (into every dispatch's `GH_TOKEN`) and `sandbox-token-check` | Issues read/write, Contents read, Metadata read — nothing else |
+| **The host's credentials** | your own `gh auth login` and git credentials on the host | the runner's host side: the push to the Shared remote, the pull request, host-side tracker reads | whatever your host-side work needs |
+
+The push and the pull request happen on the host, so a dispatch only reads the code and reads and writes issues (comments, labels, state, sub-issues, dependencies). A token that can push or write pull requests would let an agent in the sandbox publish or merge on its own. The sandbox never receives the host's credentials: the `formann-gh-token` entry is separate, and nothing on the host side reads it.
+
+#### Creating the narrow token
+
+1. GitHub → **Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token**.
+2. **Resource owner:** the owner of the consumer repository. **Repository access:** *Only select repositories* → the consumer repository.
+3. **Repository permissions:** **Issues: Read and write**, **Contents: Read-only**, **Metadata: Read-only** (selected automatically). Leave every other permission at *No access*, in particular Contents write, Pull requests and Workflows.
+4. Store it under the sandbox's entry (one-time per machine, and again when the token expires):
 
 ```sh
-security add-generic-password -s formann-gh-token -a github -w
+# macOS Keychain (-U updates an existing entry in place)
+security add-generic-password -U -s formann-gh-token -a github -w
+# Linux — libsecret
+secret-tool store --label=formann-gh-token service formann-gh-token account github
+# Linux — kernel keyring (headless hosts)
+keyctl padd user formann_gh_token_github @u
 ```
 
-Paste your GitHub token at the prompt (no trailing newline). Re-running updates the entry in place.
+Paste the token at the prompt (no trailing newline). The binding's `setup` hook asks for it on first install under macOS.
+
+#### The pre-flight check
+
+Before any dispatch, the runner runs `sandbox-token-check` (see the runner README's *Sandbox token*). It reads the token through `sandbox-env` and classifies it by prefix. The token never reaches argv, logs or `SUMMARY.md`; only its kind and the scope verdict do.
+
+- **`ghp_` (classic) / `gho_` (OAuth), or any unrecognised prefix:** one API call (`gh api --include rate_limit`, which costs no rate limit). If the `X-OAuth-Scopes` response header lists `repo` or `public_repo`, the check refuses (exit 1) and prints how to create the narrow token. `read:org` or no scopes passes. HTTP 401 means the token is expired or revoked (exit 2). A network error, 5xx or rate limit is transient (exit 3), not a refusal.
+- **`github_pat_` (fine-grained) and `ghs_` (App installation):** pass without an API call. **GitHub does not expose a fine-grained token's permissions**, so a fine-grained token granted Contents write or Pull requests write is not detected here. Grant it only the permissions above.
+
+A consumer that keeps a broad token on purpose sets `RUNNER_SANDBOX_TOKEN_MAY_PUBLISH=1`. The refusal then passes, and the run's `SUMMARY.md` carries a `## Sandbox token` section saying the sandbox can publish.
 
 ## Label-namespace bootstrap
 

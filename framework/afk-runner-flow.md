@@ -46,7 +46,7 @@ Conventions:
        trap handle_preflight_signal on INT/TERM
                   │
                   ▼
-                preflight                (10 invariants — see below;
+                preflight                (11 invariants — see below;
                                           narrowed modes also run the
                                           `check_feature_eligibility`
                                           CLI-input gate)
@@ -107,6 +107,7 @@ Rows in evaluation order. `no-other-runner` runs first (lock acquisition gates e
 | 5 | `mvn-cache`                | Volume `runner-mvn-cache-<feature>` exists or is created and chowned `1000:1000`.                  | per-feature (lazy) |
 | 6 | `sandbox-network`          | `afk-runner-sandbox` bridge + iptables RFC1918-deny rules in place.                                | global      |
 | 7 | `oauth-token`              | Keychain returns a non-empty token; held in `TOKEN` for the rest of the run.                       | global      |
+| 9 | `sandbox-token`            | The binding's `sandbox-token-check` (when present on the role surface) exits 0: the sandbox's GitHub token cannot push or write pull requests. Exit 1 passes only with `RUNNER_SANDBOX_TOKEN_MAY_PUBLISH=1`, and SUMMARY.md then says the sandbox can publish. Exit 3 is reported as transient. | global      |
 
 The runner is independent of host's HEAD and working tree: no invariant inspects either. Feature validation (unknown slug) in narrowed modes runs through `check_feature_eligibility`, a CLI-input gate that runs after the global invariants (through `runner-checkout` clone-existence, 2a) and immediately before branch-sync (2b). It is **not** an invariant: on refusal it returns 2 with a `feature-restricted` / `single-dispatch (refused: <reason>)` stop reason — not `fail_invariant`, not `preflight-abort:`. Drain mode skips this gate entirely; per-feature eligibility is decided inside the outer loop by `drain_one_feature`'s cascade.
 

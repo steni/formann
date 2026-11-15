@@ -63,3 +63,14 @@ EOF
   run grep -q "^add-generic-password" "$CALL_LOG" 2>/dev/null
   assert_failure
 }
+
+@test "Keychain entry absent — the prompt asks for the sandbox's fine-grained token and its permissions (#36)" {
+  run "$SETUP_SCRIPT"
+  assert_success
+  assert_output --partial "sandbox's token"
+  assert_output --partial "Fine-grained tokens"
+  assert_output --partial "Issues: Read and write"
+  assert_output --partial "Contents: Read-only"
+  assert_output --partial "Metadata: Read-only"
+  assert_output --partial "refuses a classic token with repo or public_repo scope"
+}

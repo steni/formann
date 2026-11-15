@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# Pre-flight check of the sandbox's GitHub token: refuse one that can publish.
+#
+# The token `sandbox-env` hands to every dispatch (the `formann-gh-token`
+# secret-store entry, read by nothing else) only needs issues read/write and
+# contents read: the push and the pull request happen on the host. A token
+# that can push or write pull requests would let an agent in the sandbox
+# publish or merge on its own. This check classifies the token by its prefix:
+#
+#   ghp_ / gho_ (classic, OAuth) and any unrecognised prefix — one API call;
+#       the `X-OAuth-Scopes` response header decides. `repo` or `public_repo`
+#       is refused (both grant push and pull-request writes).
+#   github_pat_ (fine-grained) and ghs_ (App installation) — pass without an
+#       API call. GitHub exposes no way to read a fine-grained token's
+#       permissions, so an over-broad fine-grained token is not detectable
+#       here; the binding README says so.
+#
+# Usage (invoked by the runner's pre-flight through the role surface, with CWD
+# inside the host repo so `sandbox-env` can derive GH_REPO):
+#   sandbox-token-check
+#
+# The token is read from `sandbox-env`'s stdout — never from argv — and is
+# passed to `gh` through the environment only. It is never printed: stdout
+# and stderr carry only the token's kind and the scope verdict.
+#
+# Exit codes:
+#   0 — the token cannot publish (or its permissions cannot be read: fine-grained / App)
+#   1 — refused: the token can push and write pull requests
+#   2 — no token to check: `sandbox-env` failed, or GitHub rejected the token (401)
+#   3 — transient: the API call failed (network, 5xx, rate limit); retry later
+
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+env_out=""
+if ! env_out="$("$script_dir/sandbox-env")"; then
+  echo "sandbox-token-check: sandbox-env failed; no sandbox token to check (see its diagnostic above)" >&2
+  exit 2
+fi
+
+token=""
+while IFS= read -r line; do
+  case "$line" in
+    GH_TOKEN=*) token="${line#GH_TOKEN=}" ;;
+  esac
+done <<<"$env_out"
+unset env_out
+
+if [[ -z "$token" ]]; then
+  echo "sandbox-token-check: sandbox-env emitted no GH_TOKEN; no sandbox token to check" >&2
+  exit 2
+fi
+
+narrow_token_howto() {
+  cat >&2 <<'MSG'
+Create a narrow sandbox token instead — a fine-grained personal access token
+(GitHub → Settings → Developer settings → Personal access tokens →
+Fine-grained tokens → Generate new token):
+  Repository access: Only select repositories → this repository
+  Repository permissions: Issues: Read and write
+                          Contents: Read-only
+                          Metadata: Read-only (selected automatically)
+                          everything else: No access
+Then store it under the sandbox's own entry (service formann-gh-token,
+account github), e.g. on macOS:
+  security add-generic-password -U -s formann-gh-token -a github -w
+To keep the broad token deliberately, set RUNNER_SANDBOX_TOKEN_MAY_PUBLISH=1;
+the run's SUMMARY.md then says the sandbox can publish.
+MSG
+}
+
+case "$token" in
+  github_pat_*)
+    echo "sandbox-token-check: fine-grained token; GitHub does not expose its permissions — pass (keep it to Issues read/write, Contents read)" >&2
+    exit 0
+    ;;
+  ghs_*)
+    echo "sandbox-token-check: GitHub App installation token; pass" >&2
+    exit 0
+    ;;
+  ghp_*) kind="classic" ;;
+  gho_*) kind="OAuth (classic scopes)" ;;
+  *) kind="unrecognised-prefix" ;;
+esac
+
+headers=""
+rc=0
+headers="$(GH_TOKEN="$token" gh api --include rate_limit 2>/dev/null)" || rc=$?
+unset token
+
+status_line="$(printf '%s\n' "$headers" | head -n 1 | tr -d '\r')"
+if [[ "$status_line" =~ ^HTTP/[0-9.]+\ 401 ]]; then
+  echo "sandbox-token-check: GitHub rejected the sandbox token ($kind; HTTP 401) — expired or revoked" >&2
+  narrow_token_howto
+  exit 2
+fi
+if [[ $rc -ne 0 || ! "$status_line" =~ ^HTTP/[0-9.]+\ 2[0-9][0-9] ]]; then
+  echo "sandbox-token-check: could not read the sandbox token's scopes ($kind; ${status_line:-no response}); transient, retry later" >&2
+  exit 3
+fi
+
+# Only the header block (up to the first blank line); the header name anchored
+# at line start, so `Access-Control-Expose-Headers: …, X-OAuth-Scopes, …`
+# never matches.
+scopes="$(printf '%s\n' "$headers" | tr -d '\r' | awk '
+  /^$/ { exit }
+  tolower($0) ~ /^x-oauth-scopes:/ { sub(/^[^:]*:[ \t]*/, ""); print; exit }
+')"
+
+publishing=""
+IFS=',' read -r -a scope_list <<<"$scopes"
+for s in ${scope_list[@]+"${scope_list[@]}"}; do
+  s="${s// /}"
+  case "$s" in
+    repo | public_repo) publishing+="${publishing:+, }$s" ;;
+  esac
+done
+
+if [[ -n "$publishing" ]]; then
+  echo "sandbox-token-check: refused — the sandbox token ($kind) carries scope '$publishing', which can push and open or merge pull requests" >&2
+  narrow_token_howto
+  exit 1
+fi
+
+echo "sandbox-token-check: $kind token without repo/public_repo scope (scopes: ${scopes:-none}); pass" >&2
+exit 0

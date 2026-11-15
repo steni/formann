@@ -11173,3 +11173,166 @@ use_real_eligible_features_check() {
   run format_passes_section
   assert_output --partial "3 pass(es) in total; 3 found nothing to do."
 }
+
+# === check_sandbox_token — the sandbox's GitHub token cannot publish (#36) ===
+
+# A role surface whose sandbox-token-check exits $1.
+fake_sandbox_token_check() {
+  HOST_REPO="$BATS_TEST_TMPDIR/repo"
+  mkdir -p "$HOST_REPO/docs/formann/issue-tracker"
+  printf '#!/usr/bin/env bash\necho "check ran in $PWD" >&2\nexit %s\n' "$1" \
+    >"$HOST_REPO/docs/formann/issue-tracker/sandbox-token-check"
+  chmod +x "$HOST_REPO/docs/formann/issue-tracker/sandbox-token-check"
+}
+
+@test "preflight (#36) — runs the sandbox token check" {
+  declare -f preflight | grep -q 'check_sandbox_token'
+}
+
+@test "check_sandbox_token (#36) — no check on the role surface (local-markdown) is a no-op" {
+  HOST_REPO="$BATS_TEST_TMPDIR/repo"
+  mkdir -p "$HOST_REPO/docs/formann/issue-tracker"
+  check_sandbox_token
+  [ "$RUN_SANDBOX_MAY_PUBLISH" = "0" ]
+}
+
+@test "check_sandbox_token (#36) — exit 0 passes; the check runs from the host repo" {
+  fake_sandbox_token_check 0
+  run check_sandbox_token
+  assert_success
+  assert_output --partial "check ran in $HOST_REPO"
+}
+
+@test "check_sandbox_token (#36) — exit 1 aborts pre-flight as sandbox-token" {
+  fake_sandbox_token_check 1
+  unset RUNNER_SANDBOX_TOKEN_MAY_PUBLISH
+  run bash -c 'source "$1"; HOST_REPO="$2"; check_sandbox_token; echo "not reached"' _ "$RUNNER_SCRIPT" "$HOST_REPO"
+  [ "$status" -eq 2 ]
+  assert_output --partial "runner: sandbox-token: the sandbox's GitHub token can publish"
+  assert_output --partial "RUNNER_SANDBOX_TOKEN_MAY_PUBLISH=1"
+  refute_output --partial "not reached"
+}
+
+@test "check_sandbox_token (#36) — exit 1 with RUNNER_SANDBOX_TOKEN_MAY_PUBLISH=1 passes and marks the run" {
+  fake_sandbox_token_check 1
+  RUNNER_SANDBOX_TOKEN_MAY_PUBLISH=1
+  check_sandbox_token 2>/dev/null
+  [ "$RUN_SANDBOX_MAY_PUBLISH" = "1" ]
+}
+
+@test "check_sandbox_token (#36) — transient (exit 3) aborts as transient, even with the escape hatch" {
+  fake_sandbox_token_check 3
+  run bash -c 'source "$1"; HOST_REPO="$2"; RUNNER_SANDBOX_TOKEN_MAY_PUBLISH=1; check_sandbox_token' _ "$RUNNER_SCRIPT" "$HOST_REPO"
+  [ "$status" -eq 2 ]
+  assert_output --partial "runner: sandbox-token: could not check the sandbox's GitHub token (transient)"
+  refute_output --partial "can publish"
+}
+
+@test "check_sandbox_token (#36) — no usable token (exit 2) aborts, even with the escape hatch" {
+  fake_sandbox_token_check 2
+  run bash -c 'source "$1"; HOST_REPO="$2"; RUNNER_SANDBOX_TOKEN_MAY_PUBLISH=1; check_sandbox_token' _ "$RUNNER_SCRIPT" "$HOST_REPO"
+  [ "$status" -eq 2 ]
+  assert_output --partial "runner: sandbox-token: no usable sandbox GitHub token"
+}
+
+@test "finalize_run (#36) — SUMMARY.md says the sandbox can publish when the escape hatch was used" {
+  setup_loop_output_test
+  RUN_DIR="$BATS_TEST_TMPDIR/run-may-publish"
+  mkdir -p "$RUN_DIR"
+  RUN_DISPATCHES=("f|01|f/01|in-review|42")
+  RUN_STOP_REASON="queue-empty"
+  RUN_SANDBOX_MAY_PUBLISH=1
+
+  ( finalize_run ) >/dev/null 2>&1 || true
+
+  grep -q '^## Sandbox token$' "$RUN_DIR/SUMMARY.md"
+  grep -qF -- '- The sandbox can publish: its GitHub token can push and open or merge pull requests (RUNNER_SANDBOX_TOKEN_MAY_PUBLISH=1).' "$RUN_DIR/SUMMARY.md"
+}
+
+@test "finalize_run (#36) — no Sandbox token section without the escape hatch" {
+  setup_loop_output_test
+  RUN_DIR="$BATS_TEST_TMPDIR/run-narrow"
+  mkdir -p "$RUN_DIR"
+  RUN_DISPATCHES=("f|01|f/01|in-review|42")
+  RUN_STOP_REASON="queue-empty"
+
+  ( finalize_run ) >/dev/null 2>&1 || true
+
+  ! grep -q 'Sandbox token' "$RUN_DIR/SUMMARY.md"
+}
+
+# End to end with the github-issues binding's real sandbox-env and
+# sandbox-token-check on the role surface; `security`, `git` and `gh` shimmed.
+setup_real_sandbox_token_check() {
+  setup_loop_output_test
+  HOST_REPO="$BATS_TEST_TMPDIR/repo"
+  mkdir -p "$HOST_REPO/docs/formann"
+  # HERE is the runner's own dir once run-the-queue.sh is sourced.
+  ln -s "$(cd "$(dirname "$RUNNER_SCRIPT")/../bindings/issue-tracker/github-issues" && pwd)" \
+    "$HOST_REPO/docs/formann/issue-tracker"
+  local bin="$BATS_TEST_TMPDIR/token-bin"
+  mkdir -p "$bin"
+  cat >"$bin/security" <<'SH'
+#!/usr/bin/env bash
+[[ "$1" == "find-generic-password" ]] && { printf '%s\n' "$FAKE_TOKEN"; exit 0; }
+exit 1
+SH
+  cat >"$bin/git" <<'SH'
+#!/usr/bin/env bash
+if [[ "$1" == "-C" ]]; then shift 2; fi
+[[ "$1 $2" == "rev-parse --show-toplevel" ]] && { echo /fake/repo; exit 0; }
+[[ "$1 $2 $3" == "remote get-url origin" ]] && { echo https://github.com/owner/repo.git; exit 0; }
+exit 1
+SH
+  cat >"$bin/gh" <<'SH'
+#!/usr/bin/env bash
+printf 'HTTP/2.0 200 OK\r\nX-Oauth-Scopes: %s\r\n\r\n{}' "$FAKE_GH_SCOPES"
+SH
+  chmod +x "$bin"/*
+  TOKEN_BIN="$bin"
+  RUN_DIR="$BATS_TEST_TMPDIR/run-token"
+  mkdir -p "$RUN_DIR"
+  RUN_DISPATCHES=()
+}
+
+@test "pre-flight (#36) — a classic repo-scoped sandbox token aborts the run as sandbox-token; the token appears nowhere" {
+  setup_real_sandbox_token_check
+  run env PATH="$TOKEN_BIN:$PATH" OSTYPE=darwin21 FAKE_TOKEN=ghp_SECRETe2e0123456789 FAKE_GH_SCOPES="repo, read:org" \
+    bash -c 'source "$1"; HOST_REPO="$2"; RUN_DIR="$3"; RUN_FEATURE=f; RUN_TS=t; RUN_START_CLOCK=c;
+             acquire_lock() { :; }; release_lock() { :; }; claim_release_held() { :; }
+             trap finalize_run EXIT; check_sandbox_token' _ "$RUNNER_SCRIPT" "$HOST_REPO" "$RUN_DIR"
+  [ "$status" -eq 2 ]
+  assert_output --partial "sandbox-token-check: refused"
+  assert_output --partial "Fine-grained tokens"
+  assert_output --partial "stop reason: preflight-abort: sandbox-token"
+  refute_output --partial "ghp_SECRETe2e0123456789"
+  grep -q -- '- Stop reason: preflight-abort: sandbox-token$' "$RUN_DIR/SUMMARY.md"
+  ! grep -rqF "ghp_SECRETe2e0123456789" "$RUN_DIR"
+}
+
+@test "pre-flight (#36) — with RUNNER_SANDBOX_TOKEN_MAY_PUBLISH=1 the same token passes and SUMMARY.md says the sandbox can publish" {
+  setup_real_sandbox_token_check
+  run env PATH="$TOKEN_BIN:$PATH" OSTYPE=darwin21 FAKE_TOKEN=ghp_SECRETe2e0123456789 FAKE_GH_SCOPES="repo" \
+    RUNNER_SANDBOX_TOKEN_MAY_PUBLISH=1 \
+    bash -c 'source "$1"; HOST_REPO="$2"; RUN_DIR="$3"; RUN_FEATURE=f; RUN_TS=t; RUN_START_CLOCK=c; RUN_MODE=loop;
+             RUN_STOP_REASON=queue-empty; RUN_DISPATCHES=()
+             acquire_lock() { :; }; release_lock() { :; }; claim_release_held() { :; }
+             trap finalize_run EXIT; check_sandbox_token' _ "$RUNNER_SCRIPT" "$HOST_REPO" "$RUN_DIR"
+  [ "$status" -eq 0 ]
+  refute_output --partial "ghp_SECRETe2e0123456789"
+  grep -q -- '- Stop reason: queue-empty$' "$RUN_DIR/SUMMARY.md"
+  grep -qF -- '- The sandbox can publish' "$RUN_DIR/SUMMARY.md"
+  ! grep -rqF "ghp_SECRETe2e0123456789" "$RUN_DIR"
+}
+
+@test "pre-flight (#36) — a narrow classic token (read:org only) passes with no Sandbox token section" {
+  setup_real_sandbox_token_check
+  run env PATH="$TOKEN_BIN:$PATH" OSTYPE=darwin21 FAKE_TOKEN=ghp_SECRETe2e0123456789 FAKE_GH_SCOPES="read:org" \
+    bash -c 'source "$1"; HOST_REPO="$2"; RUN_DIR="$3"; RUN_FEATURE=f; RUN_TS=t; RUN_START_CLOCK=c; RUN_MODE=loop;
+             RUN_STOP_REASON=queue-empty; RUN_DISPATCHES=()
+             acquire_lock() { :; }; release_lock() { :; }; claim_release_held() { :; }
+             trap finalize_run EXIT; check_sandbox_token' _ "$RUNNER_SCRIPT" "$HOST_REPO" "$RUN_DIR"
+  [ "$status" -eq 0 ]
+  refute_output --partial "ghp_SECRETe2e0123456789"
+  ! grep -q 'Sandbox token' "$RUN_DIR/SUMMARY.md"
+}

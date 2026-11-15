@@ -4,9 +4,11 @@
 set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# On macOS, ensure the Keychain entry for the GitHub token is populated now so
-# the AFK dispatch (sandbox-env) succeeds on first run without a Keychain-miss
-# abort.
+# On macOS, ensure the Keychain entry for the sandbox's GitHub token is
+# populated now so the AFK dispatch (sandbox-env) succeeds on first run without
+# a Keychain-miss abort. The entry holds the sandbox's token only — a
+# fine-grained token limited to issues — never the host's credentials; the
+# runner's pre-flight (sandbox-token-check) refuses one that can publish.
 if [[ "$OSTYPE" == darwin* ]]; then
   _GH_KEYCHAIN_SERVICE="formann-gh-token"
   _GH_KEYCHAIN_ACCOUNT="github"
@@ -17,8 +19,18 @@ if [[ "$OSTYPE" == darwin* ]]; then
       >/dev/null 2>&1; then
     cat <<'MSG'
 Formann setup: GitHub token not found in Keychain.
-Enter your GitHub personal-access token below — the AFK dispatch runner
-reads it from here (service: formann-gh-token, account: github).
+This is the sandbox's token: every AFK dispatch gets it as GH_TOKEN. It must
+NOT be able to push or write pull requests (the host does that), so create a
+fine-grained personal access token, not a classic one:
+  GitHub → Settings → Developer settings → Personal access tokens →
+  Fine-grained tokens → Generate new token
+  Repository access: Only select repositories → this repository
+  Repository permissions: Issues: Read and write
+                          Contents: Read-only
+                          Metadata: Read-only (selected automatically)
+                          everything else: No access
+The runner refuses a classic token with repo or public_repo scope.
+Paste it below (service: formann-gh-token, account: github).
 MSG
     security add-generic-password \
       -s "$_GH_KEYCHAIN_SERVICE" \

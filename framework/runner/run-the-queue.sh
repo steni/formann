@@ -1278,6 +1278,7 @@ RUNNER_LOG_FIFO=""
 RUNNER_LAST_PROPAGATION=""   # 'published → <remote>/<branch>' | 'parked → runner/<branch>' | 'local-only (<host indicator>)' | '' (set by propagate_feature)
 RUNNER_PUBLISH_PARKED=0      # 1 when propagate_feature's Shared-remote push was refused; stops the loop on the feature
 RUNNER_CLAIM_LOST=""          # 'taken-over-by <machine>' once a heartbeat found the claim taken over (heartbeat_claim); stops the loop on the feature after the dispatch in flight
+RUN_SANDBOX_MAY_PUBLISH=0  # 1 when RUNNER_SANDBOX_TOKEN_MAY_PUBLISH let a publishing sandbox token through pre-flight
 RUN_SWEPT_REFS=()     # parking refs deleted by sweep_stale_parking_refs; populated during pre-flight
 DISCOVERY_JSON=""     # populated by check_discovery pre-flight invariant
 RESOLVED_MANIFEST=""  # populated by check_manifest pre-flight invariant; tab-delimited label<TAB>path pairs
@@ -1498,6 +1499,7 @@ finalize_run() {
     if [ "${#RUN_SWEPT_REFS[@]}" -gt 0 ]; then
       format_swept_refs_section >>"$RUN_DIR/SUMMARY.md"
     fi
+    format_sandbox_token_section >>"$RUN_DIR/SUMMARY.md"
     if [ -z "$RUN_PREFLIGHT_INVARIANT" ]; then
       format_post_drain_section >>"$RUN_DIR/SUMMARY.md"
     fi
@@ -2322,6 +2324,56 @@ retrieve_oauth_token() {
   fi
 }
 
+# 9. The sandbox's GitHub token cannot publish (#36). The binding's
+#    `sandbox-token-check` on the role surface (absent under bindings with no
+#    sandbox token, e.g. local-markdown → no-op) reads the token sandbox-env
+#    hands to dispatches and exits 0 pass / 1 refuse (the token can push and
+#    write pull requests) / 2 no token to check / 3 transient. Run from the
+#    host repo so sandbox-env can derive GH_REPO. The token never passes
+#    through the runner here: only the check's verdict on stderr does.
+#
+#    RUNNER_SANDBOX_TOKEN_MAY_PUBLISH=1 is the escape hatch for a consumer
+#    that keeps a broad token on purpose: a refusal (exit 1 only) passes, and
+#    RUN_SANDBOX_MAY_PUBLISH puts a line in the run's SUMMARY.md saying so.
+check_sandbox_token() {
+  local check="$HOST_REPO/docs/formann/issue-tracker/sandbox-token-check"
+  if [ ! -x "$check" ]; then
+    return 0
+  fi
+  local rc=0
+  ( cd "$HOST_REPO" && "$check" ) >&2 || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1)
+      if [ "${RUNNER_SANDBOX_TOKEN_MAY_PUBLISH:-0}" = "1" ]; then
+        RUN_SANDBOX_MAY_PUBLISH=1
+        echo "runner: sandbox-token: RUNNER_SANDBOX_TOKEN_MAY_PUBLISH=1 — continuing; the sandbox's token can push and open or merge pull requests" >&2
+        return 0
+      fi
+      fail_invariant "sandbox-token" \
+        "the sandbox's GitHub token can publish; create the narrow token named above, or set RUNNER_SANDBOX_TOKEN_MAY_PUBLISH=1 to keep it"
+      ;;
+    3)
+      fail_invariant "sandbox-token" \
+        "could not check the sandbox's GitHub token (transient); re-run later"
+      ;;
+    *)
+      fail_invariant "sandbox-token" \
+        "no usable sandbox GitHub token (sandbox-token-check exit $rc); see its diagnostic above"
+      ;;
+  esac
+}
+
+# Emits the "## Sandbox token" SUMMARY.md section when the escape hatch let a
+# token that can publish through pre-flight. Omitted otherwise.
+format_sandbox_token_section() {
+  if [ "${RUN_SANDBOX_MAY_PUBLISH:-0}" != "1" ]; then
+    return 0
+  fi
+  printf '\n## Sandbox token\n\n'
+  printf -- "- The sandbox can publish: its GitHub token can push and open or merge pull requests (RUNNER_SANDBOX_TOKEN_MAY_PUBLISH=1).\n"
+}
+
 # Compose pre-flight. The lock is acquired first so a concurrent run
 # refuses immediately rather than racing on idempotent setup steps.
 # `resolve_host_repo` ran in main() so the run dir already exists; the
@@ -2369,6 +2421,7 @@ preflight() {
   fi
   ensure_network                         # invariant 6
   retrieve_oauth_token                   # invariant 7
+  check_sandbox_token                    # invariant 9: sandbox token cannot publish
   # invariant 8 (no-other-runner) was acquired up front via acquire_lock.
 }
 

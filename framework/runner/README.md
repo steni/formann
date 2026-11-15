@@ -302,9 +302,17 @@ The trailing `stop reason:` line varies by mode.
 **All modes — pre-flight-phase:**
 
 - `interrupted-during-preflight` — Ctrl-C arrived before the loop started.
-- `preflight-abort: <invariant>` — a pre-flight invariant tripped before the loop began. `preflight-abort: runner-formann` — the Runner's Formann could not be fast-forwarded to its ref (see [The Runner's Formann](#the-runners-formann)); nothing was locked or claimed.
+- `preflight-abort: <invariant>` — a pre-flight invariant tripped before the loop began. `preflight-abort: runner-formann` — the Runner's Formann could not be fast-forwarded to its ref (see [The Runner's Formann](#the-runners-formann)); nothing was locked or claimed. `preflight-abort: sandbox-token` — the binding's `sandbox-token-check` refused the sandbox's GitHub token because it can push or write pull requests, found no usable token, or could not check it (transient). See [Sandbox token](#sandbox-token).
 
 **With `--idle`, per pass:** `formann-refused` — the Runner's Formann update refused; the pass drained nothing and the runner tries again after the sleep. `formann-updated` — the ref moved; the run ends (exit 0) and the runner re-executes on the new Formann.
+
+## Sandbox token
+
+A binding that hands the sandbox a credential may ship a `sandbox-token-check` beside its `sandbox-env`. Pre-flight runs it (from the host repo) after the OAuth token is retrieved, and aborts with `preflight-abort: sandbox-token` unless it exits 0. Publishing is the host's job (the push and the pull request happen host-side), so the sandbox's token should not be able to push or write pull requests. Under github-issues, the check refuses a classic token with `repo` or `public_repo` scope and says how to create the narrow fine-grained token instead. See the binding README's *Credentials via `sandbox-env`* section.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `RUNNER_SANDBOX_TOKEN_MAY_PUBLISH` | `0` | Set to `1` to keep a broad sandbox token on purpose. A refusal for publishing scope then passes, and the run's `SUMMARY.md` gets a `## Sandbox token` section saying the sandbox can publish. A missing or rejected token, or a transient failure, still aborts. |
 
 ## Transport-class retry
 

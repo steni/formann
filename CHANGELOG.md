@@ -127,6 +127,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `review-issue` at Verify no longer checks the Evidence block; run `review-claims` for that.
 
 ### Fixed
+- The sandbox's GitHub token could push and open or merge pull requests, though dispatches only
+  need issues. The github-issues binding's `formann-gh-token` entry is now documented as the
+  sandbox's token only: a fine-grained token on the consumer's repository with Issues read/write,
+  Contents read and Metadata read. The README and the `setup` hook say how to create it. A new
+  binding hook, `sandbox-token-check`, runs in the runner's pre-flight and refuses a classic
+  (`ghp_`/`gho_`) token whose `X-OAuth-Scopes` lists `repo` or `public_repo`, aborting with
+  `preflight-abort: sandbox-token` and a message naming the token to create. Fine-grained and App
+  tokens pass, because GitHub does not expose their permissions. A transient API failure is
+  reported as transient, not as a refusal. `RUNNER_SANDBOX_TOKEN_MAY_PUBLISH=1` keeps a broad
+  token on purpose, and the run's `SUMMARY.md` then says the sandbox can publish. The token
+  never appears in argv, logs or the summary.
 - github-issues `tracker-snapshot <slug>` lists the issues of a feature whose parent is closed but
   not archived, the closed ones `done` or `wontfix`, the parent itself included when it is its own
   work item. A single-issue feature the AFK gate closed on `done` used to snapshot with no issues,
