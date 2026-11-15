@@ -533,7 +533,7 @@ read_blocked_passes() {
     return 1
   fi
   local rc=0 out
-  out="$(SNAPSHOT_CHECKOUT_DIR="$HOST_CHECKOUT" "$script" "$ref")" || rc=$?
+  out="$(SNAPSHOT_CHECKOUT_DIR="$HOST_CHECKOUT" checkout_git_run "$script" "$ref")" || rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "runner: blocked-passes exited non-zero ($rc) for $ref" >&2
     return 1
@@ -1789,6 +1789,9 @@ ensure_runner_checkout_exists() {
       return 1
     fi
   fi
+  # The host-owned config and hooks (#35), made when the checkout is first
+  # cloned or first found, and put in place before any host git runs there.
+  ensure_runner_checkout_git_state && guard_runner_checkout_git
 }
 
 # Resolve the repo's default branch — the base for lazy-initialized feature
@@ -1817,6 +1820,149 @@ resolve_default_branch() {
   return 1
 }
 
+# === Host-side git on the Runner-checkout (#35) ============================
+#
+# Rule: nothing a Dispatch writes under the runner-checkout's `.git/` runs on
+# the host. The checkout is mounted read-write into the sandbox, and git
+# obeys the repository config and hooks it finds in `.git/`: a planted
+# `core.fsmonitor` runs on `git status`, a `post-checkout` hook on
+# `git checkout`, a `filter.<x>.smudge` driver whenever a checkout writes a
+# file `.gitattributes` binds to it. Held three ways:
+#
+#   1. Host-owned copies. `.runner-state/checkout-git/config` (built from an
+#      allowlist of the checkout's format keys plus the runner's own `origin`,
+#      never a copy of whatever the checkout holds) and an empty
+#      `.runner-state/checkout-git/hooks/`. Every container mounts them
+#      read-only over `/repo/.git/config` and `/repo/.git/hooks`, so a
+#      Dispatch can commit, branch and reset but cannot change config or
+#      install hooks.
+#   2. Restore before every host call (guard_runner_checkout_git). The
+#      host-owned config is put back when the checkout's differs (or is a
+#      symlink), and the files that would point git at other config
+#      (`.git/commondir`, `.git/config.worktree`) are removed. A `.git` that
+#      is not a plain directory is refused.
+#   3. One way in. Host code runs git on the checkout only through
+#      `checkout_git` (git subcommands) and `checkout_git_run` (a command
+#      that runs git there itself: a binding script given the checkout, a
+#      host-repo fetch from it). Both apply the guard and turn off hooks,
+#      fsmonitor and upstream-tracking writes. tests/host-git-escape.bats
+#      fails when a new call bypasses them.
+#
+# With HOST_RUNNER_STATE unset (unit tests only; production always sets it)
+# the restore is skipped and only the command-line protections apply.
+
+# Directory of the host-owned copies; prints nothing when HOST_RUNNER_STATE is unset.
+runner_checkout_git_state_dir() {
+  if [ -n "${HOST_RUNNER_STATE:-}" ]; then
+    printf '%s/checkout-git\n' "$HOST_RUNNER_STATE"
+  fi
+}
+
+# Create the host-owned config and hooks dir if missing. The config is built
+# from scratch: the checkout's own config may already carry what a Dispatch
+# wrote, so only its repository-format keys are read (as data, with
+# `--file`, which never follows includes or runs anything), and `origin` is
+# always the host repo.
+ensure_runner_checkout_git_state() {
+  local dir
+  dir="$(runner_checkout_git_state_dir)"
+  [ -n "$dir" ] || return 0
+  if ! mkdir -p "$dir/hooks"; then
+    echo "runner: cannot create the host-owned git state in $dir" >&2
+    return 1
+  fi
+  [ -f "$dir/config" ] && return 0
+  local src="${HOST_CHECKOUT:-}/.git/config" tmp="$dir/config.tmp" key val
+  rm -f "$tmp"
+  : >"$tmp" || return 1
+  git config --file "$tmp" core.repositoryformatversion \
+    "$(git config --file "$src" --get core.repositoryformatversion 2>/dev/null || echo 0)" || return 1
+  git config --file "$tmp" core.bare false || return 1
+  for key in core.filemode core.logallrefupdates core.ignorecase core.precomposeunicode \
+      core.symlinks extensions.objectformat extensions.refstorage; do
+    if val="$(git config --file "$src" --get "$key" 2>/dev/null)"; then
+      git config --file "$tmp" "$key" "$val" || return 1
+    fi
+  done
+  git config --file "$tmp" remote.origin.url "$HOST_REPO" || return 1
+  git config --file "$tmp" remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*" || return 1
+  mv -f "$tmp" "$dir/config" || return 1
+  # Put the new copy in place quietly; from here on the guard reports drift.
+  if [ -d "${HOST_CHECKOUT:-}/.git" ] && [ ! -L "$HOST_CHECKOUT/.git" ]; then
+    rm -f "$HOST_CHECKOUT/.git/config" && cp "$dir/config" "$HOST_CHECKOUT/.git/config"
+  fi
+}
+
+# Put the host-owned config back in the checkout before host git runs there.
+guard_runner_checkout_git() {
+  local dir gitdir="${HOST_CHECKOUT:-}/.git" f
+  dir="$(runner_checkout_git_state_dir)"
+  [ -n "$dir" ] && [ -n "${HOST_CHECKOUT:-}" ] || return 0
+  if [ ! -e "$gitdir" ] && [ ! -L "$gitdir" ]; then
+    return 0   # no checkout yet; nothing a Dispatch wrote
+  fi
+  if [ -L "$gitdir" ] || [ ! -d "$gitdir" ]; then
+    echo "runner: $gitdir is not a directory (a dispatch replaced it?); refusing to run git there (rm -rf $HOST_CHECKOUT and re-run to recover)" >&2
+    return 1
+  fi
+  ensure_runner_checkout_git_state || return 1
+  for f in commondir config.worktree; do
+    if [ -e "$gitdir/$f" ] || [ -L "$gitdir/$f" ]; then
+      rm -f "$gitdir/$f" || return 1
+      echo "runner: removed $gitdir/$f (not written by the runner)" >&2
+    fi
+  done
+  if [ -L "$gitdir/config" ] || ! cmp -s "$dir/config" "$gitdir/config"; then
+    rm -f "$gitdir/config" && cp "$dir/config" "$gitdir/config" || {
+      echo "runner: could not restore $gitdir/config from $dir/config" >&2
+      return 1
+    }
+    echo "runner: runner-checkout .git/config differed from the host-owned copy; restored" >&2
+  fi
+}
+
+# The command-line protections, shared by both entry points.
+RUNNER_CHECKOUT_GIT_OVERRIDES=(core.hooksPath=/dev/null core.fsmonitor=false branch.autoSetupMerge=false)
+
+# Run a git subcommand in the runner-checkout. The only way host code runs
+# git there (see the rule above).
+checkout_git() {
+  guard_runner_checkout_git || return 1
+  local o c=()
+  for o in "${RUNNER_CHECKOUT_GIT_OVERRIDES[@]}"; do c+=(-c "$o"); done
+  git "${c[@]}" -C "${HOST_CHECKOUT:-}" "$@"   # checkout-git-wrapper: the one direct call
+}
+
+# Run a command that runs git in the runner-checkout itself (a binding
+# script handed the checkout, a host-repo fetch from it). The overrides
+# travel in GIT_CONFIG_COUNT/KEY/VALUE, which every git the command starts
+# inherits.
+checkout_git_run() {
+  guard_runner_checkout_git || return 1
+  local i=0 o
+  local -a envs=()
+  for o in "${RUNNER_CHECKOUT_GIT_OVERRIDES[@]}"; do
+    envs+=("GIT_CONFIG_KEY_$i=${o%%=*}" "GIT_CONFIG_VALUE_$i=${o#*=}")
+    i=$((i + 1))
+  done
+  env "GIT_CONFIG_COUNT=$i" "${envs[@]}" "$@"
+}
+
+# Read or change the runner-checkout's config. The host-owned copy is the
+# authority: changes land there and reach the checkout (and the next
+# container) through the guard. Falls back to the checkout itself when there
+# is no host-owned state (unit tests only).
+runner_checkout_config() {
+  local dir
+  dir="$(runner_checkout_git_state_dir)"
+  if [ -n "$dir" ]; then
+    ensure_runner_checkout_git_state || return 1
+    git config --file "$dir/config" "$@"
+  else
+    checkout_git config "$@"
+  fi
+}
+
 # Put the runner-checkout's `origin` back to the host repo (#4, upstream
 # jervell/formann#96). The checkout is mounted read-write into the sandbox, so a
 # dispatch that tried to push could rewrite `origin` (one set it to the GitHub
@@ -1826,30 +1972,43 @@ resolve_default_branch() {
 # whatever the previous dispatch left; one runner.log line (stderr) per repair,
 # silence when `origin` is already right. Only `origin` is repaired: other
 # remotes a dispatch added are never fetched by the runner.
+#
+# Since #35 the sandbox can't change the config any more (it is mounted
+# read-only from the host-owned copy), and the guard puts that copy back
+# over whatever a manual edit left in the checkout. The repairs below act on
+# the host-owned copy (runner_checkout_config), so they fire only when the
+# copy itself was edited.
 reset_runner_checkout_origin() {
   local current push_url
-  if ! current="$(git -C "$HOST_CHECKOUT" remote get-url origin 2>/dev/null)"; then
-    if ! git -C "$HOST_CHECKOUT" remote add origin "$HOST_REPO" >&2; then
-      echo "runner: reset_runner_checkout_origin: git remote add origin $HOST_REPO failed" >&2
+  guard_runner_checkout_git || return 1
+  if ! current="$(runner_checkout_config --get remote.origin.url 2>/dev/null)"; then
+    if ! runner_checkout_config remote.origin.url "$HOST_REPO" >&2; then
+      echo "runner: reset_runner_checkout_origin: adding origin $HOST_REPO failed" >&2
+      return 1
+    fi
+    if ! runner_checkout_config --get-all remote.origin.fetch >/dev/null 2>&1 \
+        && ! runner_checkout_config --add remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*" >&2; then
+      echo "runner: reset_runner_checkout_origin: adding origin's fetch refspec failed" >&2
       return 1
     fi
     echo "runner: runner-checkout origin was '(missing)'; reset to $HOST_REPO" >&2
   elif [ "$current" != "$HOST_REPO" ]; then
-    if ! git -C "$HOST_CHECKOUT" remote set-url origin "$HOST_REPO" >&2; then
-      echo "runner: reset_runner_checkout_origin: git remote set-url origin $HOST_REPO failed" >&2
+    if ! runner_checkout_config --replace-all remote.origin.url "$HOST_REPO" >&2; then
+      echo "runner: reset_runner_checkout_origin: setting origin's URL to $HOST_REPO failed" >&2
       return 1
     fi
     echo "runner: runner-checkout origin was '$current'; reset to $HOST_REPO" >&2
   fi
-  push_url="$(git -C "$HOST_CHECKOUT" config --get-all remote.origin.pushurl 2>/dev/null | paste -sd ' ' -)"
+  push_url="$(runner_checkout_config --get-all remote.origin.pushurl 2>/dev/null | paste -sd ' ' -)"
   if [ -n "$push_url" ]; then
-    if ! git -C "$HOST_CHECKOUT" config --unset-all remote.origin.pushurl >&2; then
+    if ! runner_checkout_config --unset-all remote.origin.pushurl >&2; then
       echo "runner: reset_runner_checkout_origin: git config --unset-all remote.origin.pushurl failed" >&2
       return 1
     fi
     echo "runner: runner-checkout origin push URL was '$push_url'; cleared" >&2
   fi
-  return 0
+  # Bring the checkout in line with a repaired copy.
+  guard_runner_checkout_git
 }
 
 # 2b. Runner-checkout is synced to the named branch's tip on host.
@@ -1909,21 +2068,21 @@ ensure_runner_checkout_on_branch() {
   # checkout porcelain doesn't know that). The plumbing ops never touch the
   # WT, so they can't refuse; the dirty-WT scrub below then resets the WT
   # against the now-valid HEAD.
-  if ! git -C "$HOST_CHECKOUT" rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
+  if ! checkout_git rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
     local default_branch
     if ! default_branch="$(resolve_default_branch)"; then
       echo "runner: ensure_runner_checkout_on_branch: default-branch resolution failed (unborn-HEAD recovery)" >&2
       return 1
     fi
-    if ! git -C "$HOST_CHECKOUT" fetch --quiet origin "$default_branch" >&2; then
+    if ! checkout_git fetch --quiet origin "$default_branch" >&2; then
       echo "runner: ensure_runner_checkout_on_branch: git fetch origin $default_branch (unborn-HEAD recovery) failed" >&2
       return 1
     fi
-    if ! git -C "$HOST_CHECKOUT" update-ref "refs/heads/$default_branch" "refs/remotes/origin/$default_branch" >&2; then
+    if ! checkout_git update-ref "refs/heads/$default_branch" "refs/remotes/origin/$default_branch" >&2; then
       echo "runner: ensure_runner_checkout_on_branch: git update-ref refs/heads/$default_branch origin/$default_branch (unborn-HEAD recovery) failed" >&2
       return 1
     fi
-    if ! git -C "$HOST_CHECKOUT" symbolic-ref HEAD "refs/heads/$default_branch" >&2; then
+    if ! checkout_git symbolic-ref HEAD "refs/heads/$default_branch" >&2; then
       echo "runner: ensure_runner_checkout_on_branch: git symbolic-ref HEAD refs/heads/$default_branch (unborn-HEAD recovery) failed" >&2
       return 1
     fi
@@ -1941,11 +2100,11 @@ ensure_runner_checkout_on_branch() {
   # bring the WT in line with current HEAD before the ref switch below. The
   # trailing `git clean -fd` (post-switch) still handles untracked files.
   local dirty
-  dirty="$(git -C "$HOST_CHECKOUT" status --porcelain 2>/dev/null)"
+  dirty="$(checkout_git status --porcelain 2>/dev/null)"
   if [ -n "$dirty" ]; then
     echo "runner: ensure_runner_checkout_on_branch: dirty runner-checkout WT before sync — scrubbing:" >&2
     echo "$dirty" >&2
-    if ! git -C "$HOST_CHECKOUT" reset --quiet --hard HEAD >&2; then
+    if ! checkout_git reset --quiet --hard HEAD >&2; then
       echo "runner: ensure_runner_checkout_on_branch: git reset --hard HEAD failed" >&2
       return 1
     fi
@@ -2003,7 +2162,7 @@ ensure_runner_checkout_on_branch() {
       echo "runner: ensure_runner_checkout_on_branch: default-branch resolution failed (lazy init for $branch)" >&2
       return 1
     fi
-    if ! git -C "$HOST_CHECKOUT" fetch --quiet origin "$default_branch" >&2; then
+    if ! checkout_git fetch --quiet origin "$default_branch" >&2; then
       echo "runner: ensure_runner_checkout_on_branch: git fetch origin $default_branch (lazy init) failed" >&2
       return 1
     fi
@@ -2012,15 +2171,15 @@ ensure_runner_checkout_on_branch() {
       # Non-destructive (refs/heads/<branch>, if the runner-checkout has
       # one, is left alone), so the guard below is not needed here; it runs
       # when the branch is actually created.
-      if ! git -C "$HOST_CHECKOUT" checkout --quiet --detach "refs/remotes/origin/$default_branch" >&2; then
+      if ! checkout_git checkout --quiet --detach "refs/remotes/origin/$default_branch" >&2; then
         echo "runner: ensure_runner_checkout_on_branch: git checkout --detach origin/$default_branch (deferred lazy init for $branch) failed" >&2
         return 1
       fi
-      if ! git -C "$HOST_CHECKOUT" reset --quiet --hard "refs/remotes/origin/$default_branch" >&2; then
+      if ! checkout_git reset --quiet --hard "refs/remotes/origin/$default_branch" >&2; then
         echo "runner: ensure_runner_checkout_on_branch: git reset --hard origin/$default_branch (deferred lazy init for $branch) failed" >&2
         return 1
       fi
-      if ! git -C "$HOST_CHECKOUT" clean --quiet -fd >&2; then
+      if ! checkout_git clean --quiet -fd >&2; then
         echo "runner: ensure_runner_checkout_on_branch: git clean -fd failed" >&2
         return 1
       fi
@@ -2039,18 +2198,18 @@ ensure_runner_checkout_on_branch() {
     # and the diverged case (default advanced past the commits' base). A
     # merge-base error fail-closes into the guard rather than skipping it.
     local local_branch_tip default_tip
-    local_branch_tip="$(git -C "$HOST_CHECKOUT" rev-parse --verify "refs/heads/$branch" 2>/dev/null || true)"
-    default_tip="$(git -C "$HOST_CHECKOUT" rev-parse --verify "refs/remotes/origin/$default_branch" 2>/dev/null || true)"
+    local_branch_tip="$(checkout_git rev-parse --verify "refs/heads/$branch" 2>/dev/null || true)"
+    default_tip="$(checkout_git rev-parse --verify "refs/remotes/origin/$default_branch" 2>/dev/null || true)"
     if [ -n "$local_branch_tip" ] \
-        && ! git -C "$HOST_CHECKOUT" merge-base --is-ancestor "$local_branch_tip" "$default_tip" 2>/dev/null; then
+        && ! checkout_git merge-base --is-ancestor "$local_branch_tip" "$default_tip" 2>/dev/null; then
       echo "runner: ensure_runner_checkout_on_branch: lazy-init guard — refs/heads/$branch ($local_branch_tip) holds commits the default branch $default_branch lacks, with no host branch and no parking ref; aborting to preserve commits" >&2
       return 1
     fi
-    if ! git -C "$HOST_CHECKOUT" checkout --quiet -B "$branch" "refs/remotes/origin/$default_branch" >&2; then
+    if ! checkout_git checkout --quiet -B "$branch" "refs/remotes/origin/$default_branch" >&2; then
       echo "runner: ensure_runner_checkout_on_branch: git checkout -B $branch origin/$default_branch (lazy init) failed" >&2
       return 1
     fi
-    if ! git -C "$HOST_CHECKOUT" reset --quiet --hard "refs/remotes/origin/$default_branch" >&2; then
+    if ! checkout_git reset --quiet --hard "refs/remotes/origin/$default_branch" >&2; then
       echo "runner: ensure_runner_checkout_on_branch: git reset --hard origin/$default_branch (lazy init) failed" >&2
       return 1
     fi
@@ -2060,7 +2219,7 @@ ensure_runner_checkout_on_branch() {
     # a moment ago, and a branch that appeared since is never overwritten.
     if [ -n "$shared_url" ]; then
       local new_tip push_stderr push_rc=0
-      new_tip="$(git -C "$HOST_CHECKOUT" rev-parse --verify HEAD)"
+      new_tip="$(checkout_git rev-parse --verify HEAD)"
       push_stderr="$(GIT_TERMINAL_PROMPT=0 git -C "$HOST_REPO" push --quiet \
           "$shared_remote" "${new_tip}:refs/heads/${branch}" 2>&1)" || push_rc=$?
       if [ "$push_rc" -ne 0 ]; then
@@ -2084,7 +2243,7 @@ ensure_runner_checkout_on_branch() {
     local base_ref base_tip
     case "$sync_verdict" in
       host-branch)
-        if ! git -C "$HOST_CHECKOUT" fetch --quiet origin "$branch" >&2; then
+        if ! checkout_git fetch --quiet origin "$branch" >&2; then
           echo "runner: ensure_runner_checkout_on_branch: git fetch origin $branch failed" >&2
           return 1
         fi
@@ -2095,7 +2254,7 @@ ensure_runner_checkout_on_branch() {
         # Fetch the parking-ref's objects from host into the runner-checkout
         # (the runner-checkout's origin fetch won't carry them), then sync to
         # the parking-ref tip so successive dispatches chain linearly.
-        if ! git -C "$HOST_CHECKOUT" fetch --quiet "$HOST_REPO" \
+        if ! checkout_git fetch --quiet "$HOST_REPO" \
             "refs/remotes/runner/$branch:refs/remotes/host-parking/$branch" >&2; then
           echo "runner: ensure_runner_checkout_on_branch: fetch parking-ref tip from host failed" >&2
           return 1
@@ -2105,7 +2264,7 @@ ensure_runner_checkout_on_branch() {
         ;;
       remote-branch)
         # The Shared remote's branch, as just read into host.
-        if ! git -C "$HOST_CHECKOUT" fetch --quiet "$HOST_REPO" \
+        if ! checkout_git fetch --quiet "$HOST_REPO" \
             "+refs/remotes/$shared_remote/$branch:refs/remotes/host-shared/$branch" >&2; then
           echo "runner: ensure_runner_checkout_on_branch: fetch $shared_remote/$branch from host failed" >&2
           return 1
@@ -2114,11 +2273,11 @@ ensure_runner_checkout_on_branch() {
         base_tip="$remote_tip"
         ;;
     esac
-    if ! git -C "$HOST_CHECKOUT" checkout --quiet -B "$branch" "$base_ref" >&2; then
+    if ! checkout_git checkout --quiet -B "$branch" "$base_ref" >&2; then
       echo "runner: ensure_runner_checkout_on_branch: git checkout -B $branch $base_ref failed" >&2
       return 1
     fi
-    if ! git -C "$HOST_CHECKOUT" reset --quiet --hard "$base_tip" >&2; then
+    if ! checkout_git reset --quiet --hard "$base_tip" >&2; then
       echo "runner: ensure_runner_checkout_on_branch: git reset --hard $base_tip failed" >&2
       return 1
     fi
@@ -2133,7 +2292,7 @@ ensure_runner_checkout_on_branch() {
   # untracked files and directories without touching gitignored content
   # (caches, IDE state). The runner-checkout has no legitimate untracked
   # state at this point in the loop, so cleaning is unconditionally safe.
-  if ! git -C "$HOST_CHECKOUT" clean --quiet -fd >&2; then
+  if ! checkout_git clean --quiet -fd >&2; then
     echo "runner: ensure_runner_checkout_on_branch: git clean -fd failed" >&2
     return 1
   fi
@@ -2145,7 +2304,7 @@ ensure_runner_checkout_on_branch() {
   # sync as it was, and issue-commits reports that it cannot tell.
   local sync_default_branch
   if sync_default_branch="$(resolve_default_branch 2>/dev/null)"; then
-    git -C "$HOST_CHECKOUT" fetch --quiet origin \
+    checkout_git fetch --quiet origin \
       "+refs/heads/$sync_default_branch:refs/remotes/origin/$sync_default_branch" \
       >/dev/null 2>&1 || true
   fi
@@ -2391,7 +2550,7 @@ preflight() {
 take_snapshot() {
   local feature="$1"
   local rc=0 result
-  result="$(SNAPSHOT_CHECKOUT_DIR="$HOST_CHECKOUT" \
+  result="$(SNAPSHOT_CHECKOUT_DIR="$HOST_CHECKOUT" checkout_git_run \
     bash "$HOST_REPO/docs/formann/issue-tracker/tracker-snapshot" "$feature")" || rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "runner: tracker-snapshot exited non-zero ($rc) for feature $feature" >&2
@@ -2759,6 +2918,20 @@ run_sandbox_container() {
     default_branch_env="RUNNER_DEFAULT_BRANCH=$sandbox_default_branch"
   fi
 
+  # The runner-checkout's `.git/config` and `.git/hooks` come read-only from
+  # the host-owned copies under `.runner-state/checkout-git/` (#35): the
+  # Dispatch can commit, branch and reset, but can't change the config or
+  # install a hook that host-side git would later obey. `git config` (and
+  # `git remote set-url`) fail inside the sandbox by design.
+  local checkout_git_state
+  checkout_git_state="$(runner_checkout_git_state_dir)"
+  if [ -z "$checkout_git_state" ]; then
+    echo "runner: run_sandbox_container: HOST_RUNNER_STATE is unset; no host-owned git config to mount" >&2
+    return 1
+  fi
+  ensure_runner_checkout_git_state || return 1
+  guard_runner_checkout_git || return 1
+
   # `--init` puts Docker's built-in init (tini) at PID 1, with the image's
   # entrypoint as its child. PID 1 inherits every process whose parent has
   # exited, and only PID 1 can collect such an orphan's exit status once it
@@ -2772,6 +2945,8 @@ run_sandbox_container() {
     --cidfile "$cid_file" \
     --network "$NET_NAME" \
     -v "$HOST_CHECKOUT:$RUNNER_CONTAINER_REPO_PATH" \
+    -v "$checkout_git_state/config:$RUNNER_CONTAINER_REPO_PATH/.git/config:ro" \
+    -v "$checkout_git_state/hooks:$RUNNER_CONTAINER_REPO_PATH/.git/hooks:ro" \
     -v "$HOST_REPO/.formann:$RUNNER_CONTAINER_REPO_PATH/.formann:ro" \
     -v "$HOST_REPO/docs/formann:$RUNNER_CONTAINER_REPO_PATH/docs/formann:ro" \
     ${claude_mounts[@]+"${claude_mounts[@]}"} \
@@ -2920,7 +3095,7 @@ with_transport_retry() {
   # Capture the runner-checkout HEAD before the first attempt so we can
   # detect whether a dispatch committed partial work between retries.
   local initial_head
-  initial_head="$(git -C "${HOST_CHECKOUT:-}" rev-parse HEAD 2>/dev/null || true)"
+  initial_head="$(checkout_git rev-parse HEAD 2>/dev/null || true)"
 
   while true; do
     attempt=$(( attempt + 1 ))
@@ -2952,7 +3127,7 @@ with_transport_retry() {
     # /implement over a half-committed state.
     if [ -n "$initial_head" ]; then
       local current_head
-      current_head="$(git -C "$HOST_CHECKOUT" rev-parse HEAD 2>/dev/null || true)"
+      current_head="$(checkout_git rev-parse HEAD 2>/dev/null || true)"
       if [ "$current_head" != "$initial_head" ]; then
         break
       fi
@@ -3040,7 +3215,7 @@ with_window_retry() {
   # with_transport_retry, which captures a fresh baseline, and its
   # window-exhausted gate breaks out before its guard is reached.
   local initial_head
-  initial_head="$(git -C "${HOST_CHECKOUT:-}" rev-parse HEAD 2>/dev/null || true)"
+  initial_head="$(checkout_git rev-parse HEAD 2>/dev/null || true)"
 
   while true; do
     rc=0
@@ -3066,7 +3241,7 @@ with_window_retry() {
     # unchanged: the maintainer reconciles either way.
     if [ -n "$initial_head" ]; then
       local current_head
-      current_head="$(git -C "$HOST_CHECKOUT" rev-parse HEAD 2>/dev/null || true)"
+      current_head="$(checkout_git rev-parse HEAD 2>/dev/null || true)"
       if [ "$current_head" != "$initial_head" ]; then
         format_window_giveup_line "$(now_clock)" \
           "$(window_rate_limit_type "$log_base.stdout.jsonl")"
@@ -3262,12 +3437,12 @@ stamp_dispatch_commits() {
   local ref="$1" base="$2"
   local trailer_key="Formann-Issue"
   local branch_ref head commits
-  if ! branch_ref="$(git -C "$HOST_CHECKOUT" symbolic-ref --quiet HEAD)"; then
+  if ! branch_ref="$(checkout_git symbolic-ref --quiet HEAD)"; then
     echo "runner: stamp_dispatch_commits: the runner-checkout's HEAD is not on a branch" >&2
     return 1
   fi
-  head="$(git -C "$HOST_CHECKOUT" rev-parse --verify HEAD)" || return 1
-  commits="$(git -C "$HOST_CHECKOUT" rev-list --reverse --topo-order "$head" --not "$base")" || return 1
+  head="$(checkout_git rev-parse --verify HEAD)" || return 1
+  commits="$(checkout_git rev-list --reverse --topo-order "$head" --not "$base")" || return 1
   [ -z "$commits" ] && return 0
 
   # Refuse before rewriting anything: one commit of another issue's fails
@@ -3280,7 +3455,7 @@ stamp_dispatch_commits() {
         echo "runner: commit $sha carries $trailer_key: $value, but the dispatch for $ref made it; the runner does not overwrite another issue's $trailer_key (issue $value vs issue $ref)" >&2
         return 1
       fi
-    done <<<"$(git -C "$HOST_CHECKOUT" log -1 \
+    done <<<"$(checkout_git log -1 \
       --format="%(trailers:key=$trailer_key,valueonly,separator=%x0A)" "$sha")"
   done <<<"$commits"
 
@@ -3291,7 +3466,7 @@ stamp_dispatch_commits() {
   local parents parent new_parents mapped i changed stamped new_sha
   local author_name author_email author_date committer_name committer_email committer_date
   while IFS= read -r sha; do
-    parents="$(git -C "$HOST_CHECKOUT" rev-list --parents -n 1 "$sha")"
+    parents="$(checkout_git rev-list --parents -n 1 "$sha")"
     parents="${parents#"$sha"}"
     new_parents=()
     changed=0
@@ -3306,7 +3481,7 @@ stamp_dispatch_commits() {
       new_parents+=(-p "$mapped")
     done
     stamped=0
-    if git -C "$HOST_CHECKOUT" log -1 \
+    if checkout_git log -1 \
         --format="%(trailers:key=$trailer_key,valueonly,separator=%x0A)" "$sha" \
         | grep -qxF -- "$ref"; then
       stamped=1
@@ -3314,17 +3489,17 @@ stamp_dispatch_commits() {
     if [ "$stamped" -eq 1 ] && [ "$changed" -eq 0 ]; then
       new_sha="$sha"
     else
-      author_name="$(git -C "$HOST_CHECKOUT" log -1 --format=%an "$sha")"
-      author_email="$(git -C "$HOST_CHECKOUT" log -1 --format=%ae "$sha")"
-      author_date="$(git -C "$HOST_CHECKOUT" log -1 --format=%ad --date=raw "$sha")"
-      committer_name="$(git -C "$HOST_CHECKOUT" log -1 --format=%cn "$sha")"
-      committer_email="$(git -C "$HOST_CHECKOUT" log -1 --format=%ce "$sha")"
-      committer_date="$(git -C "$HOST_CHECKOUT" log -1 --format=%cd --date=raw "$sha")"
+      author_name="$(checkout_git log -1 --format=%an "$sha")"
+      author_email="$(checkout_git log -1 --format=%ae "$sha")"
+      author_date="$(checkout_git log -1 --format=%ad --date=raw "$sha")"
+      committer_name="$(checkout_git log -1 --format=%cn "$sha")"
+      committer_email="$(checkout_git log -1 --format=%ce "$sha")"
+      committer_date="$(checkout_git log -1 --format=%cd --date=raw "$sha")"
       # The raw message: everything after the header block's blank line.
       if ! new_sha="$(
-          git -C "$HOST_CHECKOUT" cat-file commit "$sha" | sed '1,/^$/d' \
+          checkout_git cat-file commit "$sha" | sed '1,/^$/d' \
           | if [ "$stamped" -eq 1 ]; then cat; else
-              git -C "$HOST_CHECKOUT" interpret-trailers \
+              checkout_git interpret-trailers \
                 --where end --if-exists addIfDifferent --if-missing add \
                 --trailer "$trailer_key: $ref"
             fi \
@@ -3332,7 +3507,7 @@ stamp_dispatch_commits() {
             GIT_AUTHOR_DATE="$author_date" \
             GIT_COMMITTER_NAME="$committer_name" GIT_COMMITTER_EMAIL="$committer_email" \
             GIT_COMMITTER_DATE="$committer_date" \
-            git -C "$HOST_CHECKOUT" commit-tree "${sha}^{tree}" ${new_parents[@]+"${new_parents[@]}"} -F -
+            checkout_git commit-tree "${sha}^{tree}" ${new_parents[@]+"${new_parents[@]}"} -F -
         )"; then
         echo "runner: stamp_dispatch_commits: could not rewrite commit $sha" >&2
         return 1
@@ -3346,7 +3521,7 @@ stamp_dispatch_commits() {
   [ "$new_head" = "$head" ] && return 0
   # Trees are unchanged, so moving the checked-out branch leaves the index
   # and working tree as they are.
-  if ! git -C "$HOST_CHECKOUT" update-ref -m "runner: stamp $trailer_key: $ref" \
+  if ! checkout_git update-ref -m "runner: stamp $trailer_key: $ref" \
       "$branch_ref" "$new_head" "$head" >&2; then
     echo "runner: stamp_dispatch_commits: git update-ref $branch_ref failed" >&2
     return 1
@@ -3419,7 +3594,7 @@ propagate_feature() {
   # Git's own stderr is left to flow through so runner.log carries the actual
   # failure cause (permissions, lock contention, FS error, disk full) ahead
   # of the runner's heredoc — diagnostic without re-running the recipe.
-  if ! git -C "$HOST_REPO" fetch --quiet "$HOST_CHECKOUT" \
+  if ! checkout_git_run git -C "$HOST_REPO" fetch --quiet "$HOST_CHECKOUT" \
       "+${branch}:${parking_ref}" >&2; then
     cat >&2 <<MSG
 runner: propagation error — failed to publish to parking ref '${parking_ref}'.
@@ -3439,7 +3614,7 @@ MSG
   # every expected refusal.  `|| rc=$?` keeps set -e happy on non-zero.
   local host_indicator
   local step2_stderr step2_rc=0
-  step2_stderr="$(git -C "$HOST_REPO" fetch --quiet "$HOST_CHECKOUT" \
+  step2_stderr="$(checkout_git_run git -C "$HOST_REPO" fetch --quiet "$HOST_CHECKOUT" \
       "${branch}:${branch}" 2>&1)" || step2_rc=$?
   if [ "$step2_rc" -eq 0 ]; then
     host_indicator="propagated → host"
@@ -3454,7 +3629,7 @@ MSG
     local host_head host_tip checkout_tip expected_refusal=0
     host_head="$(git -C "$HOST_REPO" symbolic-ref --quiet HEAD 2>/dev/null || true)"
     host_tip="$(git -C "$HOST_REPO" rev-parse --verify "refs/heads/$branch" 2>/dev/null || true)"
-    checkout_tip="$(git -C "$HOST_CHECKOUT" rev-parse --verify "refs/heads/$branch" 2>/dev/null || true)"
+    checkout_tip="$(checkout_git rev-parse --verify "refs/heads/$branch" 2>/dev/null || true)"
     if [ "$host_head" = "refs/heads/${branch}" ]; then
       expected_refusal=1
     elif [ -n "$host_tip" ] && [ -n "$checkout_tip" ] \
@@ -3613,11 +3788,11 @@ sweep_stale_parking_refs() {
       # safer than treating unknown rc as "absent" and proceeding to the
       # host-only delete, which could reintroduce the resurrection bug.
       show_rc=0
-      git -C "$HOST_CHECKOUT" show-ref --verify --quiet "refs/heads/${slug}" 2>/dev/null \
+      checkout_git show-ref --verify --quiet "refs/heads/${slug}" 2>/dev/null \
         || show_rc=$?
 
       if [[ "$show_rc" -ne 1 ]]; then
-        source_tip="$(git -C "$HOST_CHECKOUT" rev-parse --verify \
+        source_tip="$(checkout_git rev-parse --verify \
           "refs/heads/${slug}^{commit}" 2>/dev/null)" || {
           printf 'runner: sweep: skipping %s — runner-checkout refs/heads/%s tip unreadable\n' \
             "$ref" "$slug" >&2
@@ -3653,7 +3828,7 @@ sweep_stale_parking_refs() {
         # ref must not be removed either — the next fetch would restore it
         # from the surviving source and silently reintroduce the original
         # cluttering bug.
-        if ! git -C "$HOST_CHECKOUT" update-ref -d "refs/heads/${slug}" 2>/dev/null; then
+        if ! checkout_git update-ref -d "refs/heads/${slug}" 2>/dev/null; then
           printf 'runner: sweep: skipping %s — failed to delete runner-checkout refs/heads/%s\n' \
             "$ref" "$slug" >&2
           continue
@@ -3805,7 +3980,7 @@ walk_post_implement_steps() {
 
     # Capture HEAD before dispatch to detect a commit delta.
     local pre_item_head
-    pre_item_head="$(git -C "$HOST_CHECKOUT" rev-parse HEAD 2>/dev/null || true)"
+    pre_item_head="$(checkout_git rev-parse HEAD 2>/dev/null || true)"
 
     local item_started_at
     item_started_at=$(date +%s)
@@ -3826,7 +4001,7 @@ walk_post_implement_steps() {
     extract_result_summary "$item_log_base.stdout.jsonl" >"$item_log_base.summary.md"
 
     local post_item_head
-    post_item_head="$(git -C "$HOST_CHECKOUT" rev-parse HEAD 2>/dev/null || true)"
+    post_item_head="$(checkout_git rev-parse HEAD 2>/dev/null || true)"
 
     local item_has_runner_commits=0
     if [ -n "$pre_item_head" ] && [ -n "$post_item_head" ] \
@@ -4133,7 +4308,7 @@ dispatch_one() {
   # `tracker:` comment that must reach the host before the next
   # iteration's reset wipes it.
   local pre_implement_head
-  pre_implement_head="$(git -C "$HOST_CHECKOUT" rev-parse HEAD 2>/dev/null || true)"
+  pre_implement_head="$(checkout_git rev-parse HEAD 2>/dev/null || true)"
 
   local impl_rc=0
   run_dispatch_container "$ref" "$log_base" || impl_rc=$?
@@ -4145,7 +4320,7 @@ dispatch_one() {
   extract_result_summary "$log_base.stdout.jsonl" >"$log_base.summary.md"
 
   local post_implement_head
-  post_implement_head="$(git -C "$HOST_CHECKOUT" rev-parse HEAD 2>/dev/null || true)"
+  post_implement_head="$(checkout_git rev-parse HEAD 2>/dev/null || true)"
 
   # Transport-crash is decided from the structured result event plus the exit
   # code (is_transport_crash's two-rung contract). The structured verdict is
@@ -4206,7 +4381,7 @@ dispatch_one() {
   # matches `core | core.*` on basename, so a core dropped inside an
   # untracked subdirectory would never be captured without the flag.
   local dirty
-  dirty="$(git -C "$HOST_CHECKOUT" status --porcelain --untracked-files=all)"
+  dirty="$(checkout_git status --porcelain --untracked-files=all)"
 
   local impl_ended_at impl_duration
   impl_ended_at=$(date +%s)
@@ -5006,7 +5181,7 @@ post_claim_note() {
     return 0
   fi
   local head_before head_after machine body
-  head_before="$(git -C "$HOST_CHECKOUT" rev-parse --verify --quiet HEAD 2>/dev/null || true)"
+  head_before="$(checkout_git rev-parse --verify --quiet HEAD 2>/dev/null || true)"
   local verb="Claimed"
   case "$how" in
     taken-over-from\ *) verb="Taken over from \`${how#taken-over-from }\` (its claim was stale)" ;;
@@ -5019,12 +5194,12 @@ ${verb} by the runner on \`${machine}\` (run \`${RUN_TS:-unknown}\`, Formann \`$
 NOTE
 )"
   if ! ( cd "$HOST_REPO" && printf '%s\n' "$body" \
-      | TRACKER_CHECKOUT_DIR="$HOST_CHECKOUT" "$script" "$feature" "Note" ) >/dev/null; then
+      | TRACKER_CHECKOUT_DIR="$HOST_CHECKOUT" checkout_git_run "$script" "$feature" "Note" ) >/dev/null; then
     echo "[$(now_clock)] runner: could not post the claim Note on $feature (see above); draining anyway"
     return 0
   fi
   echo "[$(now_clock)] runner: posted the claim Note on $feature"
-  head_after="$(git -C "$HOST_CHECKOUT" rev-parse --verify --quiet HEAD 2>/dev/null || true)"
+  head_after="$(checkout_git rev-parse --verify --quiet HEAD 2>/dev/null || true)"
   if [ -n "$head_after" ] && [ "$head_after" != "$head_before" ]; then
     if ! propagate_feature "$feature"; then
       echo "[$(now_clock)] runner: the claim Note's commit could not be propagated; draining anyway"

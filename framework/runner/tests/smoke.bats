@@ -192,6 +192,30 @@ assert_run_artifacts() {
   current_main="$(git -C "$WORKSPACE" rev-parse refs/heads/main)"
   [ "$current_main" = "$INITIAL_MAIN_TIP" ]
 
+  # The dispatch committed (above) with .git/config and .git/hooks mounted
+  # read-only from the host-owned copies (#35), and left the checkout's
+  # config as the host owns it.
+  [ -f "$WORKSPACE/.runner-state/checkout-git/config" ]
+  [ -d "$WORKSPACE/.runner-state/checkout-git/hooks" ]
+  cmp -s "$WORKSPACE/.runner-state/checkout-git/config" \
+    "$WORKSPACE/.runner-state/checkout/.git/config"
+  # And in a container with the same mounts: committing works, changing the
+  # config or installing a hook does not.
+  local img co="$WORKSPACE/.runner-state/checkout" st="$WORKSPACE/.runner-state/checkout-git"
+  img="$(cd "$WORKSPACE" && bash "$WORKSPACE/.formann/runner/build-image.sh")"
+  local -a mounts=(-v "$co:/repo" -v "$st/config:/repo/.git/config:ro" -v "$st/hooks:/repo/.git/hooks:ro")
+  run docker run --rm "${mounts[@]}" --entrypoint git "$img" \
+    -c safe.directory='*' -c user.name=smoke -c user.email=smoke@test \
+    -C /repo commit --allow-empty -q -m "smoke: commit under read-only config"
+  assert_success
+  run docker run --rm "${mounts[@]}" --entrypoint git "$img" \
+    -c safe.directory='*' -C /repo config core.fsmonitor "touch /repo/pwned"
+  assert_failure
+  run docker run --rm "${mounts[@]}" --entrypoint sh "$img" \
+    -c 'printf "#!/bin/sh\n" >/repo/.git/hooks/post-checkout'
+  assert_failure
+  cmp -s "$st/config" "$co/.git/config"
+
   # Per-run artifacts present.
   assert_run_artifacts
 

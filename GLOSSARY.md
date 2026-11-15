@@ -78,7 +78,7 @@ _Avoid_: "execution", "agent run"
 Consumer-owned. Lives in the **Consumer** repo (not Formann), because container contents are project-specific (toolchain, build commands). The **Installer** scaffolds an initial one.
 
 **Runner-checkout**:
-The separate git clone at `.runner-state/checkout/` that the **Runner** mounts into the sandbox container as `/repo`. Distinct from the **Consumer**'s host repo: the **Dispatch** has no access to the host's `.git/`, working tree, or `~/`. The **Parking ref** is where the **Runner-checkout**'s committed work lands on the host side.
+The separate git clone at `.runner-state/checkout/` that the **Runner** mounts into the sandbox container as `/repo`. Distinct from the **Consumer**'s host repo: the **Dispatch** has no access to the host's `.git/`, working tree, or `~/`. The **Parking ref** is where the **Runner-checkout**'s committed work lands on the host side. Its `.git/config` and `.git/hooks` are host-owned (`.runner-state/checkout-git/`, mounted read-only into the sandbox): nothing a **Dispatch** writes under `.git/` runs on the host.
 _Avoid_: "runner clone", "sandbox repo"
 
 **Judges checkout**:

@@ -567,6 +567,50 @@ the third pass. See "Blocked steps" in `afk-runner.md`. A terminal status (`done
 both return 0 from `dispatch_one` (operational health is fine; the
 verdict is independent); a failed step returns 1 and writes an abort flag.
 
+## Host-side git on the Runner-checkout
+
+**Rule: nothing a Dispatch writes under the Runner-checkout's `.git/` runs on the host.** The
+sandbox mounts the checkout read-write at `/repo`, and the host side of the runner then runs
+git in that same tree (`status`, `checkout`, `reset`, `clean`, `log`, `fetch`, `commit-tree`, the
+binding's `tracker-snapshot` / `blocked-passes` / `comment-on-feature`, the propagation fetch
+from it). Git obeys the repository config and hooks it finds in `.git/`, so without the measures
+below a dispatch could plant `core.fsmonitor = <command>` (run by `git status`), a
+`post-checkout` hook (run by `git checkout`) or a `filter.<x>.smudge` driver bound to a tracked
+file by `.gitattributes` (run when a checkout writes that file), and the host would run it with
+the maintainer's credentials (#35). It is held three ways:
+
+1. **Host-owned copies, mounted read-only.** When the runner clones or first finds the checkout it
+   writes `.runner-state/checkout-git/config` and an empty `.runner-state/checkout-git/hooks/`. The
+   config is built, never copied: the repository-format keys are read from the checkout's config as
+   data (`core.repositoryformatversion`, `core.filemode`, `core.logallrefupdates`,
+   `core.ignorecase`, `core.precomposeunicode`, `core.symlinks`, `extensions.objectformat`,
+   `extensions.refstorage`), `core.bare` is `false`, and `origin` is the host repo. Every container
+   mounts the two over `/repo/.git/config` and `/repo/.git/hooks` with `:ro`. A Dispatch still
+   commits, branches and resets (objects, refs, index and logs stay writable), but **`git config`,
+   `git remote set-url` and anything else that writes the repository config fail inside a
+   Dispatch, by design**, and it cannot install a hook.
+2. **The host-owned config is back in place before every host call.** If the checkout's
+   `.git/config` differs from the copy (or is a symlink) the copy replaces it, with a `runner:
+   runner-checkout .git/config differed from the host-owned copy; restored` line; a
+   `.git/commondir` or `.git/config.worktree` (either would point git at other config) is
+   removed; a `.git` that is not a plain directory is refused. When the runner changes the
+   checkout's config itself (putting `origin` back to the host repo, clearing a push URL) it
+   changes the host-owned copy, which the next call and the next container pick up.
+3. **One way in.** Host code runs git on the checkout only through `checkout_git <subcommand> …`
+   and, for a command that runs git there itself (a binding script handed the checkout, the host
+   repo's fetch from it), `checkout_git_run <command> …`. Both apply step 2 and add
+   `core.hooksPath=/dev/null`, `core.fsmonitor=false` and `branch.autoSetupMerge=false` (the
+   last so the host's own `checkout -B` never writes tracking config into the checkout);
+   `checkout_git_run` passes them in `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`
+   (git 2.31+), which every git it starts inherits. `tests/host-git-escape.bats` fails when a
+   new line runs `git -C "$HOST_CHECKOUT"`, `cd "$HOST_CHECKOUT"`, `GIT_DIR`/`--git-dir` on it, a
+   fetch from it or a binding script handed it, other than through the two.
+
+Filter drivers are covered by step 2: a filter runs only when the config defines it, and the
+config is the host's. A host-wide filter in `~/.gitconfig` (git-lfs, say) still applies; it is the
+maintainer's own program. The Judges checkout is not mounted read-write into the sandbox and is
+outside this rule.
+
 ## Sandbox primitives
 
 | File | Role |
@@ -580,7 +624,7 @@ verdict is independent); a failed step returns 1 and writes an abort flag.
 | `ensure-mvn-cache.sh` | Per-feature mvn cache helper. Creates `runner-mvn-cache-<slug>` on first use (and chowns it to uid 1000 so the non-root container can write); idempotent on re-invocation. Prints the volume name on stdout. |
 | `lib.sh` | Shared constants (network, bridge, subnet, iptables chain, OAuth keychain coords, mvn-cache prefix, container `~/.m2` path) and the helpers that derive the per-consumer image name (`runner_image_name`) and the `runner/` context hash (`runner_context_hash`). Source of truth for the names below. |
 | `NOTES.md` | Provenance of vendored files (currently `retrieve-secret.sh`). Re-vendor instructions live there. |
-| `tests/` | `bats` suite covering `tracker-snapshot` (including `--list`), the runner's pure-logic functions (`classify_outcome`, `next_eligible_ref`, `next_eligible_feature`, `classify_item_action`, `walk_post_implement_steps`, `propagate_feature`, `format_multi_feature_summary_md`), the outer drain loop (`run_drain`, `drain_one_feature`), and `run_loop` mechanics (drain / interrupt / abort-flag skipping / feature-gate refusals) with mocked dispatch. Real-Docker exercising is the job of slice 08's smoke test. |
+| `tests/` | `bats` suite covering host-side git on the Runner-checkout (`host-git-escape.bats`, see [above](#host-side-git-on-the-runner-checkout)), `tracker-snapshot` (including `--list`), the runner's pure-logic functions (`classify_outcome`, `next_eligible_ref`, `next_eligible_feature`, `classify_item_action`, `walk_post_implement_steps`, `propagate_feature`, `format_multi_feature_summary_md`), the outer drain loop (`run_drain`, `drain_one_feature`), and `run_loop` mechanics (drain / interrupt / abort-flag skipping / feature-gate refusals) with mocked dispatch. Real-Docker exercising is the job of slice 08's smoke test. |
 | `tests/fixtures/synthetic-drain/` | Two-issue micro-feature template the maintainer installs into `.features/synthetic-drain/` for the loop's live demo. Reused by slice 08. See its README for the runbook. |
 
 ## Stable Docker asset names

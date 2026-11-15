@@ -6253,7 +6253,10 @@ setup_ensure_checkout_parking_test() {
   cat >"$fake_bin/git" <<'SHIM'
 #!/usr/bin/env bash
 # On first "git -C <HOST_CHECKOUT> fetch …": advance HOST_REPO, then delegate.
-if [ "${1:-}" = "-C" ] && [ "${2:-}" = "$SHIM_HOST_CHECKOUT" ] && [ "${3:-}" = "fetch" ]; then
+# Skip the `-c <key>=<value>` overrides checkout_git puts first (#35).
+args=("$@")
+while [ "${args[0]:-}" = "-c" ]; do args=("${args[@]:2}"); done
+if [ "${args[0]:-}" = "-C" ] && [ "${args[1]:-}" = "$SHIM_HOST_CHECKOUT" ] && [ "${args[2]:-}" = "fetch" ]; then
   if [ ! -f "$SHIM_FIRED_FILE" ]; then
     touch "$SHIM_FIRED_FILE"
     "$SHIM_REAL_GIT" -C "$SHIM_HOST_REPO" \
@@ -6598,7 +6601,10 @@ SHIM
   export SHIM_HOST_CHECKOUT="$HOST_CHECKOUT" SHIM_REAL_GIT="$real_git"
   cat >"$fake_bin/git" <<'SHIM'
 #!/usr/bin/env bash
-if [ "${1:-}" = "-C" ] && [ "${2:-}" = "$SHIM_HOST_CHECKOUT" ] && [ "${3:-}" = "fetch" ]; then
+# Skip the `-c <key>=<value>` overrides checkout_git puts first (#35).
+args=("$@")
+while [ "${args[0]:-}" = "-c" ]; do args=("${args[@]:2}"); done
+if [ "${args[0]:-}" = "-C" ] && [ "${args[1]:-}" = "$SHIM_HOST_CHECKOUT" ] && [ "${args[2]:-}" = "fetch" ]; then
   echo "fatal: could not read from remote repository (shim)" >&2
   exit 128
 fi
@@ -10592,7 +10598,10 @@ setup_refresher_test() {
   git -C "$HOST_REPO" -c user.email=t@t -c user.name=t commit --allow-empty --quiet -m init
   git -C "$HOST_REPO" remote add origin "$SHARED_CLAIMS"
   mkdir -p "$HOST_REPO/docs/formann/issue-tracker"
-  HOST_CHECKOUT="$HOST_REPO"
+  # A checkout of its own: the container guard (#35) puts the host-owned
+  # config over the checkout's, which would drop the host repo's origin.
+  HOST_CHECKOUT="$BATS_TEST_TMPDIR/checkout"
+  git clone --quiet "$HOST_REPO" "$HOST_CHECKOUT"
   HOST_RUNNER_STATE="$BATS_TEST_TMPDIR"
   NET_NAME=none
   RUNNER_CONTAINER_REPO_PATH=/repo

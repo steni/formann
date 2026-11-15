@@ -127,6 +127,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `review-issue` at Verify no longer checks the Evidence block; run `review-claims` for that.
 
 ### Fixed
+- A dispatch can no longer make the AFK runner's host run commands through the Runner-checkout's
+  git settings and hooks (#35). The sandbox mounts the checkout read-write, `.git/` included, and
+  the host then runs `git status`, `checkout`, `reset`, `clean`, `fetch` and more in that tree,
+  so a planted `core.fsmonitor`, hook or filter driver ran on the host with the maintainer's
+  credentials. Every container now mounts `.git/config` and `.git/hooks` read-only from host-owned
+  copies under `.runner-state/checkout-git/` (so `git config` and `git remote set-url` fail inside a
+  dispatch, by design), and every host git call on the checkout goes through one wrapper that puts
+  the host-owned config back first, removes `.git/commondir` / `.git/config.worktree`, refuses a
+  `.git` that is not a directory, and turns off hooks and fsmonitor on the command line. A bats
+  test fails when host code bypasses the wrapper.
 - github-issues `tracker-snapshot <slug>` lists the issues of a feature whose parent is closed but
   not archived, the closed ones `done` or `wontfix`, the parent itself included when it is its own
   work item. A single-issue feature the AFK gate closed on `done` used to snapshot with no issues,
