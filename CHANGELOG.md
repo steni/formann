@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- AFK runner: a finished feature's **Post-drain phase** runs on any machine, and how it ended is
+  recorded on the Shared remote (#38, ADR-0013). The phase is due when every issue is `done` or
+  `wontfix` and neither **Post-drain mark** is at the feature's tip — whether or not the pass
+  dispatched, so a restart after the last issue went `done`, or a second machine, ends the
+  feature too. Every drain pass considers each active feature with nothing eligible whose tip
+  carries no mark (one `git ls-remote` for all of them), claims a due one and runs the phase.
+  `ok` sets `refs/formann/post-drained/<feature>` at the tip; `failed`, or the third Blocked
+  pass, sets `refs/formann/post-drain-failed/<feature>` and posts a Note on the feature's parent
+  naming the step, its outcome and the log; a Blocked step posts a `Blocked` comment there. A new
+  commit on the feature, or deleting the failed mark, makes it due again. Marks are lease pushes,
+  like the Claim; without a Shared remote they are local refs. The local-markdown binding's
+  `blocked-passes` accepts the parent's `PRD.md` path.
 - AFK runner reads its judges from a **Judges checkout** of its own, `.runner-state/judges/`:
   a clone of the consumer's default branch, detached at the Shared remote's tip and set exactly
   to it in pre-flight (after the lock) and, with `--idle`, before every later pass. The
@@ -110,6 +122,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `README.md` beside the code. Contract in `framework/domain.md`; term in `GLOSSARY.md`.
 
 ### Changed
+- AFK runner: the post-drain phase always restarts at its first step at the current tip; a
+  failed step no longer writes a local abort flag and a Blocked one no longer a local marker
+  (#38). Every post-drain step must be idempotent.
 - `/to-prd` presents the module table and primary flow to the maintainer as their own
   message and gets them approved before any PRD text is written; the PRD's Implementation
   Decisions open with that design.

@@ -11054,15 +11054,15 @@ use_real_eligible_features_check() {
   [ "$(cat "$ANY_SNAPS" | tr '\n' ' ')" = "alpha gamma " ]
 }
 
-@test "run_drain — a post-drain Blocked marker is pending work too" {
+@test "run_drain — a post-drain Blocked marker left by an older runner is not pending work (#38: the due rule decides)" {
   setup_eligible_features_drain_test
   eligible_features_check() { ELIGIBLE_FEATURES_JSON='[]'; }
   write_blocked_marker alpha post-drain "smoke" "the device lab"
 
   run_drain >/dev/null 2>&1
 
-  [ "$RUN_STOP_REASON" = "completed" ]
-  [ "$(cat "$ANY_SNAPS" | tr '\n' ' ')" = "alpha " ]
+  [ "$RUN_STOP_REASON" = "nothing-eligible" ]
+  [ ! -s "$ANY_SNAPS" ]
 }
 
 @test "run_drain — a marker for a feature no longer discovered does not hold the pass open" {

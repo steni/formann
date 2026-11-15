@@ -3,7 +3,11 @@
 ### blocked-passes — local-markdown binding: count an issue's Blocked passes.
 ###
 ### Usage: blocked-passes <feature>/<NN>
+###        blocked-passes .features/<feature>/PRD.md
 ###
+### The second form counts on a feature's parent, its PRD, by the path
+### `comment-on-feature` prints for it (the AFK runner counts a Blocked
+### post-drain phase there).
 ### Prints one integer on stdout: the number of `Blocked` comments on the
 ### issue since its latest `Implementation` comment (all `Blocked` comments
 ### when it has none). A rework posts a new Implementation comment, which
@@ -33,13 +37,30 @@ if [ "$#" -ne 1 ]; then
 fi
 
 ref="$1"
-feature="${ref%/*}"
-nn="${ref##*/}"
-if [ "$feature" = "$ref" ] || [ -z "$feature" ] || [ -z "$nn" ]; then
+prd=""
+case "$ref" in
+  .features/*/PRD.md)
+    prd="$ref"
+    feature="${ref#.features/}"
+    feature="${feature%/PRD.md}"
+    nn="PRD"
+    case "$feature" in
+      ''|*/*)
+        echo "blocked-passes: not an issue ref: '$ref' (expected <feature>/<NN> or .features/<feature>/PRD.md)" >&2
+        exit 2
+        ;;
+    esac
+    ;;
+  *)
+    feature="${ref%/*}"
+    nn="${ref##*/}"
+    ;;
+esac
+if [ -z "$prd" ] && { [ "$feature" = "$ref" ] || [ -z "$feature" ] || [ -z "$nn" ]; }; then
   echo "blocked-passes: not an issue ref: '$ref' (expected <feature>/<NN>)" >&2
   exit 2
 fi
-case "$nn" in
+[ -n "$prd" ] || case "$nn" in
   *[!0-9]*)
     echo "blocked-passes: not an issue ref: '$ref' (expected <feature>/<NN>)" >&2
     exit 2
@@ -48,9 +69,13 @@ esac
 
 issue_content=""
 if [ -n "${SNAPSHOT_CHECKOUT_DIR:-}" ]; then
-  dir=".features/$feature/issues"
-  path="$(git -C "$SNAPSHOT_CHECKOUT_DIR" ls-tree --name-only HEAD "$dir/" 2>/dev/null \
-    | grep -E "^$dir/${nn}-[^/]*\.md\$" | head -n 1 || true)"
+  if [ -n "$prd" ]; then
+    path="$prd"
+  else
+    dir=".features/$feature/issues"
+    path="$(git -C "$SNAPSHOT_CHECKOUT_DIR" ls-tree --name-only HEAD "$dir/" 2>/dev/null \
+      | grep -E "^$dir/${nn}-[^/]*\.md\$" | head -n 1 || true)"
+  fi
   if [ -z "$path" ] || ! issue_content="$(git -C "$SNAPSHOT_CHECKOUT_DIR" show "HEAD:$path" 2>/dev/null)"; then
     echo "blocked-passes: no committed issue file for '$ref' in $SNAPSHOT_CHECKOUT_DIR" >&2
     exit 1
@@ -74,9 +99,13 @@ else
     fi
   fi
   file=""
-  for candidate in "$tracker_root/$feature/issues/${nn}-"*.md; do
-    [ -f "$candidate" ] && { file="$candidate"; break; }
-  done
+  if [ -n "$prd" ]; then
+    [ -f "$tracker_root/$feature/PRD.md" ] && file="$tracker_root/$feature/PRD.md"
+  else
+    for candidate in "$tracker_root/$feature/issues/${nn}-"*.md; do
+      [ -f "$candidate" ] && { file="$candidate"; break; }
+    done
+  fi
   if [ -z "$file" ]; then
     echo "blocked-passes: no issue file for '$ref' under $tracker_root" >&2
     exit 1

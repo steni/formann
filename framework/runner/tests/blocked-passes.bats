@@ -91,3 +91,30 @@ SHIM
   TRACKER_ROOT="$HERE/fixtures" run "$LM_BLOCKED_PASSES"
   assert_failure 2
 }
+
+@test "blocked-passes (local-markdown) — counts on a feature's parent by the PRD path comment-on-feature prints (#38)" {
+  local repo="$BATS_TEST_TMPDIR/repo"
+  mkdir -p "$repo/.features/f/issues"
+  git init --quiet "$repo"
+  printf '# PRD\n\nBody.\n' >"$repo/.features/f/PRD.md"
+  git -C "$repo" add -A
+  git -C "$repo" -c user.email=t@t -c user.name=t commit --quiet -m init
+
+  local ref n
+  for n in 1 2 3; do
+    ref="$(printf 'step x blocked\n' | TRACKER_CHECKOUT_DIR="$repo" \
+      "$BINDINGS/local-markdown/comment-on-feature" f Blocked)"
+    [ "$ref" = ".features/f/PRD.md" ]
+    SNAPSHOT_CHECKOUT_DIR="$repo" run --separate-stderr "$LM_BLOCKED_PASSES" "$ref"
+    assert_success
+    assert_output "$n"
+  done
+  # A Note on the parent is not a Blocked pass.
+  printf 'a note\n' | TRACKER_CHECKOUT_DIR="$repo" "$BINDINGS/local-markdown/comment-on-feature" f Note >/dev/null
+  TRACKER_ROOT="$repo/.features" run --separate-stderr "$LM_BLOCKED_PASSES" ".features/f/PRD.md"
+  assert_success
+  assert_output "3"
+  # No PRD: exit 1, as for a missing issue file.
+  TRACKER_ROOT="$repo/.features" run "$LM_BLOCKED_PASSES" ".features/g/PRD.md"
+  assert_failure 1
+}

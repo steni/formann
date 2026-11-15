@@ -53,9 +53,12 @@
 # `tracker-snapshot` call, so issues unblocked mid-run by an earlier
 # success become selectable without restarting.
 #
-# Once a feature has drained (drain mode and --feature), the runner runs the
-# consumer's optional post-drain steps (`runner/post-drain.md`) on the host,
-# still under the feature's Claim, then releases it — see post-drain.sh.
+# Once every issue of a feature is done or wontfix and neither Post-drain
+# mark is at its tip (drain mode and --feature, whether or not the pass
+# dispatched), the runner runs the consumer's optional post-drain steps
+# (`runner/post-drain.md`) on the host, under the feature's Claim, records
+# how they ended as a mark on the Shared remote, then releases the Claim —
+# see post-drain.sh and post-drain-marks.sh.
 #
 # Stop reasons (drain mode):
 #   - `completed`             — every discovery slug considered.
@@ -64,8 +67,10 @@
 #                                is pending: the pass ended before any
 #                                per-feature snapshot or branch sync (#15).
 #                                Otherwise the pass walks only the listed
-#                                features and those with a pending marker; a
-#                                failed check walks every feature.
+#                                features, those with a pending marker and,
+#                                with post-drain steps, those whose tip
+#                                carries no Post-drain mark; a failed check
+#                                walks every feature.
 #   - `interrupted`           — Ctrl-C during the outer loop.
 #   - `propagation-error`     — parking-ref publish failed inside a feature loop.
 #   - `runaway-halt (<ref>)`  — post-implement step pushed issue back to eligible.
@@ -128,9 +133,15 @@ source "$HERE/formann-update.sh"
 # step prompts and the manifests are read from.
 # shellcheck source=judges.sh
 source "$HERE/judges.sh"
+# post-drain-marks.sh provides the Post-drain mark store (post_drain_marks
+# read|set, post_drain_tip): how a feature's post-drain phase last ended, as
+# refs on the Shared remote (ADR-0013).
+# shellcheck source=post-drain-marks.sh
+source "$HERE/post-drain-marks.sh"
 # post-drain.sh provides the Post-drain phase (check_post_drain_manifest,
-# maybe_run_post_drain, format_post_drain_section): host-side steps run once a
-# feature has drained, before its Claim is released.
+# post_drain_due, maybe_run_post_drain, format_post_drain_section): host-side
+# steps run once every issue of a feature is done or wontfix, before its
+# Claim is released.
 # shellcheck source=post-drain.sh
 source "$HERE/post-drain.sh"
 
@@ -4623,10 +4634,9 @@ run_loop() {
 # pass tries again). No Shared remote: plain run_loop.
 run_claimed_loop() {
   if ! claim_shared_remote_present; then
-    local rc=0 dispatches_before
-    dispatches_before="$(feature_dispatch_count "$TARGET_FEATURE")"
+    local rc=0
     run_loop || rc=$?
-    maybe_run_post_drain "$TARGET_FEATURE" "$RUN_STOP_REASON" "$dispatches_before"
+    maybe_run_post_drain "$TARGET_FEATURE" "$RUN_STOP_REASON"
     return "$rc"
   fi
   if ! claim take "$TARGET_FEATURE" >/dev/null; then
@@ -4642,10 +4652,9 @@ run_claimed_loop() {
       ;;
   esac
   announce_claim "$TARGET_FEATURE"
-  local rc=0 dispatches_before
-  dispatches_before="$(feature_dispatch_count "$TARGET_FEATURE")"
+  local rc=0
   run_loop || rc=$?
-  maybe_run_post_drain "$TARGET_FEATURE" "$RUN_STOP_REASON" "$dispatches_before"
+  maybe_run_post_drain "$TARGET_FEATURE" "$RUN_STOP_REASON"
   claim_release_held
   return "$rc"
 }
@@ -4719,8 +4728,10 @@ run_drain() {
 }
 
 # Print every discovered feature with a pending Blocked re-walk marker (an
-# issue's walk, or the post-drain phase, that ended Blocked), one per line.
-# Local files only: no tracker call.
+# issue's walk that ended Blocked), one per line. A `post-drain` file left by
+# an older runner is ignored: a Blocked post-drain phase is retried because
+# the feature is still due (post_drain_due), not from a marker. Local files
+# only: no tracker call.
 pending_blocked_features() {
   [ -n "${HOST_BLOCKED_DIR:-}" ] && [ -d "$HOST_BLOCKED_DIR" ] || return 0
   local slug f
@@ -4728,7 +4739,7 @@ pending_blocked_features() {
     [ -n "$slug" ] || continue
     [ -d "$HOST_BLOCKED_DIR/$slug" ] || continue
     for f in "$HOST_BLOCKED_DIR/$slug"/*; do
-      if [ -f "$f" ]; then
+      if [ -f "$f" ] && [ "${f##*/}" != "post-drain" ]; then
         printf '%s\n' "$slug"
         break
       fi
@@ -4761,11 +4772,13 @@ eligible_features_check() {
 }
 
 # The features this drain pass walks, as a JSON array in DRAIN_PASS_JSON: the
-# discovered features the binding lists as holding an eligible issue, plus
-# those with a pending Blocked re-walk marker on this machine, in discovery
-# order. A feature outside that set would only be synced and snapshotted to
-# be skipped as queue-empty. A failed check walks every discovered feature
-# (logged once); an empty discovery asks nothing.
+# discovered features the binding lists as holding an eligible issue, those
+# with a pending Blocked re-walk marker on this machine, and — when there are
+# post-drain steps — the post-drain candidates (post_drain_candidates: every
+# other discovered feature whose tip carries neither Post-drain mark), in
+# discovery order. A feature outside that set would only be synced and
+# snapshotted to be skipped as queue-empty. A failed check walks every
+# discovered feature (logged once); an empty discovery asks nothing.
 DRAIN_PASS_JSON="[]"
 drain_pass_features() {
   DRAIN_PASS_JSON="${DISCOVERY_JSON:-[]}"
@@ -4777,18 +4790,48 @@ drain_pass_features() {
   local with_work
   with_work="$( { jq -r '.[]' <<<"$ELIGIBLE_FEATURES_JSON"; pending_blocked_features; } \
     | jq -Rsc 'split("\n") | map(select(. != ""))')"
+  if [ -n "$RESOLVED_POST_DRAIN" ]; then
+    with_work="$( { jq -r '.[]' <<<"$with_work"; post_drain_candidates "$with_work"; } \
+      | jq -Rsc 'split("\n") | map(select(. != ""))')"
+  fi
   DRAIN_PASS_JSON="$(jq -c --argjson w "$with_work" '[ .[] | select(. as $f | $w | index([$f])) ]' \
     <<<"$DISCOVERY_JSON")"
   if [ "$DRAIN_PASS_JSON" = "[]" ]; then
-    echo "[$(now_clock)] runner: nothing to do — no feature has an eligible issue and no Blocked re-walk is pending; no feature snapshotted"
+    echo "[$(now_clock)] runner: nothing to do — no feature has an eligible issue, no Blocked re-walk is pending and no branch end is due; no feature snapshotted"
     return 0
   fi
   local walking total
   walking="$(jq 'length' <<<"$DRAIN_PASS_JSON")"
   total="$(jq 'length' <<<"$DISCOVERY_JSON")"
   if [ "$walking" -lt "$total" ]; then
-    echo "[$(now_clock)] runner: walking $walking of $total features (an eligible issue or a pending Blocked re-walk): $(jq -r 'join(" ")' <<<"$DRAIN_PASS_JSON")"
+    echo "[$(now_clock)] runner: walking $walking of $total features (an eligible issue, a pending Blocked re-walk or a branch end to check): $(jq -r 'join(" ")' <<<"$DRAIN_PASS_JSON")"
   fi
+}
+
+# The discovered features, outside $1 (a JSON array of features already
+# walked for other work), whose post-drain phase may be due: the feature has
+# a branch and neither Post-drain mark is at its tip. Tips and marks of every
+# feature come from one read (post_drain_refs_listing — one `git ls-remote`
+# of the Shared remote), so only these candidates are snapshotted; the due
+# rule proper (every issue done or wontfix) is decided per candidate by
+# drain_one_feature. One slug per line. A failed read lists none (logged).
+post_drain_candidates() {
+  local skip="${1:-[]}" listing slug tip ok failed
+  if ! listing="$(post_drain_refs_listing)"; then
+    echo "[$(now_clock)] runner: could not read the feature tips and Post-drain marks (see above); no finished feature considered this pass" >&2
+    return 0
+  fi
+  while IFS= read -r slug; do
+    [ -n "$slug" ] || continue
+    jq -e --arg f "$slug" 'index([$f])' >/dev/null <<<"$skip" && continue
+    tip="$(post_drain_listing_tip "$listing" "$slug")"
+    [ -n "$tip" ] || continue
+    ok="$(post_drain_listing_sha "$listing" "$(post_drain_mark_ref ok "$slug")")"
+    failed="$(post_drain_listing_sha "$listing" "$(post_drain_mark_ref failed "$slug")")"
+    [ "$tip" = "$ok" ] && continue
+    [ "$tip" = "$failed" ] && continue
+    printf '%s\n' "$slug"
+  done < <(jq -r '.[]' <<<"${DISCOVERY_JSON:-[]}")
 }
 
 # Drain a single feature inside drain mode. Evaluates the per-feature gate,
@@ -4823,10 +4866,12 @@ drain_one_feature() {
   # Queue check: ≥1 eligible non-aborted ref. Uses the same predicate as
   # the per-issue loop's selection so the verdict matches what `run_loop`
   # would compute.
-  # A post-drain step left Blocked by an earlier pass is work too: the
-  # feature is claimed and its post-drain phase re-run from that step.
+  # A finished feature whose post-drain phase is due (post_drain_due: every
+  # issue done or wontfix, neither Post-drain mark at its tip) is work too:
+  # it is claimed and its phase run, whether or not anything is dispatched.
   if ! feature_has_dispatchable_ref "$feature" "$snap" \
-      && { [ -z "$RESOLVED_POST_DRAIN" ] || [ -z "$(post_drain_pending_step "$feature")" ]; }; then
+      && { [ -z "$RESOLVED_POST_DRAIN" ] \
+           || [ "$(post_drain_due_now "$feature" "$snap" 2>/dev/null || echo not-due)" != "due" ]; }; then
     echo "[$(now_clock)] runner: skipping $feature — queue-empty"
     record_feature_outcome "$feature" "skip:queue-empty"
     return 0
@@ -4885,17 +4930,15 @@ drain_claimed_feature() {
   # mid-feature snapshot crash, we record `feature-snapshot-failed` instead
   # of `drained` so the SUMMARY narrates the failure correctly.
   local saved_stop_reason="$RUN_STOP_REASON"
-  local dispatches_before
-  dispatches_before="$(feature_dispatch_count "$feature")"
   RUN_STOP_REASON=""
   set +e
   run_loop
   set -e
 
   local inner_reason="$RUN_STOP_REASON"
-  # The feature has drained: run its post-drain phase on the host, still
-  # under the claim (drain_one_feature releases it afterwards).
-  maybe_run_post_drain "$feature" "$inner_reason" "$dispatches_before"
+  # A finished feature (the due rule): run its post-drain phase on the host,
+  # still under the claim (drain_one_feature releases it afterwards).
+  maybe_run_post_drain "$feature" "$inner_reason"
   # The outer drain loop owns the run-level stop reason. Restore whatever
   # was set before we entered the per-feature loop so a mid-drain run_loop
   # stop (queue-empty, snapshot-failed) doesn't leak as the run's final
@@ -4990,23 +5033,49 @@ heartbeat_claim() {
   return 0
 }
 
-# Announce a taken claim on the tracker: a `Note` on the feature's parent,
-# through the binding's `comment-on-feature` script on the role surface
-# (the "Comment with `<kind>`" verb). Information only — the claim ref is
-# the lock — so every failure here is logged and the drain goes on.
+# Post a comment of kind $2 with body $3 on a feature's parent, through the
+# binding's `comment-on-feature` script on the role surface (the "Comment
+# with `<kind>`" verb). Sets FEATURE_COMMENT_REF to what the script printed
+# (the parent's ref: `#N` under github-issues, the PRD's path under
+# local-markdown) — the ref the binding's `blocked-passes` takes for it.
+# Returns 1 (logged) when the script is missing or fails.
 #
-# A binding that keeps its tracker in git (local-markdown) commits the Note
-# into the runner-checkout; that commit is propagated at once, so the
-# per-dispatch re-sync doesn't wipe it.
+# A binding that keeps its tracker in git (local-markdown) commits the
+# comment into the runner-checkout; that commit is propagated at once, so
+# the per-dispatch re-sync doesn't wipe it.
+FEATURE_COMMENT_REF=""
+post_feature_comment() {
+  local feature="$1" kind="$2" body="$3"
+  local script="$HOST_REPO/docs/formann/issue-tracker/comment-on-feature"
+  FEATURE_COMMENT_REF=""
+  if [ ! -x "$script" ]; then
+    echo "[$(now_clock)] runner: no comment-on-feature script on the role surface; $kind not posted on $feature"
+    return 1
+  fi
+  local head_before head_after out
+  head_before="$(git -C "$HOST_CHECKOUT" rev-parse --verify --quiet HEAD 2>/dev/null || true)"
+  if ! out="$( cd "$HOST_REPO" && printf '%s\n' "$body" \
+      | TRACKER_CHECKOUT_DIR="$HOST_CHECKOUT" "$script" "$feature" "$kind" )"; then
+    return 1
+  fi
+  FEATURE_COMMENT_REF="$(printf '%s\n' "$out" | awk 'NF { l = $0 } END { print l }')"
+  head_after="$(git -C "$HOST_CHECKOUT" rev-parse --verify --quiet HEAD 2>/dev/null || true)"
+  if [ -n "$head_after" ] && [ "$head_after" != "$head_before" ]; then
+    if ! propagate_feature "$feature"; then
+      echo "[$(now_clock)] runner: the $kind comment's commit on $feature could not be propagated"
+    fi
+    RUNNER_LAST_PROPAGATION=""
+    RUNNER_PUBLISH_PARKED=0
+  fi
+  return 0
+}
+
+# Announce a taken claim on the tracker: a `Note` on the feature's parent
+# (post_feature_comment). Information only — the claim ref is the lock — so
+# every failure here is logged and the drain goes on.
 post_claim_note() {
   local feature="$1" how="${2:-taken}"
-  local script="$HOST_REPO/docs/formann/issue-tracker/comment-on-feature"
-  if [ ! -x "$script" ]; then
-    echo "[$(now_clock)] runner: no comment-on-feature script on the role surface; claim Note not posted"
-    return 0
-  fi
-  local head_before head_after machine body
-  head_before="$(git -C "$HOST_CHECKOUT" rev-parse --verify --quiet HEAD 2>/dev/null || true)"
+  local machine body
   local verb="Claimed"
   case "$how" in
     taken-over-from\ *) verb="Taken over from \`${how#taken-over-from }\` (its claim was stale)" ;;
@@ -5018,20 +5087,15 @@ post_claim_note() {
 ${verb} by the runner on \`${machine}\` (run \`${RUN_TS:-unknown}\`, Formann \`${RUNNER_FORMANN_SHA:-unknown}\`, judges \`${RUNNER_JUDGES_SHA:-unknown}\`). The claim is the ref \`$(claim_ref "$feature")\` on the Shared remote; this comment is information, never the lock. It is released when the drain ends.
 NOTE
 )"
-  if ! ( cd "$HOST_REPO" && printf '%s\n' "$body" \
-      | TRACKER_CHECKOUT_DIR="$HOST_CHECKOUT" "$script" "$feature" "Note" ) >/dev/null; then
+  if [ ! -x "$HOST_REPO/docs/formann/issue-tracker/comment-on-feature" ]; then
+    echo "[$(now_clock)] runner: no comment-on-feature script on the role surface; claim Note not posted"
+    return 0
+  fi
+  if ! post_feature_comment "$feature" "Note" "$body"; then
     echo "[$(now_clock)] runner: could not post the claim Note on $feature (see above); draining anyway"
     return 0
   fi
   echo "[$(now_clock)] runner: posted the claim Note on $feature"
-  head_after="$(git -C "$HOST_CHECKOUT" rev-parse --verify --quiet HEAD 2>/dev/null || true)"
-  if [ -n "$head_after" ] && [ "$head_after" != "$head_before" ]; then
-    if ! propagate_feature "$feature"; then
-      echo "[$(now_clock)] runner: the claim Note's commit could not be propagated; draining anyway"
-    fi
-    RUNNER_LAST_PROPAGATION=""
-    RUNNER_PUBLISH_PARKED=0
-  fi
   return 0
 }
 

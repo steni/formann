@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # post-drain.sh — the Post-drain phase of the AFK runner.
 #
-# Sourced by run-the-queue.sh. Once a feature has drained, and while the
-# runner still holds the feature's Claim, the runner runs the host-side steps
+# Sourced by run-the-queue.sh. Once every issue of a feature is done or
+# wontfix, and while the runner holds the feature's Claim, it runs the host-side steps
 # named in the consumer's post-drain manifest (`runner/post-drain.md`): a
 # branch review, opening a pull request — work that needs the host's
 # credentials and so cannot run in the sandbox. Steps run on the host, in the
@@ -28,21 +28,34 @@
 # or a prompt whose stream has no clean result), or `blocked (<dependency>)`
 # when a clean step's last non-blank line is `BLOCKED: <dependency>` — the
 # step contract of the post-implement phase. The phase stops at the first
-# step that does not end `ok`:
-#   - failed  → abort flag `.runner-state/aborted/<feature>/post-drain-<label>`
-#               (write_abort_flag). Dispatches are not undone. While the flag
-#               exists, later phases for the feature stop at that step.
-#   - blocked → Blocked marker `.runner-state/blocked/<feature>/post-drain`
-#               naming the step; no abort flag. The next pass re-runs the phase
-#               from that step, even when the feature has nothing to dispatch.
-# Each outcome goes on a progress line and into SUMMARY.md's "## Post-drain"
-# section (format_post_drain_section).
+# step that does not end `ok`.
 #
-# When the phase runs (maybe_run_post_drain): after a feature's per-issue loop
-# stopped with `queue-empty`, provided it dispatched in that loop (or a
-# post-drain step is pending from a Blocked pass), and a fresh snapshot says
-# the feature has drained (feature_has_drained): no eligible issue left and no
-# issue Blocked. `--issue` never runs it.
+# When the phase runs (ADR-0013): whenever the Post-drain due rule
+# (post_drain_due) says `due` — every issue of the feature is `done` or
+# `wontfix`, and neither Post-drain mark (post-drain-marks.sh) is at the
+# feature's tip — on whichever machine holds the feature's Claim, whether or
+# not this pass dispatched. A drain pass takes a finished feature with
+# nothing eligible too (drain_pass_features, drain_one_feature);
+# maybe_run_post_drain runs the phase after the feature's per-issue loop
+# stopped with `queue-empty`. `--issue` never runs it.
+#
+# How it ends, recorded as a mark at the tip so every machine sees it:
+#   - every step ok  → the ok mark at the tip as it stands when the phase
+#                      ends (a step may have pushed commits).
+#   - a step failed  → the failed mark at the tip, and a Note on the
+#                      feature's parent naming the step, its outcome and its
+#                      log.
+#   - a step Blocked → a `Blocked` comment on the feature's parent naming the
+#                      step and the dependency; no mark, so the next pass runs
+#                      the phase again. When the parent's Blocked count (the
+#                      binding's `blocked-passes`) reaches a multiple of 3,
+#                      it is treated as failed: failed mark plus Note.
+#   - interrupted, or the Claim lost → nothing recorded; the next pass runs
+#                      the phase again.
+# The phase always starts at its first step at the current tip — nothing
+# resumes from a local marker or a run folder — so every post-drain step must
+# be idempotent. Each step outcome goes on a progress line and into the
+# Post-drain section of SUMMARY.md (format_post_drain_section).
 
 # Resolved post-drain manifest (label<TAB>path pairs), set at pre-flight by
 # check_post_drain_manifest. Empty = no post-drain steps.
@@ -128,33 +141,31 @@ classify_post_drain_step() {
   fi
 }
 
-# Whether a feature has drained: its snapshot has no eligible issue and no
-# issue that is Blocked (an AFK issue at in-review with a Blocked marker,
-# which a later pass retries). Returns 0 when drained.
+# The Post-drain due rule. Pure: no I/O — everything it decides from is
+# passed in.
 #
-# Args: $1 = feature  $2 = snapshot JSON
-feature_has_drained() {
-  local feature="$1" snap="$2"
-  local nn eligible status type
-  while IFS=$'\t' read -r nn eligible status type; do
-    [ -z "$nn" ] && continue
-    [ "$eligible" = "true" ] && return 1
-    if [ "$status" = "in-review" ] && [ "$type" = "AFK" ] \
-        && [ -n "$(blocked_marker_step "$feature" "$nn")" ]; then
-      return 1
-    fi
-  done < <(jq -r '.issues[]
-    | "\(.nn)\t\(.eligible == true)\t\(.status // "-")\t\(.type // "-")"' <<<"$snap")
-  return 0
-}
-
-# The step a Blocked post-drain pass left to retry, or nothing.
-post_drain_pending_step() {
-  blocked_marker_step "$1" "post-drain"
+# Args: $1 = feature snapshot JSON  $2 = ok-mark sha  $3 = failed-mark sha
+#       $4 = the feature's tip sha (a mark is empty when absent)
+# Stdout: `due` when the feature has a tip, its snapshot lists at least one
+#         issue, every issue is `done` or `wontfix`, and neither mark is at
+#         the tip; `not-due` otherwise. (#41 adds `waiting`.)
+post_drain_due() {
+  local snap="$1" ok="${2:-}" failed="${3:-}" tip="${4:-}"
+  if [ -z "$tip" ] || [ "$ok" = "$tip" ] || [ "$failed" = "$tip" ]; then
+    echo "not-due"
+    return 0
+  fi
+  if jq -e '(.issues // []) | length > 0
+      and all(.[]; (.status // "") == "done" or (.status // "") == "wontfix")' \
+      >/dev/null 2>&1 <<<"$snap"; then
+    echo "due"
+  else
+    echo "not-due"
+  fi
 }
 
 # Host-side system prompt for prompt steps.
-RUNNER_POST_DRAIN_PREAMBLE="This is a one-shot headless post-drain step of the AFK runner: a single claude -p turn on the host, not in the sandbox, run after the feature named at the end of the prompt has drained. It runs in the consumer's repository with the host's credentials. Carry out the step within this run; do not wait to be resumed. If something outside the run that the step needs is unreachable, end your final message with the line 'BLOCKED: <dependency>'."
+RUNNER_POST_DRAIN_PREAMBLE="This is a one-shot headless post-drain step of the AFK runner: a single claude -p turn on the host, not in the sandbox, run once every issue of the feature named at the end of the prompt is done or wontfix. It runs in the consumer's repository with the host's credentials. Carry out the step within this run; do not wait to be resumed. If something outside the run that the step needs is unreachable, end your final message with the line 'BLOCKED: <dependency>'."
 
 # Run one post-drain step on the host. Writes <log_base>.stdout.jsonl (prompt)
 # or <log_base>.stdout.log (command), <log_base>.stderr.log and
@@ -212,46 +223,34 @@ record_post_drain() {
   RUN_POST_DRAIN+=("$feature|$label|$outcome|$duration|$log")
 }
 
-# Run the post-drain steps of a drained feature, in manifest order, from
-# $3 (a Blocked retry) or from the first step. Heartbeats the claim before
-# every step; a lost claim stops the phase before its next step.
+# Blocked passes on a feature's parent at which the phase is treated as
+# failed.
+POST_DRAIN_BLOCKED_PASS_LIMIT=3
+
+# Run the post-drain steps of a finished feature, in manifest order, from the
+# first step, then record how the phase ended (post_drain_conclude).
+# Heartbeats the claim before every step; a lost claim stops the phase
+# before its next step.
 #
-# Args: $1 = feature  $2 = run or pass dir  $3 = start label (optional)
+# Args: $1 = feature  $2 = run or pass dir
 # Return: always 0 — a post-drain outcome never stops the drain.
 run_post_drain_phase() {
-  local feature="$1" run_dir="$2" start_label="${3:-}"
+  local feature="$1" run_dir="$2"
   [ -n "$RESOLVED_POST_DRAIN" ] || return 0
-
-  if [ -n "$start_label" ] \
-      && ! printf '%s\n' "$RESOLVED_POST_DRAIN" | cut -f1 | grep -Fxq -- "$start_label"; then
-    echo "[$(now_clock)] runner: Blocked post-drain step '$start_label' is no longer in the manifest; running the whole post-drain phase for $feature"
-    start_label=""
-  fi
 
   local log_dir="$run_dir"
   [ "${RUN_LOG_LAYOUT:-flat}" = "nested" ] && log_dir="$run_dir/$feature"
   mkdir -p "$log_dir"
 
-  echo "[$(now_clock)] runner: $feature has drained — post-drain phase${start_label:+ (retrying from $start_label)}"
+  echo "[$(now_clock)] runner: $feature is finished — post-drain phase"
 
-  local label path idx=0 skipping=0
-  [ -n "$start_label" ] && skipping=1
+  local label path idx=0 ended="ok" ended_step="" ended_outcome="" ended_log="" ended_dep=""
   while IFS=$'\t' read -r label path; do
     [ -z "$label" ] && continue
     idx=$((idx + 1))
-    if [ "$skipping" -eq 1 ]; then
-      [ "$label" = "$start_label" ] || continue
-      skipping=0
-    fi
-
-    local flag="$HOST_ABORT_DIR/$feature/post-drain-$label"
-    if [ -f "$flag" ]; then
-      echo "[$(now_clock)] runner: post-drain step $label for $feature is aborted — rm $flag to resume; stopping the post-drain phase"
-      record_post_drain "$feature" "$label" "skipped (aborted)" 0 ""
-      break
-    fi
 
     if [ "${RUNNER_INTERRUPTED:-0}" -eq 1 ]; then
+      ended="interrupted"
       break
     fi
 
@@ -259,6 +258,7 @@ run_post_drain_phase() {
     if [ -n "${RUNNER_CLAIM_LOST:-}" ]; then
       echo "[$(now_clock)] runner: '$feature' was $RUNNER_CLAIM_LOST; not running post-drain step $label"
       record_post_drain "$feature" "$label" "not run ($RUNNER_CLAIM_LOST)" 0 ""
+      ended="claim-lost"
       break
     fi
 
@@ -274,60 +274,170 @@ run_post_drain_phase() {
     if [ "${RUNNER_INTERRUPTED:-0}" -eq 1 ]; then
       format_progress_outcome "$(now_clock)" "$feature" "post-drain:$label" "interrupted" "$duration"
       record_post_drain "$feature" "$label" "interrupted" "$duration" "$rel_log"
+      ended="interrupted"
       break
     fi
 
     outcome="$(classify_post_drain_step "$rc" "$POST_DRAIN_STEP_DEP")"
     case "$outcome" in
       ok)
-        clear_blocked_marker "$feature" "post-drain"
         format_progress_outcome "$(now_clock)" "$feature" "post-drain:$label" "ok" "$duration"
         record_post_drain "$feature" "$label" "ok" "$duration" "$rel_log"
         ;;
       blocked)
-        write_blocked_marker "$feature" "post-drain" "$label" "$POST_DRAIN_STEP_DEP"
         format_progress_outcome "$(now_clock)" "$feature" "post-drain:$label" "blocked ($POST_DRAIN_STEP_DEP)" "$duration"
         record_post_drain "$feature" "$label" "blocked ($POST_DRAIN_STEP_DEP)" "$duration" "$rel_log"
+        ended="blocked"; ended_step="$label"; ended_dep="$POST_DRAIN_STEP_DEP"
+        ended_outcome="blocked ($POST_DRAIN_STEP_DEP)"; ended_log="$POST_DRAIN_STEP_LOG"
         break
         ;;
       *)
-        clear_blocked_marker "$feature" "post-drain"
-        write_abort_flag "$feature" "post-drain-$label" "post-drain:$label" "$rc" "$POST_DRAIN_STEP_LOG"
         format_progress_outcome "$(now_clock)" "$feature" "post-drain:$label" "failed (exit $rc)" "$duration"
-        echo "[$(now_clock)] runner: post-drain step $label failed for $feature — abort flag $flag; stopping the post-drain phase"
+        echo "[$(now_clock)] runner: post-drain step $label failed for $feature; stopping the post-drain phase"
         record_post_drain "$feature" "$label" "failed (exit $rc)" "$duration" "$rel_log"
+        ended="failed"; ended_step="$label"; ended_outcome="failed (exit $rc)"; ended_log="$POST_DRAIN_STEP_LOG"
         break
         ;;
     esac
   done <<< "$RESOLVED_POST_DRAIN"
+
+  post_drain_conclude "$feature" "$ended" "$ended_step" "$ended_outcome" "$ended_log" "$ended_dep"
   return 0
 }
 
-# Number of dispatch records for a feature (RUN_DISPATCHES).
-feature_dispatch_count() {
-  local feature="$1" n=0 rec
-  if [ "${#RUN_DISPATCHES[@]}" -gt 0 ]; then
-    for rec in "${RUN_DISPATCHES[@]}"; do
-      [ "${rec%%|*}" = "$feature" ] && n=$((n + 1))
-    done
+# Record how the phase ended (see the header): the ok mark, the failed mark
+# plus a Note, or a Blocked comment (a failure at every third Blocked pass).
+# Interrupted or claim-lost: nothing.
+#
+# Args: $1 = feature  $2 = ok | failed | blocked | interrupted | claim-lost
+#       $3 = step  $4 = step outcome  $5 = step log  $6 = Blocked dependency
+post_drain_conclude() {
+  local feature="$1" ended="$2" step="${3:-}" outcome="${4:-}" log="${5:-}" dep="${6:-}"
+  case "$ended" in
+    ok)
+      post_drain_set_mark ok "$feature" >/dev/null
+      ;;
+    failed)
+      post_drain_fail "$feature" "$step" "$outcome" "$log"
+      ;;
+    blocked)
+      local passes=""
+      if post_feature_comment "$feature" "Blocked" "$(post_drain_blocked_body "$step" "$dep" "$log")"; then
+        if passes="$(read_blocked_passes "$FEATURE_COMMENT_REF")"; then
+          echo "[$(now_clock)] runner: post-drain step $step for $feature is Blocked on $dep (Blocked pass $passes on the feature's parent)"
+        else
+          echo "[$(now_clock)] runner: could not count the Blocked passes on $feature's parent (see above); the next pass runs the phase again"
+          passes=""
+        fi
+      else
+        echo "[$(now_clock)] runner: could not post the Blocked comment on $feature (see above); the next pass runs the phase again"
+      fi
+      if [ -n "$passes" ] && [ "$passes" -gt 0 ] \
+          && [ $(( passes % POST_DRAIN_BLOCKED_PASS_LIMIT )) -eq 0 ]; then
+        post_drain_fail "$feature" "$step" "$outcome on $POST_DRAIN_BLOCKED_PASS_LIMIT consecutive passes" "$log"
+      fi
+      ;;
+    *)
+      echo "[$(now_clock)] runner: post-drain phase for $feature ended $ended; nothing recorded — the next pass runs it again from its first step"
+      ;;
+  esac
+}
+
+# A failed phase: the failed mark at the tip, then a Note on the parent
+# naming the step, its outcome and its log.
+post_drain_fail() {
+  local feature="$1" step="$2" outcome="$3" log="$4" tip body
+  tip="$(post_drain_set_mark failed "$feature")"
+  body="$(cat <<NOTE
+> *This was generated by the AFK runner.*
+
+The post-drain phase failed on the runner on \`$(claim_machine)\` (run \`${RUN_TS:-unknown}\`).
+
+- Step: \`$step\`
+- Outcome: $outcome
+- Tip: \`${tip:-unknown}\`
+- Log: \`${log#$HOST_REPO/}\`
+
+The failed mark \`$(post_drain_mark_ref failed "$feature")\` is at that tip, so the phase does not run again until the feature's branch moves or the mark is deleted (\`$(post_drain_mark_delete_recipe failed "$feature")\`).
+NOTE
+)"
+  if post_feature_comment "$feature" "Note" "$body"; then
+    echo "[$(now_clock)] runner: posted the post-drain failure Note on $feature"
+  else
+    echo "[$(now_clock)] runner: could not post the post-drain failure Note on $feature (see above)"
   fi
-  echo "$n"
+}
+
+# The body of the Blocked comment a Blocked step posts on the parent.
+post_drain_blocked_body() {
+  local step="$1" dep="$2" log="$3"
+  cat <<BODY
+> *This was generated by the AFK runner.*
+
+Post-drain step \`$step\` ended Blocked on the runner on \`$(claim_machine)\` (run \`${RUN_TS:-unknown}\`).
+
+- Dependency: $dep
+- Log: \`${log#$HOST_REPO/}\`
+
+The next pass runs the post-drain phase again from its first step; every ${POST_DRAIN_BLOCKED_PASS_LIMIT}rd Blocked pass is treated as a failure.
+BODY
+}
+
+# Set a mark at the feature's tip as it stands now. Prints the tip (empty
+# when there is none) on stdout; logs on stderr. Never fails the drain.
+# Args: $1 = ok | failed  $2 = feature
+post_drain_set_mark() {
+  local kind="$1" feature="$2" tip=""
+  if ! tip="$(post_drain_tip "$feature")" || [ -z "$tip" ]; then
+    echo "[$(now_clock)] runner: could not read the tip of $feature; the $kind mark is not set" >&2
+    return 0
+  fi
+  post_drain_marks_set "$kind" "$feature" "$tip" || true
+  case "$POST_DRAIN_MARKS_RESULT" in
+    set)
+      echo "[$(now_clock)] runner: post-drain $kind mark of $feature set at ${tip:0:12} ($(post_drain_mark_ref "$kind" "$feature"))" >&2 ;;
+    lease-refused)
+      echo "[$(now_clock)] runner: the $kind mark of $feature was moved by another writer; left as it is" >&2 ;;
+    *)
+      echo "[$(now_clock)] runner: could not set the $kind mark of $feature (see above)" >&2 ;;
+  esac
+  printf '%s\n' "$tip"
+}
+
+# The due rule's verdict for a feature now: reads its tip and marks (I/O),
+# then applies post_drain_due to the given snapshot. Leaves the marks it
+# read as the lease for a later set.
+#
+# Args: $1 = feature  $2 = snapshot JSON
+# Stdout: due | not-due. Returns 1 when the tip or marks can't be read.
+post_drain_due_now() {
+  local feature="$1" snap="$2" tip
+  tip="$(post_drain_tip "$feature")" || return 1
+  post_drain_marks_read "$feature" >/dev/null || return 1
+  post_drain_due "$snap" "$POST_DRAIN_MARK_OK_SEEN" "$POST_DRAIN_MARK_FAILED_SEEN" "$tip"
 }
 
 # After a feature's per-issue loop: run the post-drain phase when the loop
-# stopped on an empty queue, it dispatched (or a Blocked post-drain step is
-# pending), and the feature has drained. Called while the claim is held.
+# stopped on an empty queue and the due rule says `due` — whether or not
+# this pass dispatched. Called while the claim is held. A tip that already
+# carries a mark is settled before any snapshot is taken.
 #
-# Args: $1 = feature  $2 = the loop's stop reason  $3 = dispatch count before
-#       the loop (feature_dispatch_count)
+# Args: $1 = feature  $2 = the loop's stop reason
 maybe_run_post_drain() {
-  local feature="$1" stop_reason="$2" before="$3"
+  local feature="$1" stop_reason="$2"
   [ -n "$RESOLVED_POST_DRAIN" ] || return 0
   [ "$stop_reason" = "queue-empty" ] || return 0
   [ "${RUNNER_INTERRUPTED:-0}" -eq 1 ] && return 0
-  local pending
-  pending="$(post_drain_pending_step "$feature")"
-  if [ "$(feature_dispatch_count "$feature")" -le "$before" ] && [ -z "$pending" ]; then
+  local tip
+  if ! tip="$(post_drain_tip "$feature")" || ! post_drain_marks_read "$feature" >/dev/null; then
+    echo "[$(now_clock)] runner: could not read the tip or the post-drain marks of $feature; post-drain phase not run"
+    return 0
+  fi
+  if [ -z "$tip" ]; then
+    echo "[$(now_clock)] runner: $feature has no branch; post-drain phase not run"
+    return 0
+  fi
+  if [ "$POST_DRAIN_MARK_OK_SEEN" = "$tip" ] || [ "$POST_DRAIN_MARK_FAILED_SEEN" = "$tip" ]; then
     return 0
   fi
   local snap
@@ -335,11 +445,11 @@ maybe_run_post_drain() {
     echo "[$(now_clock)] runner: tracker-snapshot failed for $feature; post-drain phase not run"
     return 0
   fi
-  if ! feature_has_drained "$feature" "$snap"; then
-    echo "[$(now_clock)] runner: $feature has not drained (an issue is still eligible or Blocked); post-drain phase not run"
+  if [ "$(post_drain_due "$snap" "$POST_DRAIN_MARK_OK_SEEN" "$POST_DRAIN_MARK_FAILED_SEEN" "$tip")" != "due" ]; then
+    echo "[$(now_clock)] runner: $feature is not finished (an issue is not done or wontfix); post-drain phase not run"
     return 0
   fi
-  run_post_drain_phase "$feature" "${RUN_PASS_DIR:-$RUN_DIR}" "$pending"
+  run_post_drain_phase "$feature" "${RUN_PASS_DIR:-$RUN_DIR}"
 }
 
 # SUMMARY.md's "## Post-drain" section, from RUN_POST_DRAIN. Prints nothing

@@ -448,9 +448,40 @@ A claim left behind by a runner that was killed outright (`kill -9`, power loss)
 | `RUNNER_CLAIM_STALE_AFTER` | `1800` | Seconds after its last heartbeat at which a claim is stale and may be taken over. |
 | `RUNNER_CLAIM_HEARTBEAT_SECONDS` | stale-after / 3 (`600`) | Seconds between heartbeats while a dispatch runs. Pre-flight (`claim-knobs`) refuses a value that is not a whole number above 0, or not below `RUNNER_CLAIM_STALE_AFTER`. |
 
+## Module map
+
+This map covers the modules on the branch-end path; the rest of the runner is described section by section below.
+
+### Modules
+
+| Module | Responsibility | Look for |
+| ------ | -------------- | -------- |
+| Drain loop (`run-the-queue.sh`) | Picks the features a pass walks — those with an eligible issue, a pending Blocked re-walk, or (with post-drain steps) a tip carrying neither Post-drain mark — then per feature syncs, snapshots, claims and runs the per-issue loop. Takes a finished feature with nothing to dispatch when it is due. | `run_drain`, `drain_pass_features`, `post_drain_candidates`, `drain_one_feature`, `drain_claimed_feature`, `run_claimed_loop` |
+| Claim (`claim.sh`) | The runner's exclusive hold on the feature it drains: a ref on the Shared remote, taken, heart-beaten and released with lease pushes. | `claim take\|heartbeat\|release`, `claim_verdict` |
+| Post-drain due rule (`post-drain.sh`) | Decides whether a feature's branch end is due: every issue `done` or `wontfix` and neither mark at the tip. | `post_drain_due` (pure), `post_drain_due_now` (reads tip and marks, then applies it) |
+| Post-drain mark store (`post-drain-marks.sh`) | Reads and writes the ok and failed marks (`refs/formann/post-drained/<feature>`, `refs/formann/post-drain-failed/<feature>`) at a tip; reads a feature's tip; lists every tip and mark in one read. | `post_drain_marks read\|set`, `post_drain_tip`, `post_drain_refs_listing` |
+| Post-drain phase (`post-drain.sh`) | Runs the manifest's steps on the host from the first one, then records how it ended: ok mark; failed mark plus a Note; a Blocked comment (failed at the third Blocked pass). | `maybe_run_post_drain`, `run_post_drain_phase`, `post_drain_conclude` |
+| Tracker comments (`run-the-queue.sh`) | Posts a comment of a kind on a feature's parent through the binding's `comment-on-feature`, propagating a git-tracked binding's commit. | `post_feature_comment`, `post_claim_note`, `read_blocked_passes` |
+
+### Primary flow (a branch end)
+
+1. `drain_pass_features` asks the binding which features have an eligible issue, and `post_drain_candidates` reads every tip and mark in one `post_drain_refs_listing`; the pass walks the union.
+2. `drain_one_feature` snapshots a feature; with nothing to dispatch it goes on only when `post_drain_due_now` says `due`. It takes the Claim.
+3. The per-issue loop runs (and finds nothing, or drains what is left); `maybe_run_post_drain` re-reads the tip and marks, and on `due` calls `run_post_drain_phase`.
+4. The phase runs each step from the first; `post_drain_conclude` sets a mark through `post_drain_marks set` at the tip as it stands, and posts a Note or a Blocked comment through `post_feature_comment`.
+5. `drain_one_feature` releases the Claim.
+
+### Structural claims
+
+| Claim | Check |
+| ----- | ----- |
+| The Post-drain due rule is pure: no I/O. | `tests/post-drain.bats`: "post_drain_due — does no I/O" (runs it with only `jq` on `PATH`, no repo, an empty working directory). |
+| `post-drain-marks.sh` is the only writer of the post-drain refs. | `tests/post-drain-marks.bats`: "structural claim — post-drain-marks.sh is the only writer of the post-drain refs" (and its red counterpart). |
+| Every mark write is a lease on the value last read; a refused lease is never forced. | `tests/post-drain-marks.bats`: "set — a refused lease … is reported, and the other writer's value stands"; the forced-push half is `unchecked`. |
+
 ## Post-drain phase
 
-Once a feature has drained — no eligible issue left and none Blocked — and while the runner still holds the feature's Claim, it runs the host-side steps listed in `runner/post-drain.md`, then releases the claim. Use it for end-of-feature work that needs the host's credentials: reviewing the whole branch, opening a pull request. The manifest is optional; without it nothing changes.
+When every issue of a feature is `done` or `wontfix`, the runner that holds the feature's Claim runs the host-side steps listed in `runner/post-drain.md`, then releases the claim. Use it for end-of-feature work that needs the host's credentials: reviewing the whole branch, opening a pull request. The manifest is optional; without it nothing changes.
 
 ```
 # runner/post-drain.md — same line format as runner/manifest.md
@@ -460,9 +491,23 @@ scripts/open-pr.sh      # a command: run with the feature slug as $1 (and $RUNNE
 
 - Entries resolve against `runner/` first, then the framework's `steps/`; an invalid entry is `preflight-abort: post-drain-manifest`.
 - Steps run on the host, never in the sandbox, in the consumer root with the host's environment (git, `gh`, keychain). A command must be executable. `RUNNER_HOST_CLAUDE` names the `claude` binary for prompt steps (default `claude` on `PATH`).
-- The phase runs after a loop (drain mode or `--feature`) that dispatched and ended with an empty queue; `--issue` never runs it.
-- A step ends `ok`, `failed (exit N)` or — when its last non-blank output line is `BLOCKED: <dependency>` — `blocked (<dependency>)`. The phase stops at the first step that isn't `ok`. A failure writes the abort flag `.runner-state/aborted/<feature>/post-drain-<label>` (remove it to let the step run again); a Blocked step is re-run from where it stopped on the next pass.
+- **Trigger: the due rule.** A feature is *due* when every issue is `done` or `wontfix` and neither Post-drain mark (below) is at its tip — the head of its branch on the Shared remote. It does not matter whether this pass dispatched anything, or on which machine the last issue was done: every drain pass also considers each active feature with nothing eligible whose tip carries neither mark (tips and marks for all of them come from one `git ls-remote` of the Shared remote, so only those candidates are snapshotted), and a due one is claimed and ended. `--feature` runs the phase after its loop whenever the feature is due. `--issue` never runs it.
+- A step ends `ok`, `failed (exit N)` or — when its last non-blank output line is `BLOCKED: <dependency>` — `blocked (<dependency>)`. The phase stops at the first step that isn't `ok`.
+- **Marks.** How the phase ended is recorded on the Shared remote, as a ref at the feature's tip, so every machine sees it:
+  - every step `ok` → `refs/formann/post-drained/<feature>` (the ok mark) at the tip as it stands when the phase ends;
+  - a step `failed` → `refs/formann/post-drain-failed/<feature>` (the failed mark) at the tip, plus a Note on the feature's parent naming the step, its outcome and its log;
+  - a step `blocked` → a `Blocked` comment on the feature's parent naming the step and the dependency, and no mark: the next pass runs the phase again. When the parent's Blocked count (the binding's `blocked-passes`) reaches 3 — the third consecutive Blocked pass — it is treated as `failed`: failed mark plus Note.
+
+  A feature at either mark is not due until its tip moves (a new commit — the maintainer's fix, a reworked issue — makes it due again) or the mark is deleted. Every mark write is a lease push on the value last read, like the Claim's; a refused lease is reported and left alone. Without a Shared remote the marks are local refs of the same names in the host repo, and the tip is the host's `refs/heads/<feature>` (or the parking ref when there is no such branch). To read and delete them:
+
+  ```sh
+  git ls-remote origin 'refs/formann/post-drain*'                         # read both marks of every feature
+  git push origin :refs/formann/post-drain-failed/<feature>               # retry a failed branch end at the same tip
+  git push origin :refs/formann/post-drained/<feature>                    # run a finished branch end again
+  ```
+- **Restarts.** The phase always starts at its first step at the current tip; nothing resumes from a local marker or a run folder. A phase interrupted (Ctrl-C, a lost claim) records nothing, so the next pass — on this machine or another — runs it again from the top. **Every post-drain step must therefore be idempotent**: a restart must not re-file findings already filed, open a second pull request, or redo work already on the tip.
 - Every step gets a progress line and a row in `SUMMARY.md`'s `## Post-drain` section.
+- **Known gap.** A single-issue feature whose parent the AFK gate closed drops out of `tracker-snapshot --list`, so after a restart this path does not find it (the pass that finished its issue still ends it).
 
 See "The post-drain phase" in `afk-runner.md` for the full contract.
 

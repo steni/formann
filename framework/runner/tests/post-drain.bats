@@ -1,9 +1,10 @@
 #!/usr/bin/env bats
 bats_require_minimum_version 1.5.0
 
-# Post-drain phase (post-drain.sh, #10): host-side steps named in the
-# consumer's `runner/post-drain.md`, run once a feature has drained, while
-# the runner still holds the feature's Claim.
+# Post-drain phase (post-drain.sh, #10, #38): host-side steps named in the
+# consumer's `runner/post-drain.md`, run while the runner holds the feature's
+# Claim, whenever the Post-drain due rule says the finished feature is due;
+# how the phase ended is a Post-drain mark on the Shared remote.
 #
 # The drain is driven through the real drain_one_feature / run_claimed_loop
 # with a bare repository as the Shared remote; the per-issue loop, the
@@ -49,6 +50,30 @@ setup() {
   RUN_POST_DRAIN=()
   RUN_STOP_REASON=""
   RESOLVED_POST_DRAIN=""
+  DISCOVERY_JSON='["alpha"]'
+  POST_DRAIN_MARKS_SEEN_FEATURE=""
+
+  # The feature's branch on the Shared remote: its tip is what a mark records.
+  git -C "$HOST_REPO" push --quiet origin main:refs/heads/alpha
+
+  # The binding's comment verbs: comment-on-feature appends the comment to
+  # $COMMENTS_FILE and prints the parent's ref; blocked-passes counts the
+  # parent's Blocked comments there.
+  COMMENTS_FILE="$BATS_TEST_TMPDIR/comments"
+  : >"$COMMENTS_FILE"
+  local bdir="$HOST_REPO/docs/formann/issue-tracker"
+  mkdir -p "$bdir"
+  cat >"$bdir/comment-on-feature" <<SCRIPT
+#!/usr/bin/env bash
+{ printf '=== %s %s\n' "\$1" "\$2"; cat; } >>'$COMMENTS_FILE'
+echo '#7'
+SCRIPT
+  cat >"$bdir/blocked-passes" <<SCRIPT
+#!/usr/bin/env bash
+[ "\$1" = "#7" ] || { echo "blocked-passes: unexpected ref \$1" >&2; exit 2; }
+grep -c '^=== alpha Blocked\$' '$COMMENTS_FILE' || true
+SCRIPT
+  chmod +x "$bdir/comment-on-feature" "$bdir/blocked-passes"
 
   # Recorded by the step stand-ins.
   STEPS_FILE="$BATS_TEST_TMPDIR/steps"
@@ -116,6 +141,46 @@ post_drain_manifest() {
 
 claim_sha() {
   git -C "$SHARED" rev-parse --verify --quiet "refs/formann/claims/$1" || true
+}
+
+# The feature's tip and its marks on the Shared remote.
+alpha_tip() {
+  git -C "$SHARED" rev-parse --verify --quiet refs/heads/alpha || true
+}
+ok_mark() {
+  git -C "$SHARED" rev-parse --verify --quiet "refs/formann/post-drained/$1" || true
+}
+failed_mark() {
+  git -C "$SHARED" rev-parse --verify --quiet "refs/formann/post-drain-failed/$1" || true
+}
+
+# A new commit on the feature branch of the Shared remote (the maintainer's
+# fix, a reworked issue). Prints the new tip.
+advance_tip() {
+  local new
+  new="$(git -C "$HOST_REPO" -c user.email=t@t -c user.name=t commit-tree \
+    -p "$(alpha_tip)" -m "next" "$(git -C "$HOST_REPO" mktree </dev/null)")"
+  git -C "$HOST_REPO" push --quiet origin "$new:refs/heads/alpha"
+  printf '%s\n' "$new"
+}
+
+# Comments of a kind posted on alpha's parent.
+comments_of() {
+  grep -c "^=== alpha $1\$" "$COMMENTS_FILE" || true
+}
+
+# One drain pass with the binding listing no feature as eligible: whatever
+# runs, runs because the finished feature is due. The gate snapshot shows
+# the plain $SNAP_FILE (every issue done).
+finished_pass() {
+  GATE_ELIGIBLE=0
+  LOOP_DISPATCHES=0
+  RUN_FEATURE_OUTCOMES=()
+  RUN_POST_DRAIN=()
+  RUN_STOP_REASON=""
+  eligible_features_check() { ELIGIBLE_FEATURES_JSON='[]'; }
+  : >"$SNAP_CALLS_FILE"
+  run_drain
 }
 
 # === Manifest resolution =====================================================
@@ -215,14 +280,69 @@ claim_sha() {
   [ "$(post_drain_step_kind /a/open-pr.sh)" = "command" ]
 }
 
-@test "feature_has_drained — no eligible issue and none Blocked" {
-  local done_snap='{"issues":[{"nn":"01","status":"done","type":"AFK","eligible":false},{"nn":"02","status":"in-review","type":"AFK","eligible":false}]}'
-  feature_has_drained alpha "$done_snap"
-  # An eligible issue (even one with an abort flag) means not drained.
-  ! feature_has_drained alpha '{"issues":[{"nn":"01","status":"ready-for-agent","type":"AFK","eligible":true}]}'
-  # A Blocked issue (marker, still in-review) means not drained.
-  write_blocked_marker alpha 02 review preview
-  ! feature_has_drained alpha "$done_snap"
+# === The due rule ============================================================
+
+snap_of() {
+  local s out='{"feature":"alpha","issues":['
+  local sep=""
+  for s in "$@"; do
+    out="$out$sep{\"ref\":\"#1\",\"nn\":\"01\",\"status\":\"$s\",\"type\":\"AFK\",\"eligible\":false}"
+    sep=","
+  done
+  printf '%s]}' "$out"
+}
+
+@test "post_drain_due — every issue done or wontfix and no mark at the tip: due" {
+  [ "$(post_drain_due "$(snap_of done)" "" "" T1)" = "due" ]
+  [ "$(post_drain_due "$(snap_of done wontfix done)" "" "" T1)" = "due" ]
+  [ "$(post_drain_due "$(snap_of wontfix)" "" "" T1)" = "due" ]
+}
+
+@test "post_drain_due — any issue not done or wontfix: not-due" {
+  local st
+  for st in in-review ready-for-agent ready-for-human needs-info needs-triage; do
+    [ "$(post_drain_due "$(snap_of done "$st")" "" "" T1)" = "not-due" ] || fail "$st should be not-due"
+    [ "$(post_drain_due "$(snap_of "$st")" "" "" T1)" = "not-due" ] || fail "$st alone should be not-due"
+  done
+}
+
+@test "post_drain_due — the ok mark or the failed mark at the tip: not-due" {
+  [ "$(post_drain_due "$(snap_of done)" T1 "" T1)" = "not-due" ]
+  [ "$(post_drain_due "$(snap_of done)" "" T1 T1)" = "not-due" ]
+  [ "$(post_drain_due "$(snap_of done)" T1 T1 T1)" = "not-due" ]
+}
+
+@test "post_drain_due — either mark at an older tip: due" {
+  [ "$(post_drain_due "$(snap_of done)" T0 "" T1)" = "due" ]
+  [ "$(post_drain_due "$(snap_of done)" "" T0 T1)" = "due" ]
+  [ "$(post_drain_due "$(snap_of done)" T0 T0 T1)" = "due" ]
+}
+
+@test "post_drain_due — no tip, or no issue at all: not-due" {
+  [ "$(post_drain_due "$(snap_of done)" "" "" "")" = "not-due" ]
+  [ "$(post_drain_due '{"feature":"alpha","issues":[]}' "" "" T1)" = "not-due" ]
+}
+
+@test "post_drain_due — does no I/O: no git, no tracker, no file, from anywhere" {
+  local bin="$BATS_TEST_TMPDIR/only-jq"
+  mkdir -p "$bin"
+  ln -s "$(command -v jq)" "$bin/jq"
+  local empty="$BATS_TEST_TMPDIR/empty"
+  mkdir -p "$empty"
+  # Only jq (to parse the snapshot it is given) on PATH, an empty working
+  # directory, no host repo, no remote: the verdicts are unchanged.
+  run env -i PATH="$bin" HOME="$empty" /bin/bash -c "
+    cd '$empty'
+    source '${RUNNER_SCRIPT%/*}/post-drain.sh'
+    HOST_REPO=/nonexistent
+    post_drain_due '$(snap_of done wontfix)' '' '' T1
+    post_drain_due '$(snap_of done in-review)' '' '' T1
+    post_drain_due '$(snap_of done)' T1 '' T1
+    post_drain_due '$(snap_of done)' T0 T0 T1
+  "
+  assert_success
+  assert_output "$(printf 'due\nnot-due\nnot-due\ndue')"
+  [ -z "$(ls -A "$empty")" ]
 }
 
 # === The phase in the drain ==================================================
@@ -310,9 +430,11 @@ drain_outcome() {
   consumer_step "step.sh" "echo ran >>'$STEPS_FILE'"
   post_drain_manifest "step.sh"
 
+  git -C "$HOST_REPO" branch alpha main
   run_claimed_loop
 
   [ "$(cat "$STEPS_FILE")" = "ran" ]
+  [ "$(git -C "$HOST_REPO" rev-parse refs/formann/post-drained/alpha)" = "$(git -C "$HOST_REPO" rev-parse alpha)" ]
 }
 
 @test "post-drain (#10): no manifest — no step, no Post-drain section, drained as before" {
@@ -341,7 +463,7 @@ drain_outcome() {
   [ ! -s "$LOOPS_FILE" ]
 }
 
-@test "post-drain (#10): a loop that dispatched nothing does not run the phase" {
+@test "post-drain (#38): loop mode runs the phase of a finished feature even when the loop dispatched nothing" {
   consumer_step "step.sh" "echo ran >>'$STEPS_FILE'"
   post_drain_manifest "step.sh"
   RUN_MODE="loop"; RUN_LOG_LAYOUT="flat"; TARGET_FEATURE="alpha"; GATE_ELIGIBLE=0
@@ -349,26 +471,30 @@ drain_outcome() {
 
   run_claimed_loop
 
-  [ ! -s "$STEPS_FILE" ]
+  [ "$(cat "$STEPS_FILE")" = "ran" ]
+  [ "$(ok_mark alpha)" = "$(alpha_tip)" ]
+  [ -z "$(claim_sha alpha)" ]
+
+  # The next loop pass finds the ok mark at the tip: no step, no snapshot.
+  : >"$SNAP_CALLS_FILE"
+  run_claimed_loop
+  [ "$(cat "$STEPS_FILE")" = "ran" ]
+  [ ! -s "$SNAP_CALLS_FILE" ]
 }
 
-@test "post-drain (#10): a feature that has not drained (eligible issue left, or one Blocked) does not run the phase" {
+@test "post-drain (#38): an unfinished feature (an issue not done or wontfix) does not run the phase" {
   consumer_step "step.sh" "echo ran >>'$STEPS_FILE'"
   post_drain_manifest "step.sh"
-  snapshot_with '[{"ref":"#2","nn":"02","status":"ready-for-agent","type":"AFK","blocked_by":[],"eligible":true}]'
-  # The eligible issue carries an abort flag, so the loop stopped queue-empty.
-  mkdir -p "$HOST_ABORT_DIR/alpha"; : >"$HOST_ABORT_DIR/alpha/02"
-  RUN_DISPATCHES=("alpha|01|#1|done|5|||")
-  maybe_run_post_drain alpha queue-empty 0
+  local st
+  for st in ready-for-agent in-review ready-for-human needs-info needs-triage; do
+    snapshot_with "[{\"ref\":\"#1\",\"nn\":\"01\",\"status\":\"done\",\"type\":\"AFK\",\"blocked_by\":[],\"eligible\":false},{\"ref\":\"#2\",\"nn\":\"02\",\"status\":\"$st\",\"type\":\"AFK\",\"blocked_by\":[],\"eligible\":false}]"
+    maybe_run_post_drain alpha queue-empty
+  done
   [ ! -s "$STEPS_FILE" ]
+  [ -z "$(ok_mark alpha)" ]
 
-  snapshot_with '[{"ref":"#2","nn":"02","status":"in-review","type":"AFK","blocked_by":[],"eligible":false}]'
-  write_blocked_marker alpha 02 review preview
-  maybe_run_post_drain alpha queue-empty 0
-  [ ! -s "$STEPS_FILE" ]
-
-  clear_blocked_marker alpha 02
-  maybe_run_post_drain alpha queue-empty 0
+  snapshot_with '[{"ref":"#1","nn":"01","status":"done","type":"AFK","blocked_by":[],"eligible":false},{"ref":"#2","nn":"02","status":"wontfix","type":"AFK","blocked_by":[],"eligible":false}]'
+  maybe_run_post_drain alpha queue-empty
   [ "$(cat "$STEPS_FILE")" = "ran" ]
 }
 
@@ -383,17 +509,22 @@ drain_outcome() {
   [ ! -s "$STEPS_FILE" ]
 }
 
-@test "post-drain (#10): a failing step writes an abort flag keyed by its label, stops the phase, and undoes nothing" {
+@test "post-drain (#38): a failing step sets the failed mark at the tip, posts one Note naming the step and the log, stops the phase, and undoes nothing" {
   consumer_step "review-branch.sh" "echo reviewing; exit 4"
   consumer_step "open-pr.sh" "echo ran >>'$STEPS_FILE'"
   post_drain_manifest "review-branch.sh" "open-pr.sh"
 
   drain_one_feature alpha
 
-  local flag="$HOST_ABORT_DIR/alpha/post-drain-review-branch.sh"
-  [ -f "$flag" ]
-  grep -qx 'dispatch: post-drain:review-branch.sh' "$flag"
-  grep -qx 'exit: 4' "$flag"
+  [ "$(failed_mark alpha)" = "$(alpha_tip)" ]
+  [ -z "$(ok_mark alpha)" ]
+  [ "$(comments_of Note)" = "1" ]
+  grep -qF 'Step: `review-branch.sh`' "$COMMENTS_FILE"
+  grep -qF 'Outcome: failed (exit 4)' "$COMMENTS_FILE"
+  grep -qF "alpha/post-drain-01-review-branch.sh.stdout.log" "$COMMENTS_FILE"
+  grep -qF "Tip: \`$(alpha_tip)\`" "$COMMENTS_FILE"
+  # No local abort flag remembers it.
+  [ ! -e "$HOST_ABORT_DIR/alpha/post-drain-review-branch.sh" ]
   [ ! -s "$STEPS_FILE" ]
   [[ "${RUN_POST_DRAIN[0]}" == "alpha|review-branch.sh|failed (exit 4)|"* ]]
   [ "${#RUN_POST_DRAIN[@]}" = "1" ]
@@ -401,25 +532,41 @@ drain_outcome() {
   [ "${#RUN_DISPATCHES[@]}" = "1" ]
   [ "$(drain_outcome alpha)" = "drained" ]
   [ -z "$(claim_sha alpha)" ]
-
-  # While the flag exists, a later phase stops at that step.
-  RUN_POST_DRAIN=()
-  drain_one_feature alpha
-  [ ! -s "$STEPS_FILE" ]
-  [ "${RUN_POST_DRAIN[0]}" = "alpha|review-branch.sh|skipped (aborted)|0|" ]
 }
 
-@test "post-drain (#10): a non-executable command step fails with an abort flag" {
+@test "post-drain (#38): a feature at its failed mark is not due; deleting the mark makes it due without a new commit" {
+  consumer_step "review-branch.sh" "echo try >>'$STEPS_FILE'; exit 4"
+  post_drain_manifest "review-branch.sh"
+
+  finished_pass
+  [ "$(cat "$STEPS_FILE")" = "try" ]
+  [ "$(failed_mark alpha)" = "$(alpha_tip)" ]
+
+  # The next pass does not even snapshot it.
+  finished_pass
+  [ "$RUN_STOP_REASON" = "nothing-eligible" ]
+  [ ! -s "$SNAP_CALLS_FILE" ]
+  [ "$(cat "$STEPS_FILE")" = "try" ]
+
+  # The maintainer deletes the failed mark: due again, same tip.
+  git -C "$HOST_REPO" push --quiet origin :refs/formann/post-drain-failed/alpha
+  finished_pass
+  [ "$(printf '%s ' $(cat "$STEPS_FILE"))" = "try try " ]
+  [ "$(comments_of Note)" = "2" ]
+}
+
+@test "post-drain (#38): a non-executable command step fails: failed mark, no abort flag" {
   printf 'echo hi\n' >"$HOST_REPO/runner/plain.sh"
   post_drain_manifest "plain.sh"
 
   drain_one_feature alpha 2>/dev/null
 
-  [ -f "$HOST_ABORT_DIR/alpha/post-drain-plain.sh" ]
+  [ "$(failed_mark alpha)" = "$(alpha_tip)" ]
+  [ ! -e "$HOST_ABORT_DIR/alpha/post-drain-plain.sh" ]
   [[ "${RUN_POST_DRAIN[0]}" == "alpha|plain.sh|failed (exit 126)|"* ]]
 }
 
-@test "post-drain (#10): a Blocked step stops the phase with no abort flag; the next pass claims the feature and re-runs from that step" {
+@test "post-drain (#38): a Blocked step posts a Blocked comment and stops; the next pass runs the phase again from its first step" {
   local gate="$BATS_TEST_TMPDIR/preview-up"
   consumer_step "first.sh" "echo first >>'$STEPS_FILE'"
   consumer_step "review-branch.sh" "if [ -f '$gate' ]; then echo review >>'$STEPS_FILE'; else echo 'BLOCKED: preview service'; fi"
@@ -430,24 +577,72 @@ drain_outcome() {
 
   [ "$(cat "$STEPS_FILE")" = "first" ]
   [[ "${RUN_POST_DRAIN[1]}" == "alpha|review-branch.sh|blocked (preview service)|"* ]]
-  [ ! -e "$HOST_ABORT_DIR/alpha/post-drain-review-branch.sh" ]
-  [ "$(post_drain_pending_step alpha)" = "review-branch.sh" ]
+  [ "$(comments_of Blocked)" = "1" ]
+  grep -qF 'Post-drain step `review-branch.sh` ended Blocked' "$COMMENTS_FILE"
+  grep -qF 'Dependency: preview service' "$COMMENTS_FILE"
+  [ -z "$(failed_mark alpha)" ]
+  [ -z "$(ok_mark alpha)" ]
+  [ ! -e "$HOST_BLOCKED_DIR/alpha/post-drain" ]
   [ -z "$(claim_sha alpha)" ]
 
-  # Next pass: nothing to dispatch, but the pending step makes the feature
-  # worth claiming; the phase resumes from the Blocked step.
+  # Next pass: nothing to dispatch, but the finished feature is still due;
+  # the phase runs from its first step and ends ok.
   : >"$STEPS_FILE"
   : >"$gate"
-  LOOP_DISPATCHES=0
-  GATE_ELIGIBLE=0
-  RUN_POST_DRAIN=()
-  RUN_FEATURE_OUTCOMES=()
-  snapshot_with '[{"ref":"#1","nn":"01","status":"done","type":"AFK","blocked_by":[],"eligible":false}]'
-  drain_one_feature alpha
+  finished_pass
 
-  [ "$(printf '%s ' $(cat "$STEPS_FILE"))" = "review pr " ]
-  [ -z "$(post_drain_pending_step alpha)" ]
+  [ "$(printf '%s ' $(cat "$STEPS_FILE"))" = "first review pr " ]
+  [ "$(ok_mark alpha)" = "$(alpha_tip)" ]
   [ -z "$(claim_sha alpha)" ]
+}
+
+@test "post-drain (#38): a step Blocked on three consecutive passes posts three Blocked comments, then the failed mark and one Note" {
+  consumer_step "review-branch.sh" "echo try >>'$STEPS_FILE'; echo 'BLOCKED: preview service'"
+  post_drain_manifest "review-branch.sh"
+
+  finished_pass
+  finished_pass
+  [ "$(comments_of Blocked)" = "2" ]
+  [ -z "$(failed_mark alpha)" ]
+  [ "$(comments_of Note)" = "0" ]
+
+  finished_pass
+  [ "$(comments_of Blocked)" = "3" ]
+  [ "$(failed_mark alpha)" = "$(alpha_tip)" ]
+  [ "$(comments_of Note)" = "1" ]
+  grep -qF 'Step: `review-branch.sh`' "$COMMENTS_FILE"
+  grep -qF 'Outcome: blocked (preview service) on 3 consecutive passes' "$COMMENTS_FILE"
+
+  # Not due any more: the fourth pass runs nothing.
+  finished_pass
+  [ "$(wc -l <"$STEPS_FILE" | tr -d ' ')" = "3" ]
+  [ "$(comments_of Blocked)" = "3" ]
+}
+
+@test "post-drain (#38): a phase interrupted after its first step re-runs from its first step on the next pass" {
+  consumer_step "first.sh" "echo first >>'$STEPS_FILE'"
+  consumer_step "second.sh" "echo second >>'$STEPS_FILE'"
+  post_drain_manifest "first.sh" "second.sh"
+  eval "_real_run_post_drain_step() $(declare -f run_post_drain_step | sed 1d)"
+  run_post_drain_step() {
+    local rc=0
+    _real_run_post_drain_step "$@" || rc=$?
+    [ "$2" = "first.sh" ] && [ -n "${INTERRUPT_AFTER_FIRST:-}" ] && RUNNER_INTERRUPTED=1
+    return "$rc"
+  }
+
+  INTERRUPT_AFTER_FIRST=1
+  finished_pass
+  [ "$(cat "$STEPS_FILE")" = "first" ]
+  [ -z "$(ok_mark alpha)" ]
+  [ -z "$(failed_mark alpha)" ]
+
+  INTERRUPT_AFTER_FIRST=""
+  RUNNER_INTERRUPTED=0
+  : >"$STEPS_FILE"
+  finished_pass
+  [ "$(printf '%s ' $(cat "$STEPS_FILE"))" = "first second " ]
+  [ "$(ok_mark alpha)" = "$(alpha_tip)" ]
 }
 
 @test "post-drain (#10): a prompt step runs claude -p on the host with the prompt and the feature; a closing BLOCKED line is Blocked" {
@@ -472,6 +667,7 @@ SCRIPT
 
   printf 'blockme\n' >"$HOST_REPO/runner/review-branch.md"
   RUN_POST_DRAIN=()
+  advance_tip >/dev/null
   drain_one_feature alpha
   [[ "${RUN_POST_DRAIN[0]}" == "alpha|review-branch|blocked (github)|"* ]]
 }
@@ -487,7 +683,108 @@ SCRIPT
   drain_one_feature alpha
 
   [[ "${RUN_POST_DRAIN[0]}" == "alpha|review-branch|failed (exit 1)|"* ]]
-  [ -f "$HOST_ABORT_DIR/alpha/post-drain-review-branch" ]
+  [ "$(failed_mark alpha)" = "$(alpha_tip)" ]
+}
+
+# === Restarts and other machines =============================================
+
+@test "post-drain (#38): a finished feature whose pass dispatched nothing takes the Claim, runs its steps, sets the ok mark at the tip and releases the Claim; the next pass does not snapshot it" {
+  consumer_step "probe.sh" "git -C '$SHARED' rev-parse --verify --quiet refs/formann/claims/alpha >/dev/null && echo held >>'$STEPS_FILE'"
+  post_drain_manifest "probe.sh"
+
+  finished_pass
+
+  [ "$RUN_STOP_REASON" = "completed" ]
+  [ "$(cat "$STEPS_FILE")" = "held" ]
+  [ ! -s "$LOOPS_FILE" ] || [ "$(cat "$LOOPS_FILE")" = "alpha" ]
+  [ "${#RUN_DISPATCHES[@]}" = "0" ]
+  [ "$(ok_mark alpha)" = "$(alpha_tip)" ]
+  [ -z "$(claim_sha alpha)" ]
+  [ -z "$CLAIM_HELD_FEATURE" ]
+
+  finished_pass
+  [ "$RUN_STOP_REASON" = "nothing-eligible" ]
+  [ ! -s "$SNAP_CALLS_FILE" ]
+  [ "$(cat "$STEPS_FILE")" = "held" ]
+}
+
+@test "post-drain (#38): the ok mark is set at the tip as it stands when the phase ends" {
+  consumer_step "fix.sh" "git -C '$HOST_REPO' -c user.email=t@t -c user.name=t commit-tree -p \$(git -C '$SHARED' rev-parse refs/heads/alpha) -m fix \$(git -C '$HOST_REPO' mktree </dev/null) >'$BATS_TEST_TMPDIR/fix-sha'; git -C '$HOST_REPO' push --quiet origin \$(cat '$BATS_TEST_TMPDIR/fix-sha'):refs/heads/alpha"
+  post_drain_manifest "fix.sh"
+  local before
+  before="$(alpha_tip)"
+
+  finished_pass
+
+  [ "$(alpha_tip)" != "$before" ]
+  [ "$(ok_mark alpha)" = "$(alpha_tip)" ]
+  [ "$(ok_mark alpha)" = "$(cat "$BATS_TEST_TMPDIR/fix-sha")" ]
+}
+
+@test "post-drain (#38): a second host repo on the same Shared remote sees the ok mark and does not run the phase for that tip" {
+  consumer_step "step.sh" "echo ran >>'$STEPS_FILE'"
+  post_drain_manifest "step.sh"
+  finished_pass
+  [ "$(cat "$STEPS_FILE")" = "ran" ]
+
+  # Machine two: its own host repo, same Shared remote, no local state.
+  local host1="$HOST_REPO"
+  HOST_REPO="$BATS_TEST_TMPDIR/host2"
+  git init --quiet --initial-branch=main "$HOST_REPO"
+  git -C "$HOST_REPO" remote add origin "$SHARED"
+  HOST_ABORT_DIR="$HOST_REPO/.runner-state/aborted"
+  HOST_BLOCKED_DIR="$HOST_REPO/.runner-state/blocked"
+  RUNNER_MACHINE="m2"
+  POST_DRAIN_MARKS_SEEN_FEATURE=""
+  mkdir -p "$HOST_REPO/docs/formann"
+  cp -R "$host1/docs/formann/issue-tracker" "$HOST_REPO/docs/formann/"
+
+  finished_pass
+  [ "$RUN_STOP_REASON" = "nothing-eligible" ]
+  [ ! -s "$SNAP_CALLS_FILE" ]
+  # Even a feature walked for other work settles on the mark before any step.
+  GATE_ELIGIBLE=1
+  drain_one_feature alpha
+  [ "$(cat "$STEPS_FILE")" = "ran" ]
+  [ -z "$(claim_sha alpha)" ]
+}
+
+@test "post-drain (#38): a new commit on the feature makes it due again" {
+  consumer_step "step.sh" "echo ran >>'$STEPS_FILE'"
+  post_drain_manifest "step.sh"
+  finished_pass
+  local first
+  first="$(ok_mark alpha)"
+  finished_pass
+  [ "$(cat "$STEPS_FILE")" = "ran" ]
+
+  local tip2
+  tip2="$(advance_tip)"
+  finished_pass
+  [ "$(printf '%s ' $(cat "$STEPS_FILE"))" = "ran ran " ]
+  [ "$(ok_mark alpha)" = "$tip2" ]
+  [ "$first" != "$tip2" ]
+}
+
+@test "post-drain (#38): without a Shared remote the marks are local refs and one machine behaves the same" {
+  git -C "$HOST_REPO" remote remove origin
+  git -C "$HOST_REPO" branch alpha main
+  consumer_step "step.sh" "echo ran >>'$STEPS_FILE'"
+  post_drain_manifest "step.sh"
+
+  finished_pass
+  [ "$(cat "$STEPS_FILE")" = "ran" ]
+  [ "$(git -C "$HOST_REPO" rev-parse refs/formann/post-drained/alpha)" = "$(git -C "$HOST_REPO" rev-parse alpha)" ]
+  [ -z "$(git -C "$SHARED" for-each-ref refs/formann)" ]
+
+  finished_pass
+  [ "$RUN_STOP_REASON" = "nothing-eligible" ]
+  [ ! -s "$SNAP_CALLS_FILE" ]
+
+  git -C "$HOST_REPO" -c user.email=t@t -c user.name=t commit --allow-empty --quiet -m more
+  git -C "$HOST_REPO" branch -f alpha HEAD
+  finished_pass
+  [ "$(printf '%s ' $(cat "$STEPS_FILE"))" = "ran ran " ]
 }
 
 # === SUMMARY.md ==============================================================
