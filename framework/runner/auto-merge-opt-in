@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+# auto-merge-opt-in — grant, revoke or read a feature's Auto-merge opt-in
+# (ADR-0015).
+#
+# Usage: .formann/runner/auto-merge-opt-in grant|revoke|read <feature>
+#
+#   Run from the host repo (any directory inside it; HOST_REPO overrides),
+#   in the maintainer's own session, with the maintainer's own git
+#   credentials. `/to-prd` calls `grant` when the grilling said a feature may
+#   be merged without a person; the maintainer runs `revoke` (or `grant`) by
+#   hand. The runner only ever reads it: no runner code path calls `grant` or
+#   `revoke`, and a Dispatch could not push the ref anyway (ADR-0014).
+#
+#   The opt-in is the ref `refs/formann/auto-merge/<feature>` on the Shared
+#   remote ($RUNNER_SHARED_REMOTE, default `origin`), pointing at a small
+#   parentless commit (empty tree) whose message records who granted it:
+#
+#       formann auto-merge opt-in
+#
+#       feature: <feature>
+#       granted-by: <git user.name>
+#       granted-at: <UTC ISO-8601>
+#
+#   With no Shared remote it is a local ref of the same name in the host repo.
+#
+#   grant   Refuses (exit 1, nothing pushed) unless the feature has an open
+#           parent — located through the binding's `comment-on-feature
+#           --locate`. Pushes the ref (a lease expecting it absent) and posts a
+#           Note on the parent saying the feature was opted in, by whom, when,
+#           and how to revoke. Prints `granted`. Re-granting a feature already
+#           opted in changes nothing and posts nothing: `already-opted-in`.
+#   revoke  Deletes the ref (a lease on the sha it read) and posts a Note.
+#           Prints `revoked`. Revoking a feature without an opt-in changes
+#           nothing and posts nothing: `not-opted-in`.
+#   read    Prints `opted-in` or `not-opted-in`, exit 0 either way.
+#
+#   The ref is the opt-in; the Note is information for people. A Note that
+#   can't be posted after the ref was written is reported on stderr (the ref
+#   change stands) and the exit code is the tracker's (1 or 3).
+#
+# Exit codes:
+#   0 — done (including the no-op cases)
+#   1 — the feature has no open parent (or a slug collision)
+#   2 — usage error (verb, feature, not in a git repo)
+#   3 — transient failure: the Shared remote or the tracker can't be reached
+#
+# Bash 3.2 compatible (macOS default).
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# claim_shared_remote, claim_shared_remote_present.
+# shellcheck source=claim.sh
+source "$HERE/claim.sh"
+
+usage() {
+  echo "usage: auto-merge-opt-in grant|revoke|read <feature>" >&2
+  exit 2
+}
+
+[ "$#" -eq 2 ] || usage
+verb="$1"
+feature="$2"
+case "$verb" in grant|revoke|read) ;; *) usage ;; esac
+[ -n "$feature" ] || usage
+
+ref="refs/formann/auto-merge/$feature"
+if ! git check-ref-format "$ref" 2>/dev/null || [[ "$feature" == */* ]]; then
+  echo "auto-merge-opt-in: '$feature' is not a feature slug" >&2
+  exit 2
+fi
+
+if [ -z "${HOST_REPO:-}" ]; then
+  if ! HOST_REPO="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    echo "auto-merge-opt-in: not inside a git repository (set HOST_REPO)" >&2
+    exit 2
+  fi
+fi
+export HOST_REPO
+
+tracker_dir="$HOST_REPO/docs/formann/issue-tracker"
+
+# The opt-in's sha, or nothing when absent. Exit 3 when the remote can't be
+# read.
+read_opt_in() {
+  if claim_shared_remote_present; then
+    local remote out
+    remote="$(claim_shared_remote)"
+    if ! out="$(GIT_TERMINAL_PROMPT=0 git -C "$HOST_REPO" ls-remote "$remote" "$ref" 2>&1)"; then
+      printf 'auto-merge-opt-in: cannot read %s on %s:\n%s\n' "$ref" "$remote" "$out" >&2
+      exit 3
+    fi
+    printf '%s\n' "$out" | awk -F'\t' -v r="$ref" '$2 == r { print $1; exit }'
+  else
+    git -C "$HOST_REPO" rev-parse --verify --quiet "$ref" 2>/dev/null || true
+  fi
+}
+
+# The binding's comment-on-feature, run from the host repo. Args passed on;
+# stdin passed through.
+comment_on_feature() {
+  local script="$tracker_dir/comment-on-feature"
+  if [ ! -x "$script" ]; then
+    echo "auto-merge-opt-in: no comment-on-feature script at $script" >&2
+    return 3
+  fi
+  ( cd "$HOST_REPO" && "$script" "$@" )
+}
+
+# Exit 1 (nothing written) unless the feature has an open parent.
+require_parent() {
+  local rc=0
+  comment_on_feature --locate "$feature" >/dev/null || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) echo "auto-merge-opt-in: no open feature parent for '$feature'; nothing changed" >&2; exit 1 ;;
+    *) echo "auto-merge-opt-in: cannot look up the feature parent of '$feature' (comment-on-feature --locate exited $rc); nothing changed" >&2; exit 3 ;;
+  esac
+}
+
+who() {
+  local name
+  name="$(git -C "$HOST_REPO" config user.name 2>/dev/null || true)"
+  printf '%s\n' "${name:-${USER:-unknown}}"
+}
+
+# Post a Note; on failure report that the ref change stands and exit with the
+# tracker's code. Args: $1 = body, $2 = what was done (for the diagnostic).
+post_note() {
+  local rc=0
+  printf '%s\n' "$1" | comment_on_feature "$feature" Note >/dev/null || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf 'auto-merge-opt-in: %s, but the Note on its parent could not be posted (comment-on-feature exited %s); post it by hand\n' \
+      "$2" "$rc" >&2
+    [ "$rc" -eq 1 ] && exit 1
+    exit 3
+  fi
+}
+
+where() {
+  if claim_shared_remote_present; then
+    printf 'the ref `%s` on the Shared remote (`%s`)' "$ref" "$(claim_shared_remote)"
+  else
+    printf 'the ref `%s` in the host repo (no Shared remote)' "$ref"
+  fi
+}
+
+do_read() {
+  local current
+  current="$(read_opt_in)"
+  if [ -n "$current" ]; then echo "opted-in"; else echo "not-opted-in"; fi
+}
+
+do_grant() {
+  require_parent
+  local current
+  current="$(read_opt_in)"
+  if [ -n "$current" ]; then
+    echo "already-opted-in"
+    return 0
+  fi
+
+  local name email now tree commit
+  name="$(who)"
+  email="$(git -C "$HOST_REPO" config user.email 2>/dev/null || true)"
+  email="${email:-$name@localhost}"
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  tree="$(git -C "$HOST_REPO" mktree </dev/null)"
+  commit="$(printf 'formann auto-merge opt-in\n\nfeature: %s\ngranted-by: %s\ngranted-at: %s\n' \
+      "$feature" "$name" "$now" \
+    | GIT_AUTHOR_NAME="$name" GIT_AUTHOR_EMAIL="$email" \
+      GIT_COMMITTER_NAME="$name" GIT_COMMITTER_EMAIL="$email" \
+      git -C "$HOST_REPO" commit-tree "$tree")"
+
+  if claim_shared_remote_present; then
+    local remote out rc=0
+    remote="$(claim_shared_remote)"
+    out="$(GIT_TERMINAL_PROMPT=0 git -C "$HOST_REPO" push --quiet \
+        "--force-with-lease=$ref:" "$remote" "$commit:$ref" 2>&1)" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      # Refused: someone granted it meanwhile — or the remote is unreachable.
+      current="$(read_opt_in)"
+      if [ -n "$current" ]; then
+        echo "already-opted-in"
+        return 0
+      fi
+      printf 'auto-merge-opt-in: cannot push %s to %s:\n%s\n' "$ref" "$remote" "$out" >&2
+      exit 3
+    fi
+  else
+    if ! git -C "$HOST_REPO" update-ref "$ref" "$commit" "" 2>/dev/null; then
+      echo "already-opted-in"
+      return 0
+    fi
+  fi
+
+  post_note "$(cat <<NOTE
+> *This was generated by \`auto-merge-opt-in grant\`.*
+
+**Opted into auto-merge** by ${name} at ${now}. Once its branch review is clean, this feature's Proof may be merged without a person, when every condition of ADR-0015 holds; otherwise it waits for a person as any other feature does. Auto-merge is not a release.
+
+The opt-in is $(where); this comment is information, never the opt-in. To revoke it, run \`.formann/runner/auto-merge-opt-in revoke ${feature}\` from the host repo.
+NOTE
+)" "the opt-in was granted"
+  echo "granted"
+}
+
+do_revoke() {
+  local current
+  current="$(read_opt_in)"
+  if [ -z "$current" ]; then
+    echo "not-opted-in"
+    return 0
+  fi
+  if claim_shared_remote_present; then
+    local remote out rc=0
+    remote="$(claim_shared_remote)"
+    out="$(GIT_TERMINAL_PROMPT=0 git -C "$HOST_REPO" push --quiet \
+        "--force-with-lease=$ref:$current" "$remote" ":$ref" 2>&1)" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      current="$(read_opt_in)"
+      if [ -z "$current" ]; then
+        echo "not-opted-in"
+        return 0
+      fi
+      printf 'auto-merge-opt-in: cannot delete %s on %s:\n%s\n' "$ref" "$remote" "$out" >&2
+      exit 3
+    fi
+  else
+    if ! git -C "$HOST_REPO" update-ref -d "$ref" "$current" 2>/dev/null; then
+      echo "auto-merge-opt-in: $ref moved while revoking; run revoke again" >&2
+      exit 3
+    fi
+  fi
+
+  local name now
+  name="$(who)"
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  post_note "$(cat <<NOTE
+> *This was generated by \`auto-merge-opt-in revoke\`.*
+
+**Auto-merge opt-in revoked** by ${name} at ${now}. This feature's Proof now waits for a person.
+
+The opt-in was $(where), now deleted. To grant it again, run \`.formann/runner/auto-merge-opt-in grant ${feature}\` from the host repo.
+NOTE
+)" "the opt-in was revoked"
+  echo "revoked"
+}
+
+case "$verb" in
+  read)   do_read ;;
+  grant)  do_grant ;;
+  revoke) do_revoke ;;
+esac

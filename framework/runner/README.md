@@ -448,6 +448,24 @@ A claim left behind by a runner that was killed outright (`kill -9`, power loss)
 | `RUNNER_CLAIM_STALE_AFTER` | `1800` | Seconds after its last heartbeat at which a claim is stale and may be taken over. |
 | `RUNNER_CLAIM_HEARTBEAT_SECONDS` | stale-after / 3 (`600`) | Seconds between heartbeats while a dispatch runs. Pre-flight (`claim-knobs`) refuses a value that is not a whole number above 0, or not below `RUNNER_CLAIM_STALE_AFTER`. |
 
+## Auto-merge opt-in
+
+A feature's **Auto-merge opt-in** (ADR-0015) is the ref `refs/formann/auto-merge/<feature>` on the Shared remote (`RUNNER_SHARED_REMOTE`, default `origin`), pointing at a parentless commit (empty tree) whose message reads `feature: <feature>`, `granted-by: <git user.name>`, `granted-at: <UTC ISO-8601>`. Without a Shared remote it is a local ref of the same name in the host repo. `/to-prd` grants it when the grilling said yes; the maintainer can grant or revoke it by hand. It is never set by the runner or a Dispatch, and it is not a release.
+
+```bash
+.formann/runner/auto-merge-opt-in grant  <feature>   # → granted | already-opted-in
+.formann/runner/auto-merge-opt-in revoke <feature>   # → revoked | not-opted-in
+.formann/runner/auto-merge-opt-in read   <feature>   # → opted-in | not-opted-in
+```
+
+- **grant** refuses (exit 1, nothing pushed) unless the feature has an open parent, located with the binding's `comment-on-feature --locate`. It pushes the ref as a lease expecting it absent, then posts a `Note` on the parent saying who opted the feature in, when, and how to revoke it. Re-granting changes nothing and posts nothing.
+- **revoke** deletes the ref (a lease on the sha it read) and posts a `Note`. Revoking a feature without an opt-in changes nothing and posts nothing.
+- **read** exits 0 either way.
+- A Note that can't be posted after the ref changed is reported on stderr — the ref change stands — and the exit code is the tracker's.
+- Exit codes: `0` done, `1` no open feature parent (or a slug collision), `2` usage error, `3` the Shared remote or the tracker can't be reached.
+
+Run it from the host repo, in your own session: it pushes with your credentials. Inspect an opt-in with `git fetch <remote> refs/formann/auto-merge/<feature> && git log -1 FETCH_HEAD`.
+
 ## Module map
 
 This map covers the modules on the branch-end path; the rest of the runner is described section by section below.
@@ -461,6 +479,7 @@ This map covers the modules on the branch-end path; the rest of the runner is de
 | Post-drain due rule (`post-drain.sh`) | Decides whether a feature's branch end is due: every issue `done` or `wontfix` and neither mark at the tip. | `post_drain_due` (pure), `post_drain_due_now` (reads tip and marks, then applies it) |
 | Post-drain mark store (`post-drain-marks.sh`) | Reads and writes the ok and failed marks (`refs/formann/post-drained/<feature>`, `refs/formann/post-drain-failed/<feature>`) at a tip; reads a feature's tip; lists every tip and mark in one read. | `post_drain_marks read\|set`, `post_drain_tip`, `post_drain_refs_listing` |
 | Post-drain phase (`post-drain.sh`) | Runs the manifest's steps on the host from the first one, then records how it ended: ok mark; failed mark plus a Note; a Blocked comment (failed at the third Blocked pass). | `maybe_run_post_drain`, `run_post_drain_phase`, `post_drain_conclude` |
+| Auto-merge opt-in (`auto-merge-opt-in`) | Grants, revokes and reads a feature's opt-in (`refs/formann/auto-merge/<feature>`) from the maintainer's session, announcing each change with a Note on the parent. Not on the branch-end path: the runner may only read it. | `auto-merge-opt-in grant\|revoke\|read <feature>` |
 | Tracker comments (`run-the-queue.sh`) | Posts a comment of a kind on a feature's parent through the binding's `comment-on-feature`, propagating a git-tracked binding's commit. | `post_feature_comment`, `post_claim_note`, `read_blocked_passes` |
 
 ### Primary flow (a branch end)
@@ -477,6 +496,7 @@ This map covers the modules on the branch-end path; the rest of the runner is de
 | ----- | ----- |
 | The Post-drain due rule is pure: no I/O. | `tests/post-drain.bats`: "post_drain_due — does no I/O" (runs it with only `jq` on `PATH`, no repo, an empty working directory). |
 | `post-drain-marks.sh` is the only writer of the post-drain refs. | `tests/post-drain-marks.bats`: "structural claim — post-drain-marks.sh is the only writer of the post-drain refs" (and its red counterpart). |
+| No runner code path grants or revokes an Auto-merge opt-in: `run-the-queue.sh` and the scripts it sources never call `auto-merge-opt-in grant\|revoke` or write an auto-merge ref. | `tests/auto-merge-opt-in.bats`: "structural claim — no runner code path calls grant or revoke" (and its red counterpart). |
 | Every mark write is a lease on the value last read; a refused lease is never forced. | `tests/post-drain-marks.bats`: "set — a refused lease … is reported, and the other writer's value stands"; the forced-push half is `unchecked`. |
 
 ## Post-drain phase

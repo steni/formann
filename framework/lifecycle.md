@@ -150,6 +150,20 @@ Both dispatches run in fresh sandbox containers with bypass permissions; the tru
 
 See [`afk-runner.md`](afk-runner.md) for the architecture, binding contract, outcome classifiers, and pre-flight invariants. Operator-facing reference (sandbox primitives, OAuth setup, smoke test) lives at [`runner/README.md`](runner/README.md).
 
+### Auto-merge opt-in
+
+Whether a feature may reach the default branch without a person pressing merge is decided while it is grilled, when its risk is known (ADR-0015). `grill-with-docs` asks it as "what does this feature touch?"; on a yes, `/to-prd` grants the **Auto-merge opt-in** once the feature's parent exists. The opt-in is the ref `refs/formann/auto-merge/<feature>` on the Shared remote (a local ref in the host repo when there is none), pushed from the maintainer's own session with the maintainer's own credentials — the sandbox cannot push, so no Dispatch can opt its own feature in. A Note on the feature's parent says who opted it in and when; the Note is information, the ref is the opt-in.
+
+Grant, revoke or check it by hand from the host repo:
+
+```bash
+.formann/runner/auto-merge-opt-in grant  <feature>   # granted | already-opted-in; exit 1 without a feature parent
+.formann/runner/auto-merge-opt-in revoke <feature>   # revoked | not-opted-in
+.formann/runner/auto-merge-opt-in read   <feature>   # opted-in | not-opted-in
+```
+
+Revoking deletes the ref and posts a Note; the feature's Proof then waits for a person. The runner only ever reads the opt-in, and even an opted-in feature waits for a person when any condition of ADR-0015 fails. Auto-merge is not a release: an auto-merged feature is released like any other, through the consumer's own release gate.
+
 ## Design principles
 
 **Implementation lives in bindings.** Binding docs (`docs/formann/issue-tracker/BINDING.md`) are where the system meets a concrete implementation. They define where things live, how references resolve, and what implementation-specific actions like "set up a feature workspace" mean mechanically. Each binding covers one lifecycle role.

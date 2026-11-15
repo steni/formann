@@ -63,8 +63,12 @@ Only offer to create an ADR when all three are true:
 
 If any of the three is missing, skip the ADR. Use the format in `${CLAUDE_SKILL_DIR}/ADR-FORMAT.md`.
 
+### Ask whether it may merge itself
+
+Before the tree is walked, ask this as one of its branches: **may this feature be merged without a person once its branch review is clean?** It is the maintainer's **Auto-merge opt-in** (ADR-0015), and it is decided now, while the risk is known, not after the work is built. Frame it as "what does it touch?": payments, auth, user data, the runner or its reviewers, CI, anything a person should see before it ships all argue no. Give your recommendation from what the grilling has shown the feature touches. A yes is not a release — releasing stays where it is — and the maintainer can revoke it later. Record the answer (yes, no) for the closing summary; do not grant anything here — `/to-prd` does that once the feature's parent exists.
+
 ## When the tree is walked
 
-Stop. Say in a few lines what was decided and which glossary entries and ADRs were written, then name the next step: `/to-prd` for a feature, or a standalone issue for a small, well-scoped task. Do not slice the work into issues or write them by hand — packaging is `/to-prd` and `/to-issues`' job, and asking "one issue or three?" here skips the module design those steps exist for. The glossary and ADR edits stay uncommitted in the working tree; `/to-prd` carries them onto the feature branch.
+Stop. Say in a few lines what was decided — including the auto-merge answer (`auto-merge: yes` or `auto-merge: no`) — and which glossary entries and ADRs were written, then name the next step: `/to-prd` for a feature, or a standalone issue for a small, well-scoped task. Do not slice the work into issues or write them by hand — packaging is `/to-prd` and `/to-issues`' job, and asking "one issue or three?" here skips the module design those steps exist for. The glossary and ADR edits stay uncommitted in the working tree; `/to-prd` carries them onto the feature branch.
 
 </supporting-info>

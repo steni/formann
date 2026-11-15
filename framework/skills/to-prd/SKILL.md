@@ -28,6 +28,19 @@ Ask the user to edit it: a module they would merge, split, rename or drop; an ar
 
 5. Write and publish the PRD using the template below; publish per `docs/formann/issue-tracker/BINDING.md`.
 
+6. Record the auto-merge answer. Once the feature's parent exists (steps 4–5 created it), look back at the grilling's auto-merge question (`grill-with-docs`, "Ask whether it may merge itself"):
+
+   - **Yes** — grant the **Auto-merge opt-in** from this session, with the maintainer's own credentials:
+
+     ```bash
+     .formann/runner/auto-merge-opt-in grant <feature-slug>
+     ```
+
+     It prints `granted` (or `already-opted-in`), pushes `refs/formann/auto-merge/<feature-slug>` to the Shared remote and posts a Note on the parent. Exit `1` means no feature parent was found: fix that and run it again; exit `3` is a remote or tracker failure: report it and give the maintainer the command to re-run. Never run it from a Dispatch.
+   - **No**, or the question was not asked — do nothing. The feature is not auto-mergeable.
+
+   The PRD's **Further Notes** say which: "Auto-merge: opted in during grilling (revoke with `.formann/runner/auto-merge-opt-in revoke <feature-slug>`)." or "Auto-merge: not opted in; the Proof waits for a person." When the grant fails after the PRD is published, edit Further Notes to match what is true.
+
 ### Writing the Gist
 
 Open the PRD with `## Gist`: 1–3 plain-English sentences for a colleague reading cold. The structured sections below carry the contract; the Gist exists so a new teammate can grasp what's at stake before hitting them.
@@ -107,6 +120,6 @@ A description of the things that are out of scope for this PRD.
 
 ## Further Notes
 
-Any further notes about the feature.
+Whether the feature was opted into auto-merge (step 6), and any further notes about the feature.
 
 </prd-template>

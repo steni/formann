@@ -121,6 +121,34 @@ lm_repo() {
   [ "$(git -C "$REPO" rev-parse HEAD)" = "$before" ]
 }
 
+@test "comment-on-feature --locate (github-issues) — prints the parent's ref and posts nothing; exit 1 without a parent" {
+  export GH_PARENTS=$'12\n'
+  run --separate-stderr "$GH" --locate alpha
+  assert_success
+  assert_output "#12"
+  [ ! -f "$GH_LOG.body" ]
+  export GH_PARENTS=""
+  run --separate-stderr "$GH" --locate alpha
+  assert_failure 1
+  export GH_PARENTS=$'3\n9\n'
+  run --separate-stderr "$GH" --locate alpha
+  assert_failure 1
+  [ ! -f "$GH_LOG.body" ]
+}
+
+@test "comment-on-feature --locate (local-markdown) — prints the PRD's path and commits nothing; exit 1 without one" {
+  lm_repo
+  local before
+  before="$(git -C "$REPO" rev-parse HEAD)"
+  run --separate-stderr env TRACKER_CHECKOUT_DIR="$REPO" "$LM" --locate alpha
+  assert_success
+  assert_output ".features/alpha/PRD.md"
+  run --separate-stderr env TRACKER_CHECKOUT_DIR="$REPO" "$LM" --locate beta
+  assert_failure 1
+  [ "$(git -C "$REPO" rev-parse HEAD)" = "$before" ]
+  [ -z "$(git -C "$REPO" status --porcelain)" ]
+}
+
 @test "comment-on-feature — both bindings: usage errors exit 2" {
   run "$LM" alpha
   assert_failure 2

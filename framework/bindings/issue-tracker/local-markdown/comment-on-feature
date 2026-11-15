@@ -3,6 +3,7 @@
 ### comment-on-feature — local-markdown binding: comment on a feature's parent.
 ###
 ### Usage: comment-on-feature <feature> <Kind>     (comment body on stdin)
+###        comment-on-feature --locate <feature>
 ###
 ### Realizes "Comment with `<kind>`" on the feature's parent, its PRD
 ### (`.features/<feature>/PRD.md`, as "Read the feature" reads it): appends a
@@ -15,6 +16,10 @@
 ### The AFK runner uses it to post the informational Note when it takes a
 ### Claim, writing into its runner-checkout (TRACKER_CHECKOUT_DIR) and then
 ### propagating the commit like a dispatch's.
+###
+### `--locate` writes nothing: it prints the PRD's path when the feature has
+### one, or exits 1. `auto-merge-opt-in grant` uses it to refuse a feature
+### without a parent before it pushes anything.
 ###
 ### Checkout resolution (a git work tree; the commit lands on its HEAD):
 ###   1. TRACKER_CHECKOUT_DIR.
@@ -30,11 +35,18 @@ set -eu
 set -o pipefail
 
 if [ "$#" -ne 2 ] || [ -z "$1" ] || [ -z "$2" ]; then
-  echo "usage: comment-on-feature <feature> <Kind>  (body on stdin)" >&2
+  echo "usage: comment-on-feature <feature> <Kind>  (body on stdin) | --locate <feature>" >&2
   exit 2
 fi
-feature="$1"
-kind="$2"
+locate=0
+if [ "$1" = "--locate" ]; then
+  locate=1
+  feature="$2"
+  kind=""
+else
+  feature="$1"
+  kind="$2"
+fi
 
 if [ -n "${TRACKER_CHECKOUT_DIR:-}" ]; then
   root="$TRACKER_CHECKOUT_DIR"
@@ -59,6 +71,10 @@ file="$root/$rel"
 if [ ! -f "$file" ]; then
   echo "comment-on-feature: no $rel in $root (a PRD-less feature has no parent to comment on)" >&2
   exit 1
+fi
+if [ "$locate" -eq 1 ]; then
+  printf '%s\n' "$rel"
+  exit 0
 fi
 
 body="$(cat)"

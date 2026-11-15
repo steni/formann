@@ -3,6 +3,7 @@
 ### comment-on-feature — github-issues binding: comment on a feature's parent.
 ###
 ### Usage: comment-on-feature <feature-slug> <Kind>     (comment body on stdin)
+###        comment-on-feature --locate <feature-slug>
 ###
 ### Realizes "Comment with `<kind>`" on the feature's parent issue, located
 ### as "Read the feature" does: the one open issue labelled both
@@ -14,6 +15,10 @@
 ### The AFK runner uses it to post the informational Note when it takes a
 ### Claim. Override the GitHub repo for tests via GH_TRACKER_REPO (owner/repo).
 ###
+### `--locate` posts nothing: it locates the parent the same way and prints
+### its ref (`#N`), or exits 1. `auto-merge-opt-in grant` uses it to refuse a
+### feature without a parent before it pushes anything.
+###
 ### Exit codes: 0 posted, 1 parent not found / slug collision, 2 usage error,
 ### 3 API failure after retries.
 ###
@@ -24,11 +29,18 @@ set -o pipefail
 readonly _MAX_RETRIES=3
 
 if [ "$#" -ne 2 ] || [ -z "$1" ] || [ -z "$2" ]; then
-  echo "usage: comment-on-feature <feature-slug> <Kind>  (body on stdin)" >&2
+  echo "usage: comment-on-feature <feature-slug> <Kind>  (body on stdin) | --locate <feature-slug>" >&2
   exit 2
 fi
-_slug="$1"
-_kind="$2"
+_locate=0
+if [ "$1" = "--locate" ]; then
+  _locate=1
+  _slug="$2"
+  _kind=""
+else
+  _slug="$1"
+  _kind="$2"
+fi
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "comment-on-feature: 'jq' not found or not in PATH." >&2
@@ -52,7 +64,8 @@ else
   fi
 fi
 
-_body="$(cat)"
+_body=""
+[ "$_locate" -eq 1 ] || _body="$(cat)"
 
 # Run gh with bounded retries; prints its stdout.
 _gh() {
@@ -87,6 +100,10 @@ if [ "$_count" -ge 2 ]; then
   exit 1
 fi
 _num="$(printf '%s\n' "$_parents" | head -n 1)"
+if [ "$_locate" -eq 1 ]; then
+  printf '#%s\n' "$_num"
+  exit 0
+fi
 
 _date="$(date -u +%Y-%m-%d)"
 _prior="$(_gh issue view "$_num" --repo "$_repo" --json comments)"

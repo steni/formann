@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Auto-merge opt-in** (#39, ADR-0015): whether a feature may be merged without a person is
+  decided while it is grilled. `grill-with-docs` asks it ("what does it touch?"), and on a yes
+  `/to-prd` runs `.formann/runner/auto-merge-opt-in grant <feature>` once the feature's parent
+  exists, which pushes `refs/formann/auto-merge/<feature>` to the Shared remote from the
+  maintainer's own session and posts a Note on the parent; `revoke` deletes the ref and posts a
+  Note, `read` reports `opted-in` or `not-opted-in`. `grant` refuses a feature without an open
+  parent and pushes nothing. Without a Shared remote the opt-in is a local ref. The runner never
+  grants or revokes it (a test fails if it does), and auto-merge is not a release. Both bindings'
+  `comment-on-feature` gain `--locate <feature>`, which prints the parent's ref and writes
+  nothing.
 - AFK runner: a finished feature's **Post-drain phase** runs on any machine, and how it ended is
   recorded on the Shared remote (#38, ADR-0013). The phase is due when every issue is `done` or
   `wontfix` and neither **Post-drain mark** is at the feature's tip — whether or not the pass
