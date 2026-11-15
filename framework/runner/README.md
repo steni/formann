@@ -599,15 +599,22 @@ the maintainer's credentials (#35). It is held three ways:
 3. **One way in.** Host code runs git on the checkout only through `checkout_git <subcommand> …`
    and, for a command that runs git there itself (a binding script handed the checkout, the host
    repo's fetch from it), `checkout_git_run <command> …`. Both apply step 2 and add
-   `core.hooksPath=/dev/null`, `core.fsmonitor=false` and `branch.autoSetupMerge=false` (the
-   last so the host's own `checkout -B` never writes tracking config into the checkout);
-   `checkout_git_run` passes them in `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`
+   `core.hooksPath=/dev/null`, `core.fsmonitor=false`, `branch.autoSetupMerge=false` (so the
+   host's own `checkout -B` never writes tracking config into the checkout), and
+   `diff.ignoreSubmodules=all`, `submodule.recurse=false`, `fetch.recurseSubmodules=false` and
+   `push.recurseSubmodules=no` (so host git never enters a repository nested in the checkout,
+   below); `checkout_git_run` passes them in `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`
    (git 2.31+), which every git it starts inherits. `tests/host-git-escape.bats` fails when a
    new line runs `git -C "$HOST_CHECKOUT"`, `cd "$HOST_CHECKOUT"`, `GIT_DIR`/`--git-dir` on it, a
    fetch from it or a binding script handed it, other than through the two.
 
-Filter drivers are covered by step 2: a filter runs only when the config defines it, and the
-config is the host's. A host-wide filter in `~/.gitconfig` (git-lfs, say) still applies; it is the
+A filter driver runs only when the config git reads defines it. For the checkout itself that
+config is the host's (step 2). A repository nested in the checkout (a committed gitlink, with its
+config in `sub/.git/config` or `.git/modules/<name>/config`) keeps its own config outside the
+read-only mounts, where a Dispatch can define a filter; `git status` would recurse into it and run
+that filter on a file that looks changed. The submodule keys in step 3 stop host git from entering
+it, so its config is never read on the host. The cost: the host's dirty check does not see
+uncommitted changes inside a nested repository. A host-wide filter in `~/.gitconfig` (git-lfs, say) still applies; it is the
 maintainer's own program. The Judges checkout is not mounted read-write into the sandbox and is
 outside this rule.
 

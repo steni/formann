@@ -6,7 +6,8 @@ bats_require_minimum_version 1.5.0
 # host side of the runner runs git in that same tree; git obeys the
 # repository config and hooks it finds there. These tests plant what a
 # dispatch could write — a `core.fsmonitor` command, hooks, a filter driver
-# bound to a tracked file through `.gitattributes`, a `.git/commondir`
+# bound to a tracked file through `.gitattributes`, a repository nested in
+# the checkout with a filter in its own config, a `.git/commondir`
 # redirect — each of which writes a marker file when it runs, then drive the
 # host side of a dispatch cycle and assert no marker exists.
 
@@ -69,8 +70,11 @@ plant_dispatch() {
   DISPATCH_BASE="$(git -C "$HOST_CHECKOUT" rev-parse HEAD)"
   printf '*.dat filter=x\n' >"$HOST_CHECKOUT/.gitattributes"
   echo data >"$HOST_CHECKOUT/a.dat"
-  git -C "$HOST_CHECKOUT" add -A
+  plant_nested_repos
+  git -C "$HOST_CHECKOUT" add -A 2>/dev/null
   git -C "$HOST_CHECKOUT" commit --quiet -m "feat: the dispatch's work"
+  sleep 1
+  touch "$HOST_CHECKOUT/sub/f.dat" "$HOST_CHECKOUT/mod/f.dat"
 
   local name
   for name in fsmonitor smudge clean; do
@@ -89,6 +93,32 @@ plant_dispatch() {
   done
   # A stray untracked file, so the next sync's scrub and clean run.
   echo stray >"$HOST_CHECKOUT/stray.txt"
+}
+
+# A git repository nested in the checkout, committed as a gitlink, whose own
+# config — outside the read-only mounts — defines a filter bound to a file in
+# it. `sub` keeps its config in `sub/.git/config`; `mod` keeps it in
+# `.git/modules/mod/config` behind a gitfile, as `git submodule` lays it out.
+# plant_dispatch commits them with its work and then touches each file, so
+# `git status` recursing into an inner repository would run its `clean` to
+# compare contents.
+plant_nested_repos() {
+  local name inner gitdir
+  for name in sub mod; do
+    inner="$HOST_CHECKOUT/$name"
+    git init --quiet --initial-branch=main "$inner"
+    printf '*.dat filter=x\n' >"$inner/.gitattributes"
+    echo inner >"$inner/f.dat"
+    git -C "$inner" add -A
+    git -C "$inner" commit --quiet -m inner
+    printf '#!/bin/sh\ntouch "%s/nested-%s-clean"\ncat\n' "$MARKERS" "$name" >"$EVIL/nested-$name-clean"
+    chmod +x "$EVIL/nested-$name-clean"
+    git -C "$inner" config filter.x.clean "$EVIL/nested-$name-clean"
+  done
+  mkdir -p "$HOST_CHECKOUT/.git/modules"
+  mv "$HOST_CHECKOUT/mod/.git" "$HOST_CHECKOUT/.git/modules/mod"
+  printf 'gitdir: ../.git/modules/mod\n' >"$HOST_CHECKOUT/mod/.git"
+  git config --file "$HOST_CHECKOUT/.git/modules/mod/config" core.worktree ../../../mod
 }
 
 # The host side of a dispatch cycle after the container exits: the
@@ -145,6 +175,8 @@ drive_host_cycle() {
   [ -f "$MARKERS/fsmonitor" ]
   [ -f "$MARKERS/hook-post-checkout" ]
   [ -f "$MARKERS/smudge" ]
+  [ -f "$MARKERS/nested-sub-clean" ]
+  [ -f "$MARKERS/nested-mod-clean" ]
 }
 
 @test "host-git-escape — a planted pre-push hook does not run when the host pushes from the checkout" {

@@ -1921,8 +1921,19 @@ guard_runner_checkout_git() {
   fi
 }
 
-# The command-line protections, shared by both entry points.
-RUNNER_CHECKOUT_GIT_OVERRIDES=(core.hooksPath=/dev/null core.fsmonitor=false branch.autoSetupMerge=false)
+# The command-line protections, shared by both entry points. The submodule
+# keys keep host git out of any repository nested in the checkout: its config
+# (sub/.git/config, .git/modules/<name>/config) is outside the read-only
+# mounts, and `git status` recursing into it would run a filter defined there.
+RUNNER_CHECKOUT_GIT_OVERRIDES=(
+  core.hooksPath=/dev/null
+  core.fsmonitor=false
+  branch.autoSetupMerge=false
+  diff.ignoreSubmodules=all
+  submodule.recurse=false
+  fetch.recurseSubmodules=false
+  push.recurseSubmodules=no
+)
 
 # Run a git subcommand in the runner-checkout. The only way host code runs
 # git there (see the rule above).
@@ -1963,21 +1974,15 @@ runner_checkout_config() {
   fi
 }
 
-# Put the runner-checkout's `origin` back to the host repo (#4, upstream
-# jervell/formann#96). The checkout is mounted read-write into the sandbox, so a
-# dispatch that tried to push could rewrite `origin` (one set it to the GitHub
-# URL and pushed), remove it, or give it a separate push URL. Every sync below
-# fetches from `origin` and must fetch from host, so a rewritten remote halted
-# the next run with `preflight-abort: runner-checkout`. Run before every sync,
-# whatever the previous dispatch left; one runner.log line (stderr) per repair,
-# silence when `origin` is already right. Only `origin` is repaired: other
-# remotes a dispatch added are never fetched by the runner.
-#
-# Since #35 the sandbox can't change the config any more (it is mounted
-# read-only from the host-owned copy), and the guard puts that copy back
-# over whatever a manual edit left in the checkout. The repairs below act on
-# the host-owned copy (runner_checkout_config), so they fire only when the
-# copy itself was edited.
+# Make the runner-checkout's `origin` the host repo, with the host's fetch
+# refspec and no separate push URL (#4, upstream jervell/formann#96). Every
+# sync below fetches from `origin` and must fetch from host. The sandbox sees
+# the checkout's config read-only, and the guard puts the host-owned copy back
+# over the checkout's before every host call, so the repairs act on the
+# host-owned copy (runner_checkout_config): they fire only when someone edited
+# that copy by hand. Run before every sync; one runner.log line (stderr) per
+# repair, silence when `origin` is already right. Only `origin` is repaired:
+# the runner never fetches from another remote.
 reset_runner_checkout_origin() {
   local current push_url
   guard_runner_checkout_git || return 1

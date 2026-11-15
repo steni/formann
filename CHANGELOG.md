@@ -135,7 +135,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   copies under `.runner-state/checkout-git/` (so `git config` and `git remote set-url` fail inside a
   dispatch, by design), and every host git call on the checkout goes through one wrapper that puts
   the host-owned config back first, removes `.git/commondir` / `.git/config.worktree`, refuses a
-  `.git` that is not a directory, and turns off hooks and fsmonitor on the command line. A bats
+  `.git` that is not a directory, and turns off hooks, fsmonitor and submodule recursion on the
+  command line (a repository nested in the checkout keeps its own, writable config). A bats
   test fails when host code bypasses the wrapper.
 - github-issues `tracker-snapshot <slug>` lists the issues of a feature whose parent is closed but
   not archived, the closed ones `done` or `wontfix`, the parent itself included when it is its own
