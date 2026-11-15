@@ -71,8 +71,12 @@ _Avoid_: "interface directory", "binding mount"
 The orchestrator that drains a feature's `ready-for-agent + AFK` queue without maintainer keystrokes. Framework code at `framework/runner/`.
 
 **Dispatch**:
-A single autonomous run of `/implement` (or `review-and-gate`) inside a sandbox container, kicked off by the **Runner**. One dispatch per issue.
+A single autonomous run of `/implement` (or `review-and-gate`) inside a sandbox container, kicked off by the **Runner**. One dispatch per issue step; after a drain, a **Feature dispatch** runs on the feature as a whole.
 _Avoid_: "execution", "agent run"
+
+**Feature dispatch**:
+A **Dispatch** on a feature's branch as a whole rather than on one issue: one sandboxed `claude` turn in the **Runner-checkout** at the feature's tip, started by a **Post-drain phase** step, whose commits the **Runner** propagates and fast-forwards to the **Shared remote** like any other **Dispatch**'s. The only way agent work runs after a drain.
+_Avoid_: "sandbox turn", "branch dispatch"
 
 **Dockerfile**:
 Consumer-owned. Lives in the **Consumer** repo (not Formann), because container contents are project-specific (toolchain, build commands). The **Installer** scaffolds an initial one.
@@ -82,7 +86,7 @@ The separate git clone at `.runner-state/checkout/` that the **Runner** mounts i
 _Avoid_: "runner clone", "sandbox repo"
 
 **Judges checkout**:
-The **Runner**'s own git clone at `.runner-state/judges/` of the **Consumer**'s default branch, detached at the **Shared remote**'s tip and set exactly to it before every pass. Everything that judges a **Dispatch** is read from it: the reviewers the sandbox mounts (`.claude/skills`, `.claude/agents`, `.claude/rules`) and the consumer's manifests and step prompts (`runner/`). The host repo is where people work, so the **Runner** never updates it; a slug branch never changes the reviewers that judge it. With no **Shared remote** the judges come from the host repo. Its commit is logged per pass beside the **Runner's Formann**'s.
+The **Runner**'s own git clone at `.runner-state/judges/` of the **Consumer**'s default branch, detached at the **Shared remote**'s tip and set exactly to it before every pass. Everything that judges a **Dispatch** is read from it: the reviewers and hooks the sandbox mounts (`.claude/skills`, `.claude/agents`, `.claude/rules`, `.claude/settings.json`, `.claude/hooks`) and the consumer's manifests and step prompts (`runner/`). The host repo is where people work, so the **Runner** never updates it; a slug branch never changes the reviewers that judge it. With no **Shared remote** the judges come from the host repo. Its commit is logged per pass beside the **Runner's Formann**'s.
 _Avoid_: "the host checkout" (that one is the maintainer's), "reviewer checkout"
 
 **Parking ref**:
@@ -101,6 +105,14 @@ _Avoid_: "GitHub", "origin" (a hosting service and a default name, not the conce
 A **Runner**'s exclusive hold on a feature while it drains it, so two machines never drain the same feature. A ref on the **Shared remote** (`refs/formann/claims/<feature>`), taken with an atomic push that succeeds only when no claim exists, refreshed as a heartbeat while the drain runs, and deleted when it ends. A **Claim** without a heartbeat for 30 minutes is stale and may be taken over. Lives in git, not in the tracker, so it is the same under every **Binding**; a tracker comment announcing it is information, never the lock.
 _Avoid_: "lock" (the per-machine runner lock is a different, local thing), "assignment"
 
+**Runner identity**:
+The GitHub identity (a GitHub App, or a machine user) the **Runner** writes as, never the maintainer's own: tracker writes from the sandbox, the push and the Proof from the host. It holds two tokens, the sandbox's limited to writing issues and reading contents, the host's also allowed to push and write pull requests, so a **Dispatch** cannot publish and the maintainer is notified of, and can approve, what the **Runner** did.
+_Avoid_: "bot", "the runner's token" (there are two)
+
+**Auto-merge opt-in**:
+The maintainer's decision, taken while grilling a feature or in `/to-prd`, that its Proof may be merged without a person: a ref on the **Shared remote** (`refs/formann/auto-merge/<feature>`) pushed from the maintainer's own session, announced by a Note on the feature issue. Only the maintainer can grant it, since the sandbox cannot push; the branch can only take it away (a protected path changed, a check failed, a claim not shown), and then the Proof waits for a person. A feature without one is never auto-merged.
+_Avoid_: "auto-merge label" (a label is something a **Dispatch** could set), "auto-ship" (merging is not releasing)
+
 **Runner's Formann**:
 The **Runner**'s own checkout of **Formann**, separate from the one the **Consumer**'s interactive sessions read through `.formann`. At the start of every drain, before taking a **Claim**, the **Runner** fast-forwards it to a configured Formann ref (upstream `main` by default, or a maintainer's integration branch) and refuses to drain if it cannot. Its sha is recorded in the **Claim** and the run's summary, so every run says which Formann built it. An update never changes skills under a live session.
 _Avoid_: "the .formann checkout" (that one belongs to the sessions)
@@ -114,8 +126,16 @@ The ordered sequence of **Dispatch**es the **Runner** executes after a successfu
 _Avoid_: "gate stage", "review phase" (those describe specific prompts, not the configurable walk structure)
 
 **Post-drain phase**:
-The host-side steps the **Runner** runs once a feature has drained (no eligible issue left and none **Blocked**), after the feature's last **Dispatch** and before it releases the feature's **Claim**: a branch review, opening a pull request — work that needs the host's credentials. Named in an optional **Consumer** manifest (`runner/post-drain.md`, same line format as the **Post-implement phase**'s); no manifest means no post-drain steps. A `.md` entry is a prompt run with `claude -p` on the host, anything else a command; neither ever runs in the sandbox. A step ends `ok`, `failed` (abort flag keyed by its label; dispatches are not undone) or **Blocked** (re-run from that step on the next pass).
+The steps the **Runner** runs once every issue of a feature is `done` or `wontfix`, before it releases the feature's **Claim**: a branch review, opening a pull request. A feature that drains with an issue still open (left for a human, HITL, or behind one) gets no post-drain phase, only a Note on the feature issue naming the issues it waits on, once per tip and set of waiting issues. Named in an optional **Consumer** manifest (`runner/post-drain.md`, same line format as the **Post-implement phase**'s); no manifest means no post-drain steps. A `.md` entry is a prompt run as a **Feature dispatch**; anything else is a **Post-drain command**. No agent ever runs on the host. It is due whenever every issue is terminal and the feature's **Post-drain mark** is not at its tip, on whichever machine holds the **Claim**, whether or not that pass dispatched anything. It always starts from the top at the current tip, so its steps are idempotent; nothing resumes from a machine's run folder. A step ends `ok`, `failed` (the failed mark is set at the tip and a Note posted on the feature issue; dispatches are not undone) or **Blocked** (re-run on the next pass; after three **Blocked** passes it is treated as `failed`).
 _Avoid_: "post-merge", "finalizer"
+
+**Post-drain mark**:
+The **Shared remote**'s record of how the **Post-drain phase** last ended for a feature: `refs/formann/post-drained/<feature>` at the tip it finished `ok` for, `refs/formann/post-drain-failed/<feature>` at the tip it failed on, and `refs/formann/post-drain-waiting/<feature>` naming the tip and the open issues the last waiting Note listed, so that Note is posted once. A feature whose tip carries neither mark is due; a new commit on the feature moves the tip and makes it due again, and deleting the failed mark retries it. Lives in git beside the **Claim**, so every machine sees it under every **Binding**.
+_Avoid_: "proof ref", "done marker" (the mark says the phase ran, not that the feature is done)
+
+**Post-drain command**:
+A **Post-drain phase** step that is deterministic **Consumer** code, read from the **Judges checkout** and run on the host with the host's credentials, never from the feature's branch. It treats the feature as data (reads its commits, never executes its files) and starts every agent turn it needs as a **Feature dispatch**. A consumer's branch review is the typical one: its loop and verdicts stay in its own code, its reviewer and fix turns run in the sandbox, and only the push and the pull request happen on the host.
+_Avoid_: "host prompt", "host step" (a host step that runs an agent is exactly what this rules out)
 
 **Building-block step**:
 A single-purpose framework-shipped prompt in `framework/runner/steps/` that does exactly one thing in the **Post-implement phase**: `review.md` (runs the independent review, posts severity-tagged findings comment, no state change), `gate.md` (reads the latest findings comment, promotes to `done` only when no Critical findings, no new review), `fix.md` (reads the latest findings comment and commits changes, no state change, no comment), or `find-and-fix.md` (runs `/code-review --fix` over the issue's change-set, commits the fixes, and posts a `Note` describing them; no state change; soft-fails without blocking the issue). Compose them in a manifest to get different workflows: `[review.md]` for review-without-gate, `[review.md, gate.md]` to reuse the framework gate with a separate review, `[find-and-fix.md, review-and-gate.md]` to fix obvious bugs automatically before gating, or the unrolled iterate pattern (`[review-and-gate.md, fix.md, review-and-gate.md, …]`) to loop until clean.
@@ -166,4 +186,5 @@ _Avoid_: "setup script" (the prompt may delegate to scripts, but the installer i
 - "agent" — overloaded between (a) a Claude Code subagent (e.g., `review-feature`) and (b) "the autonomous thing running in the sandbox." Resolved: (a) is **Agent**; (b) is **Dispatch**.
 - "target repo" — used in conversation for what is now **Consumer**. Resolved: prefer **Consumer**.
 - "docs/agents/" — the pre-Formann name of the **Role surface**. Resolved: renamed to `docs/formann/`.
+- "drained" — used for both "the queue has nothing eligible" and "the feature is finished". Resolved: a feature has drained when nothing is eligible and nothing **Blocked**, which says nothing about whether its issues are done; only a feature whose every issue is `done` or `wontfix` gets a **Post-drain phase**.
 - "observer" — overloaded between (a) the operator glancing at the live terminal (the **Liveness line**'s audience) and (b) the renderer process, a read-only observer of the artifacts a **Dispatch** writes. Resolved: unqualified "observer" means (a), the operator; (b) is always named "the renderer".
