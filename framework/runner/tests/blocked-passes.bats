@@ -46,7 +46,7 @@ SHIM
     assert_success
     [ "$output" = "$expected" ] || fail "github-issues #$nn: expected $expected, got '$output'"
   done <"$FIXTURE/expected.tsv"
-  [ "$n" -eq 6 ]
+  [ "$n" -eq 7 ]
 }
 
 @test "blocked-passes (local-markdown) — two prior Blocked plus the third pass counts 3" {
@@ -114,6 +114,15 @@ SHIM
   TRACKER_ROOT="$repo/.features" run --separate-stderr "$LM_BLOCKED_PASSES" ".features/f/PRD.md"
   assert_success
   assert_output "3"
+  # The runner's Post-drain comment (the phase ended ok or failed) resets it.
+  printf 'ended\n' | TRACKER_CHECKOUT_DIR="$repo" "$BINDINGS/local-markdown/comment-on-feature" f Post-drain >/dev/null
+  SNAPSHOT_CHECKOUT_DIR="$repo" run --separate-stderr "$LM_BLOCKED_PASSES" ".features/f/PRD.md"
+  assert_success
+  assert_output "0"
+  printf 'step x blocked\n' | TRACKER_CHECKOUT_DIR="$repo" "$BINDINGS/local-markdown/comment-on-feature" f Blocked >/dev/null
+  SNAPSHOT_CHECKOUT_DIR="$repo" run --separate-stderr "$LM_BLOCKED_PASSES" ".features/f/PRD.md"
+  assert_success
+  assert_output "1"
   # No PRD: exit 1, as for a missing issue file.
   TRACKER_ROOT="$repo/.features" run "$LM_BLOCKED_PASSES" ".features/g/PRD.md"
   assert_failure 1

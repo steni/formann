@@ -1,13 +1,13 @@
 # blocked-passes fixture
 
-Six issue timelines, each written twice: once as a local-markdown issue file
+Seven issue timelines, each written twice: once as a local-markdown issue file
 (`issues/<NN>-<slug>.md`) and once as the `gh issue view --json comments`
 response the github-issues binding reads (`github/<NN>.json`). The two forms
 carry the same comments in the same order.
 
 `expected.tsv` holds the Blocked pass count both bindings' `blocked-passes`
 must print for each issue: the number of `Blocked` comments since the latest
-`Implementation` comment.
+`Implementation` or `Post-drain` comment.
 
 | NN | Timeline | Count |
 |----|----------|-------|
@@ -17,3 +17,4 @@ must print for each issue: the number of `Blocked` comments since the latest
 | 04 | two Blocked, then a rework's new Implementation, then one Blocked | 1 |
 | 05 | two Blocked, no Implementation comment | 2 |
 | 06 | Blocked headings quoted in a code block or inline don't count | 1 |
+| 07 | two Blocked (a Note between), then the runner's `Post-drain` comment, then one Blocked | 1 |

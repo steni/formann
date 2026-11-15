@@ -24,9 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dispatched, so a restart after the last issue went `done`, or a second machine, ends the
   feature too. Every drain pass considers each active feature with nothing eligible whose tip
   carries no mark (one `git ls-remote` for all of them), claims a due one and runs the phase.
-  `ok` sets `refs/formann/post-drained/<feature>` at the tip; `failed`, or the third Blocked
-  pass, sets `refs/formann/post-drain-failed/<feature>` and posts a Note on the feature's parent
-  naming the step, its outcome and the log; a Blocked step posts a `Blocked` comment there. A new
+  `ok` sets `refs/formann/post-drained/<feature>` at the tip; `failed`, or the third consecutive
+  Blocked pass, posts a Note on the feature's parent naming the step, its outcome and the log,
+  then sets `refs/formann/post-drain-failed/<feature>`; a Blocked step posts a `Blocked` comment
+  there. Every comment comes before the mark, so a binding whose comments are commits
+  (local-markdown) leaves the mark at the tip. When the phase ends ok or failed after Blocked
+  passes, a `Post-drain` comment on the parent restarts its count; both bindings'
+  `blocked-passes` count from it. A new
   commit on the feature, or deleting the failed mark, makes it due again. Marks are lease pushes,
   like the Claim; without a Shared remote they are local refs. The local-markdown binding's
   `blocked-passes` accepts the parent's `PRD.md` path.

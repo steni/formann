@@ -9,9 +9,11 @@
 ### `comment-on-feature` prints for it (the AFK runner counts a Blocked
 ### post-drain phase there).
 ### Prints one integer on stdout: the number of `Blocked` comments on the
-### issue since its latest `Implementation` comment (all `Blocked` comments
-### when it has none). A rework posts a new Implementation comment, which
-### resets the count. Reads the issue file per the "Read the issue" verb
+### issue since its latest `Implementation` or `Post-drain` comment (all
+### `Blocked` comments when it has neither). A rework posts a new
+### Implementation comment, which resets the count; on a feature's parent the
+### runner posts a `Post-drain` comment when the post-drain phase ends ok or
+### failed, which resets it there. Reads the issue file per the "Read the issue" verb
 ### (`.features/<feature>/issues/<NN>-<slug>.md`); comments are the
 ### `### <Kind> — <date>` / `### <Kind> (n) — <date>` subsections of its
 ### `## Comments` section. Fenced code blocks are skipped, so a heading
@@ -119,7 +121,7 @@ printf '%s\n' "$issue_content" | awk '
   fence { next }
   /^## / { in_comments = ($0 == "## Comments"); next }
   !in_comments { next }
-  /^### Implementation( \([0-9]+\))? — / { count = 0; next }
+  /^### (Implementation|Post-drain)( \([0-9]+\))? — / { count = 0; next }
   /^### Blocked( \([0-9]+\))? — / { count++ }
   END { print count + 0 }
 '

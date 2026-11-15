@@ -57,21 +57,31 @@ setup() {
   git -C "$HOST_REPO" push --quiet origin main:refs/heads/alpha
 
   # The binding's comment verbs: comment-on-feature appends the comment to
-  # $COMMENTS_FILE and prints the parent's ref; blocked-passes counts the
-  # parent's Blocked comments there.
+  # $COMMENTS_FILE and prints the parent's ref (`--locate` only prints it);
+  # blocked-passes counts the parent's Blocked comments there since the
+  # latest Post-drain comment. With $COMMIT_COMMENTS_FLAG present, every
+  # comment is also a commit on alpha's branch on the Shared remote — what a
+  # local-markdown comment is once post_feature_comment has propagated it.
   COMMENTS_FILE="$BATS_TEST_TMPDIR/comments"
   : >"$COMMENTS_FILE"
+  COMMIT_COMMENTS_FLAG="$BATS_TEST_TMPDIR/comments-commit"
   local bdir="$HOST_REPO/docs/formann/issue-tracker"
   mkdir -p "$bdir"
   cat >"$bdir/comment-on-feature" <<SCRIPT
 #!/usr/bin/env bash
+[ "\$1" = "--locate" ] && { echo '#7'; exit 0; }
 { printf '=== %s %s\n' "\$1" "\$2"; cat; } >>'$COMMENTS_FILE'
+if [ -f '$COMMIT_COMMENTS_FLAG' ]; then
+  tip="\$(git -C '$SHARED' rev-parse refs/heads/\$1)"
+  new="\$(git -C '$SHARED' -c user.email=t@t -c user.name=t commit-tree -p "\$tip" -m "tracker: \$2 on \$1" "\$(git -C '$SHARED' mktree </dev/null)")"
+  git -C '$SHARED' update-ref "refs/heads/\$1" "\$new" "\$tip"
+fi
 echo '#7'
 SCRIPT
   cat >"$bdir/blocked-passes" <<SCRIPT
 #!/usr/bin/env bash
 [ "\$1" = "#7" ] || { echo "blocked-passes: unexpected ref \$1" >&2; exit 2; }
-grep -c '^=== alpha Blocked\$' '$COMMENTS_FILE' || true
+awk '/^=== alpha Post-drain\$/ { n = 0 } /^=== alpha Blocked\$/ { n++ } END { print n + 0 }' '$COMMENTS_FILE'
 SCRIPT
   chmod +x "$bdir/comment-on-feature" "$bdir/blocked-passes"
 
@@ -167,6 +177,11 @@ advance_tip() {
 # Comments of a kind posted on alpha's parent.
 comments_of() {
   grep -c "^=== alpha $1\$" "$COMMENTS_FILE" || true
+}
+
+# The text of every comment of a kind on alpha's parent.
+comment_text_of() {
+  awk -v want="=== alpha $1" '/^=== / { on = ($0 == want); next } on' "$COMMENTS_FILE"
 }
 
 # One drain pass with the binding listing no feature as eligible: whatever
@@ -612,11 +627,135 @@ drain_outcome() {
   [ "$(comments_of Note)" = "1" ]
   grep -qF 'Step: `review-branch.sh`' "$COMMENTS_FILE"
   grep -qF 'Outcome: blocked (preview service) on 3 consecutive passes' "$COMMENTS_FILE"
+  comment_text_of Note | grep -qF 'Step: `review-branch.sh`'
+  comment_text_of Note | grep -qF "alpha/post-drain-01-review-branch.sh.stdout.log"
+  # A count at the limit has just failed: no reset comment.
+  [ "$(comments_of Post-drain)" = "0" ]
 
   # Not due any more: the fourth pass runs nothing.
   finished_pass
   [ "$(wc -l <"$STEPS_FILE" | tr -d ' ')" = "3" ]
   [ "$(comments_of Blocked)" = "3" ]
+}
+
+@test "post-drain (#38): comments that are commits on the branch — a failing step's failed mark is at the tip after the Note, and the next pass does not run it" {
+  : >"$COMMIT_COMMENTS_FLAG"
+  consumer_step "review-branch.sh" "echo try >>'$STEPS_FILE'; exit 4"
+  post_drain_manifest "review-branch.sh"
+  # The claim Note is a commit too.
+  post_claim_note() { printf 'claimed\n' | "$HOST_REPO/docs/formann/issue-tracker/comment-on-feature" "$1" Note >/dev/null; }
+  local before
+  before="$(alpha_tip)"
+
+  finished_pass
+  [ "$(cat "$STEPS_FILE")" = "try" ]
+  [ "$(alpha_tip)" != "$before" ]
+  [ "$(failed_mark alpha)" = "$(alpha_tip)" ]
+  # The Note names the tip the step ran at: the one before the Note's commit.
+  comment_text_of Note | grep -qF "Tip: \`$(git -C "$SHARED" rev-parse "$(alpha_tip)^")\`"
+
+  finished_pass
+  [ "$RUN_STOP_REASON" = "nothing-eligible" ]
+  [ ! -s "$SNAP_CALLS_FILE" ]
+  [ "$(cat "$STEPS_FILE")" = "try" ]
+  [ "$(failed_mark alpha)" = "$(alpha_tip)" ]
+}
+
+@test "post-drain (#38): comments that are commits on the branch — three Blocked passes end at the failed mark on the final tip, and a fourth pass runs nothing" {
+  : >"$COMMIT_COMMENTS_FLAG"
+  consumer_step "review-branch.sh" "echo try >>'$STEPS_FILE'; echo 'BLOCKED: preview service'"
+  post_drain_manifest "review-branch.sh"
+
+  finished_pass
+  finished_pass
+  [ "$(comments_of Blocked)" = "2" ]
+  [ -z "$(failed_mark alpha)" ]
+  finished_pass
+  [ "$(comments_of Blocked)" = "3" ]
+  [ "$(comments_of Note)" = "1" ]
+  [ "$(failed_mark alpha)" = "$(alpha_tip)" ]
+
+  finished_pass
+  [ "$RUN_STOP_REASON" = "nothing-eligible" ]
+  [ "$(wc -l <"$STEPS_FILE" | tr -d ' ')" = "3" ]
+}
+
+@test "post-drain (#38): comments that are commits on the branch — an ok after a Blocked pass posts the reset first, and the ok mark is at the tip after it" {
+  : >"$COMMIT_COMMENTS_FLAG"
+  local gate="$BATS_TEST_TMPDIR/preview-up"
+  consumer_step "review-branch.sh" "[ -f '$gate' ] && echo review >>'$STEPS_FILE' || echo 'BLOCKED: preview service'"
+  post_drain_manifest "review-branch.sh"
+
+  finished_pass
+  [ "$(comments_of Blocked)" = "1" ]
+  : >"$gate"
+  finished_pass
+  [ "$(cat "$STEPS_FILE")" = "review" ]
+  [ "$(comments_of Post-drain)" = "1" ]
+  [ "$(ok_mark alpha)" = "$(alpha_tip)" ]
+
+  finished_pass
+  [ "$RUN_STOP_REASON" = "nothing-eligible" ]
+  [ "$(cat "$STEPS_FILE")" = "review" ]
+}
+
+@test "post-drain (#38): the Blocked count restarts after an ok — two Blocked, ok, then only the third consecutive Blocked pass fails" {
+  local gate="$BATS_TEST_TMPDIR/preview-up"
+  consumer_step "review-branch.sh" "[ -f '$gate' ] && echo ok >>'$STEPS_FILE' || echo 'BLOCKED: preview service'"
+  post_drain_manifest "review-branch.sh"
+
+  finished_pass
+  finished_pass
+  [ "$(comments_of Blocked)" = "2" ]
+  : >"$gate"
+  finished_pass
+  [ "$(ok_mark alpha)" = "$(alpha_tip)" ]
+  [ "$(comments_of Post-drain)" = "1" ]
+  comment_text_of Post-drain | grep -qF "after 2 Blocked pass(es)"
+
+  # A later tip: Blocked again, counted from 1.
+  rm "$gate"
+  advance_tip >/dev/null
+  finished_pass
+  advance_tip >/dev/null
+  finished_pass
+  [ "$(comments_of Blocked)" = "4" ]
+  [ -z "$(failed_mark alpha)" ]
+  [ "$(comments_of Note)" = "0" ]
+  finished_pass
+  [ "$(comments_of Blocked)" = "5" ]
+  [ "$(failed_mark alpha)" = "$(alpha_tip)" ]
+  [ "$(comments_of Note)" = "1" ]
+}
+
+@test "post-drain (#38): the Blocked count restarts after a failed step — two Blocked, a failure, then one Blocked pass is not a failure" {
+  local mode="$BATS_TEST_TMPDIR/mode"
+  echo blocked >"$mode"
+  consumer_step "review-branch.sh" "case \$(cat '$mode') in blocked) echo 'BLOCKED: preview service' ;; fail) exit 4 ;; esac"
+  post_drain_manifest "review-branch.sh"
+
+  finished_pass
+  finished_pass
+  echo fail >"$mode"
+  finished_pass
+  [ "$(failed_mark alpha)" = "$(alpha_tip)" ]
+  [ "$(comments_of Post-drain)" = "1" ]
+  [ "$(comments_of Note)" = "1" ]
+
+  echo blocked >"$mode"
+  advance_tip >/dev/null
+  finished_pass
+  [ "$(comments_of Blocked)" = "3" ]
+  [ "$(comments_of Note)" = "1" ]
+  [ "$(failed_mark alpha)" != "$(alpha_tip)" ]
+}
+
+@test "post-drain (#38): a phase that was never Blocked posts no Post-drain comment" {
+  consumer_step "step.sh" "true"
+  post_drain_manifest "step.sh"
+  finished_pass
+  [ "$(ok_mark alpha)" = "$(alpha_tip)" ]
+  [ ! -s "$COMMENTS_FILE" ]
 }
 
 @test "post-drain (#38): a phase interrupted after its first step re-runs from its first step on the next pass" {

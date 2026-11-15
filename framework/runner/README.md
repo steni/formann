@@ -478,7 +478,7 @@ This map covers the modules on the branch-end path; the rest of the runner is de
 | Claim (`claim.sh`) | The runner's exclusive hold on the feature it drains: a ref on the Shared remote, taken, heart-beaten and released with lease pushes. | `claim take\|heartbeat\|release`, `claim_verdict` |
 | Post-drain due rule (`post-drain.sh`) | Decides whether a feature's branch end is due: every issue `done` or `wontfix` and neither mark at the tip. | `post_drain_due` (pure), `post_drain_due_now` (reads tip and marks, then applies it) |
 | Post-drain mark store (`post-drain-marks.sh`) | Reads and writes the ok and failed marks (`refs/formann/post-drained/<feature>`, `refs/formann/post-drain-failed/<feature>`) at a tip; reads a feature's tip; lists every tip and mark in one read. | `post_drain_marks read\|set`, `post_drain_tip`, `post_drain_refs_listing` |
-| Post-drain phase (`post-drain.sh`) | Runs the manifest's steps on the host from the first one, then records how it ended: ok mark; failed mark plus a Note; a Blocked comment (failed at the third Blocked pass). | `maybe_run_post_drain`, `run_post_drain_phase`, `post_drain_conclude` |
+| Post-drain phase (`post-drain.sh`) | Runs the manifest's steps on the host from the first one, then records how it ended: ok mark; a Note then the failed mark; a Blocked comment (failed at the third consecutive Blocked pass). Comments always come before the mark. | `maybe_run_post_drain`, `run_post_drain_phase`, `post_drain_conclude`, `post_drain_reset_blocked_passes` |
 | Auto-merge opt-in (`auto-merge-opt-in`) | Grants, revokes and reads a feature's opt-in (`refs/formann/auto-merge/<feature>`) from the maintainer's session, announcing each change with a Note on the parent. Not on the branch-end path: the runner may only read it. | `auto-merge-opt-in grant\|revoke\|read <feature>` |
 | Tracker comments (`run-the-queue.sh`) | Posts a comment of a kind on a feature's parent through the binding's `comment-on-feature`, propagating a git-tracked binding's commit. | `post_feature_comment`, `post_claim_note`, `read_blocked_passes` |
 
@@ -487,7 +487,7 @@ This map covers the modules on the branch-end path; the rest of the runner is de
 1. `drain_pass_features` asks the binding which features have an eligible issue, and `post_drain_candidates` reads every tip and mark in one `post_drain_refs_listing`; the pass walks the union.
 2. `drain_one_feature` snapshots a feature; with nothing to dispatch it goes on only when `post_drain_due_now` says `due`. It takes the Claim.
 3. The per-issue loop runs (and finds nothing, or drains what is left); `maybe_run_post_drain` re-reads the tip and marks, and on `due` calls `run_post_drain_phase`.
-4. The phase runs each step from the first; `post_drain_conclude` sets a mark through `post_drain_marks set` at the tip as it stands, and posts a Note or a Blocked comment through `post_feature_comment`.
+4. The phase runs each step from the first; `post_drain_conclude` posts any comment (a `Post-drain` reset, a Note, a Blocked comment) through `post_feature_comment`, then sets a mark through `post_drain_marks set` at the tip as it stands after them.
 5. `drain_one_feature` releases the Claim.
 
 ### Structural claims
@@ -515,8 +515,10 @@ scripts/open-pr.sh      # a command: run with the feature slug as $1 (and $RUNNE
 - A step ends `ok`, `failed (exit N)` or — when its last non-blank output line is `BLOCKED: <dependency>` — `blocked (<dependency>)`. The phase stops at the first step that isn't `ok`.
 - **Marks.** How the phase ended is recorded on the Shared remote, as a ref at the feature's tip, so every machine sees it:
   - every step `ok` → `refs/formann/post-drained/<feature>` (the ok mark) at the tip as it stands when the phase ends;
-  - a step `failed` → `refs/formann/post-drain-failed/<feature>` (the failed mark) at the tip, plus a Note on the feature's parent naming the step, its outcome and its log;
-  - a step `blocked` → a `Blocked` comment on the feature's parent naming the step and the dependency, and no mark: the next pass runs the phase again. When the parent's Blocked count (the binding's `blocked-passes`) reaches 3 — the third consecutive Blocked pass — it is treated as `failed`: failed mark plus Note.
+  - a step `failed` → a Note on the feature's parent naming the step, its outcome and its log, then `refs/formann/post-drain-failed/<feature>` (the failed mark) at the tip;
+  - a step `blocked` → a `Blocked` comment on the feature's parent naming the step and the dependency, and no mark: the next pass runs the phase again. The third consecutive Blocked pass is treated as `failed`: Note, then failed mark. The binding's `blocked-passes` counts the parent's Blocked comments since its latest `Post-drain` comment, which the runner posts when the phase ends `ok` or `failed` after one or more Blocked passes — so the count restarts after every ending that is not Blocked. A new commit between Blocked passes does not restart it (under local-markdown each Blocked comment is itself a commit).
+
+  Every comment comes before the mark, and the mark is set at the tip as it stands after them: with local-markdown a comment is a commit on the feature branch, so a mark set first would no longer be at the tip.
 
   A feature at either mark is not due until its tip moves (a new commit — the maintainer's fix, a reworked issue — makes it due again) or the mark is deleted. Every mark write is a lease push on the value last read, like the Claim's; a refused lease is reported and left alone. Without a Shared remote the marks are local refs of the same names in the host repo, and the tip is the host's `refs/heads/<feature>` (or the parking ref when there is no such branch). To read and delete them:
 
